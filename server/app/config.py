@@ -2,18 +2,33 @@
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
+from pathlib import Path
+from typing import Annotated
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+# This file lives at <repo>/server/app/config.py; the .env file lives at <repo>/.env.
+# Resolving via __file__ keeps Settings working regardless of which directory
+# uvicorn / pytest / ad-hoc python is launched from.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ENV_FILE_PATH = PROJECT_ROOT / ".env"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=str(ENV_FILE_PATH),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     redis_url: str
     symbol_mapping_path: str = "/workspaces/ftmo_exness_hedge_v3/symbol_mapping_ftmo_exness.json"
-    cors_origins: list[str] = ["http://localhost:5173"]
+    # NoDecode disables pydantic-settings' eager JSON parse for this list field
+    # so the validator below can accept either CSV or JSON-list strings from env.
+    cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:5173"]
     log_level: str = "INFO"
 
     jwt_secret: str
@@ -25,7 +40,12 @@ class Settings(BaseSettings):
     @classmethod
     def _split_cors(cls, v: object) -> object:
         if isinstance(v, str):
-            return [item.strip() for item in v.split(",") if item.strip()]
+            stripped = v.strip()
+            if stripped.startswith("["):
+                # JSON-list form, e.g. ["http://a","http://b"].
+                return json.loads(stripped)
+            # Comma-separated form, e.g. http://a,http://b.
+            return [item.strip() for item in stripped.split(",") if item.strip()]
         return v
 
     @field_validator("jwt_secret")
@@ -38,7 +58,6 @@ class Settings(BaseSettings):
     @field_validator("admin_password_hash")
     @classmethod
     def _admin_hash_format(cls, v: str) -> str:
-        # bcrypt hashes start with $2a$, $2b$, or $2y$ (variant).
         if not v.startswith(("$2a$", "$2b$", "$2y$")):
             raise ValueError("ADMIN_PASSWORD_HASH must be a bcrypt hash (starts with $2a/$2b/$2y$)")
         return v

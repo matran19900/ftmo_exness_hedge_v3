@@ -29,14 +29,33 @@ Manual hedging tool between FTMO (cTrader) and Exness (MT5).
 
 ### First-time auth setup
 
-Generate secrets and add them to your local `.env` file (do NOT commit `.env`):
+Generate secrets and write the full `.env` at the repo root (do NOT commit `.env`):
 
 ```bash
+# Generate JWT_SECRET (any directory):
 echo "JWT_SECRET=$(openssl rand -hex 32)" >> .env
-echo "ADMIN_PASSWORD_HASH=$(python -c "import bcrypt; print(bcrypt.hashpw(b'admin', bcrypt.gensalt(rounds=12)).decode())")" >> .env
-echo "ADMIN_USERNAME=admin" >> .env
-echo "JWT_EXPIRES_MINUTES=60" >> .env
+
+# Generate bcrypt hash (must run inside the server venv):
+cd server && source .venv/bin/activate && cd ..
+echo "ADMIN_PASSWORD_HASH=$(python -c 'import bcrypt; print(bcrypt.hashpw(b"admin", bcrypt.gensalt(rounds=12)).decode())')" >> .env
+deactivate
+
+# Add the remaining required vars:
+cat >> .env <<'EOF'
+ADMIN_USERNAME=admin
+JWT_EXPIRES_MINUTES=60
+REDIS_URL=redis://192.168.88.4:6379/2
+SYMBOL_MAPPING_PATH=/workspaces/ftmo_exness_hedge_v3/symbol_mapping_ftmo_exness.json
+CORS_ORIGINS=http://localhost:5173
+LOG_LEVEL=INFO
+EOF
 ```
+
+Notes:
+
+- All Python helper commands that import project deps (like `bcrypt`) must run inside the venv: `cd server && source .venv/bin/activate`.
+- Settings loads `.env` from the repo root regardless of which directory you run uvicorn / pytest from (the path is resolved relative to `server/app/config.py`, not `cwd`).
+- `CORS_ORIGINS` accepts comma-separated (`http://a,http://b`) or JSON-list (`["http://a","http://b"]`).
 
 Default password is `admin`. Change it before any real deployment.
 
