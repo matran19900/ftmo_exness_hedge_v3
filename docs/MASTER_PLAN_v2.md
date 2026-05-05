@@ -140,16 +140,20 @@ Setup repo + skeleton 3 service (server, web, redis) chạy được local, CEO 
 14. `docs/CTO_HANDOFF_TEMPLATE.md` tồn tại để CEO copy khi tạo CTO chat mới.
 
 ### Step breakdown
-| # | Branch | Scope |
+
+> Thứ tự step phản ánh thực tế đã thực hiện. Telegram setup được chuyển lên sớm hơn theo yêu cầu CEO. Chi tiết deviation xem `PHASE_1_REPORT.md`.
+
+| # | Branch | Scope (1-line summary) |
 |---|---|---|
-| 1.1 | `step/1.1-repo-and-lint` | Monorepo skeleton + docker-compose + .env.example + ruff + eslint + prettier + pre-commit hooks. |
-| 1.2 | `step/1.2-server-fastapi-scaffold` | FastAPI lifespan + config + Redis pool + `GET /health` + symbol whitelist loader + `GET /symbols` static. |
-| 1.3 | `step/1.3-server-auth-jwt` | JWT create/decode + bcrypt + `POST /auth/login` (dummy admin) + deps `get_current_user_*`. |
-| 1.4 | `step/1.4-web-scaffold-store-axios` | Vite + React + TS + ESLint + Zustand store với persist + Axios client với JWT interceptor. |
-| 1.5 | `step/1.5-web-login-page` | Login form + call API + save token + redirect. |
-| 1.6 | `step/1.6-web-layout-skeleton` | App.tsx layout 3 panel với placeholder components. |
-| 1.7 | `step/1.7-telegram-notify-setup` | `scripts/notify_telegram.sh` (reuse từ project) + `scripts/claude-with-notify.sh` wrapper + post-commit hook bash + bootstrap script install hook + 3 trigger: commit done / need approve / inactivity 90s + throttle 3 phút + test cả 3 trigger + document trong README cách dùng wrapper. |
-| 1.8 | `step/1.8-phase-1-docs-sync` | Update README + RUNBOOK + tạo `docs/PHASE_1_REPORT.md` + `docs/PROJECT_STATE.md` (initial) + `docs/DECISIONS.md` (initial) + `docs/CTO_HANDOFF_TEMPLATE.md`. Tag `phase-1-complete`. |
+| 1.1 | `step/1.1-repo-and-lint` | Monorepo skeleton + lint + devcontainer (docker-compose bỏ — D-006). |
+| 1.2 | `step/1.2-server-fastapi-scaffold` | FastAPI + symbols whitelist + 2 endpoint (`/health`, `/symbols/`). |
+| 1.3 | `step/1.3-telegram-notify-setup` | Telegram wrapper + post-commit hook (REORDERED — gốc là 1.7). Wrapper bị bypass trong thực tế (D-019). |
+| 1.4 | `step/1.4-server-auth-jwt` | JWT auth + protect symbols endpoints. |
+| 1.4a | `step/1.4a-config-fixes` | Sub-fix: CORS env parsing + `.env` path resolution. |
+| 1.5 | `step/1.5-web-scaffold-store-axios` | Vite + React 19 + TS strict + Tailwind v3 + Zustand + Axios. |
+| 1.6 | `step/1.6-web-login-page` | Login form + auth flow + react-hot-toast. |
+| 1.7 | `step/1.7-web-layout-skeleton` | 3-panel layout + Open/History tabs (PositionList full-width — D-029). |
+| 1.8 | `step/1.8-phase-1-docs-sync` | Phase 1 docs: DECISIONS, PROJECT_STATE, CTO_HANDOFF_TEMPLATE, PHASE_1_REPORT, RUNBOOK skeleton + cập nhật MASTER_PLAN_v2 + README. Tag `phase-1-complete` (CEO tag thủ công sau khi merge). |
 
 ---
 
@@ -769,11 +773,13 @@ CEO chỉ điền 2 dòng cuối → CTO mới có đủ context bắt đầu wo
 
 | Phase | Status | Steps | Tag | Report |
 |---|---|---|---|---|
-| 1 — Foundation | ⏳ pending | 0/8 | — | — |
+| 1 — Foundation | ✅ done | 9/9 | `phase-1-complete` | `docs/PHASE_1_REPORT.md` |
 | 2 — Market Data + Chart + Form | ⏳ pending | 0/10 | — | — |
 | 3 — Single-leg Trading | ⏳ pending | 0/14 | — | — |
 | 4 — Hedge + Cascade | ⏳ pending | 0/11 | — | — |
 | 5 — Hardening + Deploy | ⏳ pending | 0/10 | — | — |
+
+> Phase 1 đếm 9 step khi tính cả 1.4a (sub-fix). Plan gốc có 8.
 
 CTO update tracker này sau mỗi phase PASS.
 
