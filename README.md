@@ -59,6 +59,23 @@ Notes:
 
 Default password is `admin`. Change it before any real deployment.
 
+### Web frontend
+
+After devcontainer rebuild, web deps install automatically via post-create.sh. To run dev server:
+
+```bash
+cd web
+npm run dev
+```
+
+Open http://localhost:5173. The placeholder page should show:
+
+- Backend health: ✓ ftmo-hedge-server v0.1.0
+- Auth state: not logged in (or "logged in" if token persists from previous session)
+
+If backend health shows ✗ error, ensure the backend is running on port 8000:
+`cd server && source .venv/bin/activate && uvicorn app.main:app --port 8000`
+
 ### Working with Claude Code
 
 ALWAYS run Claude Code via the wrapper:
