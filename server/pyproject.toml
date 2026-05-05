@@ -2,7 +2,24 @@
 name = "hedger-server"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+  "fastapi>=0.115,<0.116",
+  "uvicorn[standard]>=0.32,<0.33",
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.4,<3",
+  "redis[hiredis]>=5.0,<6",
+  "hedger-shared",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "pytest-mock>=3.14",
+  "fakeredis[lua]>=2.24",
+  "mypy>=1.10",
+  "ruff>=0.5",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -11,3 +28,7 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"

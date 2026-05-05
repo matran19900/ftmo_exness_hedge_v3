@@ -15,3 +15,10 @@ indent-style = "space"
 python_version = "3.12"
 strict = true
 exclude = ["\\.venv", "node_modules", "build"]
+
+# `redis.asyncio.from_url` is shipped without a typed signature, so strict mode
+# flags `no-untyped-call` at every caller. Disable that single check for our
+# server module that constructs the pool — keep the rest of strict mode intact.
+[[tool.mypy.overrides]]
+module = ["app.redis_client"]
+disable_error_code = ["no-untyped-call"]
