@@ -68,12 +68,18 @@ cd web
 npm run dev
 ```
 
-Open http://localhost:5173. The placeholder page should show:
+Open http://localhost:5173. Login form appears.
 
-- Backend health: ✓ ftmo-hedge-server v0.1.0
-- Auth state: not logged in (or "logged in" if token persists from previous session)
+Default credentials (development): `admin` / `admin` (or whatever `ADMIN_PASSWORD_HASH` in `.env` was generated from).
 
-If backend health shows ✗ error, ensure the backend is running on port 8000:
+After login:
+
+- Token saved in localStorage (persists across page refresh).
+- Symbol count loads from `/api/symbols/`.
+- Logout button in top-right clears the token, returns to login.
+- Session expiry (server returns 401) auto-logs out with toast notification.
+
+If backend is not running, login submit will show a network error toast. Start it with:
 `cd server && source .venv/bin/activate && uvicorn app.main:app --port 8000`
 
 ### Working with Claude Code

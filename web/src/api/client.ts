@@ -1,4 +1,5 @@
 import axios, { AxiosError, type AxiosInstance, type InternalAxiosRequestConfig } from 'axios'
+import toast from 'react-hot-toast'
 import { useAppStore } from '../store'
 
 export const apiClient: AxiosInstance = axios.create({
@@ -19,7 +20,11 @@ apiClient.interceptors.response.use(
   (response) => response,
   (error: AxiosError) => {
     if (error.response?.status === 401) {
+      const hadToken = useAppStore.getState().token !== null
       useAppStore.getState().logout()
+      if (hadToken) {
+        toast.error('Session expired. Please login again.')
+      }
     }
     return Promise.reject(error)
   }
