@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Tracked source for .git/hooks/post-commit. Installed via
+# scripts/install-git-hooks.sh — copy this file into .git/hooks/ on every fresh
+# clone or devcontainer rebuild.
+#
+# Behaviour: when a commit lands on a `step/*` branch, send a Telegram
+# notification with the branch name, commit hash, subject, and changed-file
+# count, so the CEO knows Claude Code finished a step without watching the
+# terminal. No-op on any other branch (main, detached HEAD, etc.).
+
+set -u
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+if [[ "$BRANCH" != step/* ]]; then
+  exit 0
+fi
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+NOTIFY_SH="$REPO_ROOT/scripts/notify_telegram.sh"
+
+if [[ -z "$REPO_ROOT" || ! -f "$NOTIFY_SH" ]]; then
+  exit 0
+fi
+
+COMMIT_HASH=$(git rev-parse --short HEAD)
+COMMIT_MSG=$(git log -1 --pretty=%s)
+FILES_CHANGED=$(git diff-tree --no-commit-id --name-only -r HEAD | wc -l | tr -d ' ')
+
+bash "$NOTIFY_SH" "🔧 [$BRANCH] Claude Code committed
+Commit: $COMMIT_HASH — $COMMIT_MSG
+Files changed: $FILES_CHANGED
+→ Open chat for CTO review" >/dev/null 2>&1 || true
+
+exit 0
