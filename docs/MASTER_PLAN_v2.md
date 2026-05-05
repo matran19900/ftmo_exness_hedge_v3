@@ -18,6 +18,7 @@ Plan này thay thế `13-rebuild-guide.md` (M0–M6 cũ). Cấu trúc theo **ver
   - Code comments + commit messages: **English**.
   - Documentation files trong `docs/`: Tiếng Việt (knowledge cho CEO + CTO onboarding).
   - Telegram notify: **English** (concise).
+- **Prompt format rule**: CTO viết toàn bộ prompt cho Claude Code trong **1 code block duy nhất** để CEO copy bằng 1 nút bấm. KHÔNG tách prompt thành nhiều section bằng heading markdown ngoài code block. Mọi section, bullet, table của prompt nằm bên trong cùng 1 fenced code block.
 
 ### Quyết định kiến trúc đã chốt (reference)
 - Symbol mapping: file JSON cứng, load lúc startup.
