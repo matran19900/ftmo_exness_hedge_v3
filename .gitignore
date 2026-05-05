@@ -39,3 +39,4 @@ desktop.ini
 *.log
 /tmp/
 build/
+.claude/scheduled_tasks.lock
