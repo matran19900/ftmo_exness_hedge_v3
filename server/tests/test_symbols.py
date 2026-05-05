@@ -1,4 +1,4 @@
-"""Tests for GET /api/symbols and GET /api/symbols/{ftmo_symbol}."""
+"""Tests for GET /api/symbols and GET /api/symbols/{ftmo_symbol} (happy path, authed)."""
 
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ def _existing_symbol() -> str:
 
 
 @pytest.mark.asyncio
-async def test_list_symbols_returns_sorted_list(client: AsyncClient) -> None:
-    resp = await client.get("/api/symbols/")
+async def test_list_symbols_returns_sorted_list(authed_client: AsyncClient) -> None:
+    resp = await authed_client.get("/api/symbols/")
     assert resp.status_code == 200
     body = resp.json()
     syms = body["symbols"]
@@ -27,16 +27,16 @@ async def test_list_symbols_returns_sorted_list(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_symbols_count_matches_file(client: AsyncClient) -> None:
-    resp = await client.get("/api/symbols/")
+async def test_list_symbols_count_matches_file(authed_client: AsyncClient) -> None:
+    resp = await authed_client.get("/api/symbols/")
     assert resp.status_code == 200
     assert len(resp.json()["symbols"]) == EXPECTED_SYMBOL_COUNT
 
 
 @pytest.mark.asyncio
-async def test_get_symbol_existing(client: AsyncClient) -> None:
+async def test_get_symbol_existing(authed_client: AsyncClient) -> None:
     target = _existing_symbol()
-    resp = await client.get(f"/api/symbols/{target}")
+    resp = await authed_client.get(f"/api/symbols/{target}")
     assert resp.status_code == 200
     body = resp.json()
     assert body["ftmo"] == target
@@ -55,7 +55,7 @@ async def test_get_symbol_existing(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_symbol_not_found(client: AsyncClient) -> None:
-    resp = await client.get("/api/symbols/NOTREAL")
+async def test_get_symbol_not_found(authed_client: AsyncClient) -> None:
+    resp = await authed_client.get("/api/symbols/NOTREAL")
     assert resp.status_code == 404
     assert resp.json()["detail"] == "Symbol not in whitelist"

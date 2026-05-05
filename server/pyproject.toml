@@ -8,6 +8,8 @@ dependencies = [
   "pydantic>=2.7,<3",
   "pydantic-settings>=2.4,<3",
   "redis[hiredis]>=5.0,<6",
+  "pyjwt>=2.9,<3",
+  "bcrypt>=4.2,<5",
   "hedger-shared",
 ]
 

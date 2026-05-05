@@ -27,6 +27,19 @@ Manual hedging tool between FTMO (cTrader) and Exness (MT5).
 4. Install git hooks: `bash scripts/install-git-hooks.sh`
 5. (Future steps will add Python venv activation, web npm install, etc.)
 
+### First-time auth setup
+
+Generate secrets and add them to your local `.env` file (do NOT commit `.env`):
+
+```bash
+echo "JWT_SECRET=$(openssl rand -hex 32)" >> .env
+echo "ADMIN_PASSWORD_HASH=$(python -c "import bcrypt; print(bcrypt.hashpw(b'admin', bcrypt.gensalt(rounds=12)).decode())")" >> .env
+echo "ADMIN_USERNAME=admin" >> .env
+echo "JWT_EXPIRES_MINUTES=60" >> .env
+```
+
+Default password is `admin`. Change it before any real deployment.
+
 ### Working with Claude Code
 
 ALWAYS run Claude Code via the wrapper:
