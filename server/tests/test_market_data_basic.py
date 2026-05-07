@@ -32,6 +32,37 @@ def test_market_data_initial_state_is_idle() -> None:
     assert md.is_authenticated is False
 
 
+def test_protobuf_extract_unwraps_proto_message_wrapper() -> None:
+    """Regression for step 2.1b: cTrader returns a ProtoMessage wrapper that
+    has only payloadType / payload / clientMsgId. Callers want the inner
+    message (e.g. ProtoOASymbolsListRes with its `symbol` field), so
+    _send_and_wait now passes responses through Protobuf.extract.
+
+    This test proves the library contract the fix depends on: a wrapper has
+    no `.symbol` attribute; the extracted inner message does.
+    """
+    from ctrader_open_api import Protobuf
+    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoMessage
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOASymbolsListRes
+
+    inner = ProtoOASymbolsListRes()
+    inner.ctidTraderAccountId = 42
+    sym = inner.symbol.add()
+    sym.symbolId = 1
+    sym.symbolName = "EURUSD"
+    sym.enabled = True
+
+    wrapper = ProtoMessage()
+    wrapper.payloadType = inner.payloadType
+    wrapper.payload = inner.SerializeToString()
+    assert not hasattr(wrapper, "symbol")  # the bug-reproducing assertion
+
+    extracted = Protobuf.extract(wrapper)
+    assert type(extracted).__name__ == "ProtoOASymbolsListRes"
+    assert extracted.symbol[0].symbolName == "EURUSD"
+    assert extracted.symbol[0].enabled is True
+
+
 @pytest.mark.asyncio
 async def test_redis_service_creds_roundtrip(
     fake_redis: fakeredis.aioredis.FakeRedis,

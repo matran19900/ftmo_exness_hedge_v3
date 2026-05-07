@@ -16,7 +16,7 @@ import threading
 import time
 from typing import Any
 
-from ctrader_open_api import Client, TcpProtocol
+from ctrader_open_api import Client, Protobuf, TcpProtocol
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAccountAuthReq,
     ProtoOAApplicationAuthReq,
@@ -282,7 +282,14 @@ class MarketDataService:
     # ---------- async <-> Twisted bridge ----------
 
     async def _send_and_wait(self, message: Any, timeout: float = 30.0) -> Any:
-        """Send a request through Twisted and await its response in asyncio."""
+        """Send a request through Twisted and await its response in asyncio.
+
+        The cTrader library delivers responses as a ``ProtoMessage`` wrapper
+        (payloadType / payload bytes / clientMsgId). Callers want the inner
+        protobuf (e.g. ``ProtoOASymbolsListRes`` with its ``symbol`` field), so
+        we unwrap once here via ``Protobuf.extract`` — every callsite gets the
+        already-decoded message.
+        """
         if self._loop is None or self._client is None:
             raise RuntimeError("MarketDataService not started")
         client = self._client
@@ -305,4 +312,5 @@ class MarketDataService:
             d.addErrback(on_error)
 
         reactor.callFromThread(send_in_reactor)
-        return await asyncio.wait_for(future, timeout=timeout)
+        wrapper = await asyncio.wait_for(future, timeout=timeout)
+        return Protobuf.extract(wrapper)
