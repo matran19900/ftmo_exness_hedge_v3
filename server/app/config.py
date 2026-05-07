@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     admin_username: str = "admin"
     admin_password_hash: str
 
+    # cTrader Open API (Phase 2+ market-data feed)
+    ctrader_client_id: str = ""
+    ctrader_client_secret: str = ""
+    ctrader_host: str = "live.ctraderapi.com"
+    ctrader_port: int = 5035
+    ctrader_redirect_uri: str = "http://localhost:8000/api/auth/ctrader/callback"
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_cors(cls, v: object) -> object:

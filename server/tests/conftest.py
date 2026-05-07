@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import bcrypt
@@ -19,11 +19,17 @@ os.environ.setdefault(
     "ADMIN_PASSWORD_HASH",
     bcrypt.hashpw(b"admin", bcrypt.gensalt(rounds=4)).decode("utf-8"),
 )
+# Force empty cTrader credentials in tests regardless of any .env shipped in
+# the dev environment — the tests assert "no credentials" behaviour.
+os.environ["CTRADER_CLIENT_ID"] = ""
+os.environ["CTRADER_CLIENT_SECRET"] = ""
 
+import fakeredis.aioredis  # noqa: E402
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
 from app.main import app  # noqa: E402
 from app.services import symbol_whitelist  # noqa: E402
+from app.services.redis_service import RedisService, get_redis_service  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -42,6 +48,20 @@ def real_mapping_path() -> Path:
 def _load_real_whitelist(real_mapping_path: Path) -> None:
     """Ensure the in-process whitelist cache is loaded before every test."""
     symbol_whitelist.load_whitelist(str(real_mapping_path))
+
+
+@pytest.fixture
+def fake_redis() -> fakeredis.aioredis.FakeRedis:
+    """A fresh fakeredis-async client per test, decoded as strings."""
+    return fakeredis.aioredis.FakeRedis(decode_responses=True)
+
+
+@pytest.fixture(autouse=True)
+def _override_redis_service(fake_redis: fakeredis.aioredis.FakeRedis) -> Iterator[None]:
+    """Replace the FastAPI redis-service dependency with a fakeredis-backed one."""
+    app.dependency_overrides[get_redis_service] = lambda: RedisService(fake_redis)
+    yield
+    app.dependency_overrides.pop(get_redis_service, None)
 
 
 @pytest_asyncio.fixture

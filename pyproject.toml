@@ -22,3 +22,14 @@ exclude = ["\\.venv", "node_modules", "build"]
 [[tool.mypy.overrides]]
 module = ["app.redis_client"]
 disable_error_code = ["no-untyped-call"]
+
+# ctrader-open-api ships no type stubs; treat its modules as untyped.
+[[tool.mypy.overrides]]
+module = ["ctrader_open_api.*"]
+ignore_missing_imports = true
+
+# Twisted has partial stubs but they don't cover every reactor entry-point we
+# touch. Disable the missing-import noise for it.
+[[tool.mypy.overrides]]
+module = ["twisted.*"]
+ignore_missing_imports = true

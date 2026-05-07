@@ -94,6 +94,35 @@ Sau khi login:
 Backend không chạy → login sẽ báo network error inline. Khởi động lại bằng:
 `cd server && source .venv/bin/activate && uvicorn app.main:app --port 8000`
 
+### cTrader market-data setup (Phase 2)
+
+Phase 2 cần một cTrader market-data account để feed live price + chart data.
+
+**Prerequisites**:
+1. Đăng ký cTrader Open API app tại https://connect.spotware.com/apps
+2. Set Redirect URI: `http://localhost:8000/api/auth/ctrader/callback`
+3. Mở DEMO account ở bất kỳ broker cTrader nào (vd IC Markets, Pepperstone). FTMO accounts không hoạt động trực tiếp với endpoint mặc định trong dev — chúng cần `demo.ctraderapi.com`.
+
+**Setup**:
+1. Thêm vào `.env`:
+
+   ```
+   CTRADER_CLIENT_ID=<your client_id>
+   CTRADER_CLIENT_SECRET=<your client_secret>
+   CTRADER_HOST=live.ctraderapi.com
+   CTRADER_PORT=5035
+   CTRADER_REDIRECT_URI=http://localhost:8000/api/auth/ctrader/callback
+   ```
+
+2. Restart server.
+3. Mở browser: `http://localhost:8000/api/auth/ctrader`
+4. Login bằng cTrader credentials, approve app.
+5. Sẽ redirect về `/` (server origin), access token đã lưu vào Redis.
+6. Verify: `curl http://localhost:8000/api/auth/ctrader/status` → `{"has_credentials": true, ...}`
+7. Verify symbols synced: `curl -H "Authorization: Bearer <jwt>" http://localhost:8000/api/symbols/` → list symbols available trên YOUR cTrader account giao với whitelist.
+
+**Note về availability**: mỗi broker có symbol khác nhau. Whitelist file có 117 symbol; account của bạn có thể ít hơn. Kết quả là intersection.
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:
