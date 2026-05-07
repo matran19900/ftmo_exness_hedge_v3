@@ -7,7 +7,6 @@ redirect chain that cannot carry an Authorization header.
 from __future__ import annotations
 
 import logging
-import secrets
 import time
 import urllib.parse
 from typing import Annotated, Any
@@ -35,37 +34,33 @@ CTRADER_TRADING_ACCOUNTS_URL = "https://api.spotware.com/connect/tradingaccounts
 @router.get("")
 async def ctrader_login(
     settings: Annotated[Settings, Depends(get_settings)],
-    redis_svc: Annotated[RedisService, Depends(get_redis_service)],
 ) -> RedirectResponse:
-    """Redirect the user to the cTrader consent page."""
+    """Redirect the user to the cTrader consent page.
+
+    Note: cTrader's OAuth callback does not echo `state` back, so we don't
+    send one. CSRF risk is accepted for this single-admin tool — see D-031.
+    """
     if not settings.ctrader_client_id:
         raise HTTPException(
             status_code=503, detail="cTrader client_id is not configured (CTRADER_CLIENT_ID)"
         )
-    state = secrets.token_urlsafe(32)
-    await redis_svc.set_oauth_state(state, ttl_seconds=600)
     params = {
         "client_id": settings.ctrader_client_id,
         "redirect_uri": settings.ctrader_redirect_uri,
         "scope": "trading",
-        "state": state,
     }
     url = f"{CTRADER_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
-    logger.info("Redirecting to cTrader consent page (state=%s)", state[:8])
+    logger.info("Redirecting to cTrader consent page")
     return RedirectResponse(url, status_code=302)
 
 
 @router.get("/callback")
 async def ctrader_callback(
     code: Annotated[str, Query()],
-    state: Annotated[str, Query()],
     settings: Annotated[Settings, Depends(get_settings)],
     redis_svc: Annotated[RedisService, Depends(get_redis_service)],
 ) -> RedirectResponse:
     """Exchange the OAuth code, store credentials, and trigger MarketDataService."""
-    if not await redis_svc.consume_oauth_state(state):
-        raise HTTPException(status_code=400, detail="Invalid or expired state")
-
     async with httpx.AsyncClient(timeout=30.0) as http:
         token_resp = await http.get(
             CTRADER_TOKEN_URL,

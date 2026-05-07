@@ -7,8 +7,10 @@ documented in the step report — too brittle to mock in a unit test.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import fakeredis.aioredis
+import httpx
 import pytest
 from app.services.market_data import MarketDataService
 from app.services.redis_service import RedisService
@@ -28,24 +30,6 @@ def test_market_data_initial_state_is_idle() -> None:
     md = _make_service()
     assert md.is_connected is False
     assert md.is_authenticated is False
-
-
-@pytest.mark.asyncio
-async def test_redis_service_oauth_state_consume_once(
-    fake_redis: fakeredis.aioredis.FakeRedis,
-) -> None:
-    svc = RedisService(fake_redis)
-    await svc.set_oauth_state("abc", ttl_seconds=600)
-    assert await svc.consume_oauth_state("abc") is True
-    assert await svc.consume_oauth_state("abc") is False
-
-
-@pytest.mark.asyncio
-async def test_redis_service_oauth_state_unknown_returns_false(
-    fake_redis: fakeredis.aioredis.FakeRedis,
-) -> None:
-    svc = RedisService(fake_redis)
-    assert await svc.consume_oauth_state("never-stored") is False
 
 
 @pytest.mark.asyncio
@@ -133,11 +117,28 @@ async def test_login_endpoint_503_when_client_id_missing(client: AsyncClient) ->
 
 
 @pytest.mark.asyncio
-async def test_callback_rejects_unknown_state(client: AsyncClient) -> None:
+async def test_callback_rejects_invalid_code(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When cTrader's token endpoint rejects the code, the callback returns 502."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="invalid_grant")
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("app.api.auth_ctrader.httpx.AsyncClient", patched_async_client)
+
     resp = await client.get(
         "/api/auth/ctrader/callback",
-        params={"code": "deadbeef", "state": "never-issued"},
+        params={"code": "deadbeef"},
         follow_redirects=False,
     )
-    assert resp.status_code == 400
-    assert "state" in resp.json()["detail"].lower()
+    assert resp.status_code == 502
+    assert "token exchange failed" in resp.json()["detail"].lower()

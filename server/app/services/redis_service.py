@@ -55,17 +55,6 @@ class RedisService:
             "expires_at": int(data["expires_at"]),
         }
 
-    # ----- OAuth CSRF state -----
-
-    async def set_oauth_state(self, state: str, ttl_seconds: int = 600) -> None:
-        """Store an OAuth CSRF token with a TTL so stale states drop on their own."""
-        await self._redis.setex(f"ctrader:oauth_state:{state}", ttl_seconds, "1")
-
-    async def consume_oauth_state(self, state: str) -> bool:
-        """Atomically consume a state token: return True iff the key existed."""
-        deleted = await self._redis.delete(f"ctrader:oauth_state:{state}")
-        return bool(deleted)
-
     # ----- Symbol config / active symbols -----
 
     async def set_symbol_config(self, ftmo_symbol: str, config: dict[str, Any]) -> None:
