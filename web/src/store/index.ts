@@ -52,6 +52,12 @@ export interface AppState {
   setSlPrice: (price: number | null) => void
   tpPrice: number | null
   setTpPrice: (price: number | null) => void
+
+  // Manual volume override for VolumeCalculator. null = auto (use server's
+  // calc); number = user-typed Vol Primary (Vol Secondary derived from
+  // ratio). Reset on symbol switch + per session — NOT persisted.
+  manualVolumePrimary: number | null
+  setManualVolumePrimary: (v: number | null) => void
 }
 
 export const useAppStore = create<AppState>()(
@@ -90,6 +96,9 @@ export const useAppStore = create<AppState>()(
       setSlPrice: (slPrice) => set({ slPrice }),
       tpPrice: null,
       setTpPrice: (tpPrice) => set({ tpPrice }),
+
+      manualVolumePrimary: null,
+      setManualVolumePrimary: (manualVolumePrimary) => set({ manualVolumePrimary }),
     }),
     {
       name: 'ftmo-hedge-store',

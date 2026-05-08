@@ -299,6 +299,20 @@ curl -X POST http://localhost:8000/api/pairs/ \
 14. F5 reload → Entry/SL/TP/side reset; risk + selectedPairId persist; setup lines biến mất theo form state.
 15. Server thiếu rate cache (cold restart) → preview hiển thị "Conversion rate not ready, retry..." trong vài giây, sau đó tự thành công khi server subscribe-on-miss xong.
 
+### Verify form enhancements (sau khi step 2.9a)
+
+1. Login. Chọn EURUSD. Right-click set Entry/SL/TP → volume preview hiển thị auto values.
+2. Đổi sang USDJPY → Entry/SL/TP **reset hết** + manual volume override (nếu có) cũng reset.
+3. Click **BUY**. Set Entry, sau đó set SL **above** Entry → cảnh báo đỏ "SL must be below Entry for BUY" hiện dưới SL input. Volume calc vẫn chạy.
+4. Click **SELL** → cảnh báo đảo chiều (TP > Entry sẽ trigger warning). Đặt SL > Entry → không còn warning.
+5. Click nút × bên phải Entry → Entry clear, blue line mất khỏi chart.
+6. Với auto volume hiển thị, click **"Override manually"** → Vol Primary thành input edit được (viền xanh). SL distance / Est. SL $ ẩn đi (không còn chính xác trong manual mode).
+7. Sửa Vol Primary thành 0.50 → Vol Secondary auto cập nhật 0.50 (ratio 1.0).
+8. Click **"↻ Reset to auto"** → quay về calculated value.
+9. Tạo lỗi: Entry=1.08 SL=1.07999 (1 pip < min 5 pips) → server trả 400, error hiện kèm link "Override manually" (user vẫn có thể trade thủ công nếu chủ ý).
+10. Trong manual override, đổi symbol → manual override cũng clear (auto mode resume).
+11. F5 reload → toàn bộ field reset (entry/SL/TP/manualVolume KHÔNG persist; risk + selectedPairId persist).
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:
