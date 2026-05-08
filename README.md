@@ -228,6 +228,27 @@ Phase 2 chưa validate `ftmo_account_id`/`exness_account_id` tồn tại — Pha
 8. Resize browser → canvas chart tự co dãn theo.
 9. Refresh page → `selectedSymbol` + `selectedTimeframe` persist (Zustand localStorage).
 
+### Verify live data (sau khi step 2.7)
+
+1. Backend chạy + cTrader OAuth done + market data đang tick.
+2. `cd web && npm run dev`. Mở http://localhost:5173, login.
+3. Top-right header: dot WS chuyển từ "WS: connecting..." (vàng) sang "WS: connected" (xanh) trong 1–2 giây.
+4. Chọn EURUSD trên chart:
+   - 200 candle history load.
+   - Bid line đỏ (dashed) + Ask line xanh (dashed) hiện trên chart.
+   - Top-right toolbar chart hiển thị live bid/ask (font mono, cập nhật 0.1–1 giây/lần).
+   - Last candle update real-time (close price flicker khi tick mới).
+5. Đổi sang USDJPY → bid/ask line snap về range 140–160.
+6. Chờ ≥30s → server ping, client pong, WS giữ nguyên "connected".
+7. Stop backend (Ctrl+C):
+   - WS dot xám "WS: disconnected" trong 1–2s.
+   - Bid/ask line biến mất (latestTick cleared).
+   - Historical chart vẫn hiển thị.
+8. Restart backend → dot vàng → xanh trong 2–5s; `set_symbol` auto-resent; tick line trở lại.
+9. Logout → WS đóng sạch (code 1000), không reconnect.
+10. Login lại → WS connect; symbol/timeframe restore từ localStorage; live data tiếp tục.
+11. DevTools Network → WS → thấy connection persistent + JSON frames (set_symbol, ticks, candles, ping/pong).
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:

@@ -1,6 +1,14 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 
+export interface LatestTick {
+  bid: number | null
+  ask: number | null
+  ts: number
+}
+
+export type WsState = 'disconnected' | 'connecting' | 'connected'
+
 export interface AppState {
   token: string | null
   setToken: (token: string | null) => void
@@ -17,6 +25,14 @@ export interface AppState {
 
   riskAmount: number
   setRiskAmount: (amount: number) => void
+
+  // Runtime-only: latest tick for currently selected symbol (not persisted).
+  latestTick: LatestTick | null
+  setLatestTick: (tick: LatestTick | null) => void
+
+  // Runtime-only: WS connection status for header indicator (not persisted).
+  wsState: WsState
+  setWsState: (state: WsState) => void
 }
 
 export const useAppStore = create<AppState>()(
@@ -37,6 +53,12 @@ export const useAppStore = create<AppState>()(
 
       riskAmount: 100,
       setRiskAmount: (riskAmount) => set({ riskAmount }),
+
+      latestTick: null,
+      setLatestTick: (latestTick) => set({ latestTick }),
+
+      wsState: 'disconnected',
+      setWsState: (wsState) => set({ wsState }),
     }),
     {
       name: 'ftmo-hedge-store',

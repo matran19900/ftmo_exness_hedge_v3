@@ -110,3 +110,45 @@ export async function getOhlc(
   })
   return response.data
 }
+
+// ----- WebSocket messages (server protocol from docs/08-server-api.md §9) -----
+
+export interface WsTickMessage {
+  channel: string // "ticks:EURUSD"
+  data: {
+    type: 'tick'
+    symbol: string
+    bid: number | null
+    ask: number | null
+    ts: number // unix ms
+  }
+}
+
+export interface WsCandleMessage {
+  channel: string // "candles:EURUSD:M15"
+  data: {
+    type: 'candle_update'
+    time: number // unix seconds (Lightweight Charts convention)
+    open: number
+    high: number
+    low: number
+    close: number
+  }
+}
+
+export interface WsPingMessage {
+  type: 'ping'
+}
+
+export interface WsErrorMessage {
+  type: 'error'
+  detail: string
+}
+
+export type WsServerMessage = WsTickMessage | WsCandleMessage | WsPingMessage | WsErrorMessage
+
+export type WsClientMessage =
+  | { type: 'subscribe'; channels: string[] }
+  | { type: 'unsubscribe'; channels: string[] }
+  | { type: 'set_symbol'; symbol: string; timeframe: string }
+  | { type: 'pong' }
