@@ -69,6 +69,23 @@ export async function getSymbolMapping(ftmoSymbol: string): Promise<SymbolMappin
   return response.data
 }
 
+// ----- Pairs -----
+
+export interface PairResponse {
+  pair_id: string
+  name: string
+  ftmo_account_id: string
+  exness_account_id: string
+  ratio: number
+  created_at: number
+  updated_at: number
+}
+
+export async function listPairs(): Promise<PairResponse[]> {
+  const response = await apiClient.get<PairResponse[]>('/pairs/')
+  return response.data
+}
+
 // ----- Charts -----
 
 export interface Candle {

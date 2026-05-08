@@ -249,6 +249,35 @@ Phase 2 chưa validate `ftmo_account_id`/`exness_account_id` tồn tại — Pha
 10. Login lại → WS connect; symbol/timeframe restore từ localStorage; live data tiếp tục.
 11. DevTools Network → WS → thấy connection persistent + JSON frames (set_symbol, ticks, candles, ping/pong).
 
+### Verify order form UI (sau khi step 2.8)
+
+1. Backend chạy. Tạo ít nhất 1 pair qua curl (snippet bên dưới) rồi `cd web && npm run dev` và login.
+2. Right panel hiện form với:
+   - Dropdown "Pair" — populated từ `/api/pairs/` (auto-select pair đầu tiên nếu chưa có selection).
+   - "Symbol" read-only — hiển thị symbol đang xem trên chart.
+   - "Side" — 2 button BUY (xanh) / SELL (đỏ).
+   - Entry / Stop Loss / Take Profit — input số (`step` = `10^-digits`).
+   - Risk Amount (USD) — default 100.
+   - Placeholder "Volume preview: step 2.9".
+   - Button "Place Hedge Order" disabled (Phase 3 sẽ wire).
+3. Click BUY → highlight xanh đậm/trắng. Click SELL → đổi đỏ.
+4. Type Entry "1.08500" → state cập nhật. Type SL/TP tương tự.
+5. F5 reload → Entry/SL/TP/side reset (NOT persisted). Risk Amount + selectedPairId persist (Zustand whitelist).
+6. Đổi symbol trên chart EURUSD → USDJPY: "Symbol" trong form đổi theo, `step` của input chuyển từ `0.00001` sang `0.001`.
+7. DevTools Network: chỉ 1 GET `/api/pairs/` lúc form mount. Submit button không POST (disabled).
+8. Xoá hết pair qua curl rồi reload → form hiện "No pairs configured".
+
+Tạo pair test qua curl:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin"}' | python -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+
+curl -X POST http://localhost:8000/api/pairs/ \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"Test Pair","ftmo_account_id":"ftmo_001","exness_account_id":"exness_001","ratio":1.0}'
+```
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:

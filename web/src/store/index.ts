@@ -9,6 +9,8 @@ export interface LatestTick {
 
 export type WsState = 'disconnected' | 'connecting' | 'connected'
 
+export type OrderSide = 'buy' | 'sell'
+
 export interface AppState {
   token: string | null
   setToken: (token: string | null) => void
@@ -38,6 +40,18 @@ export interface AppState {
   // OHLC load). Default 5 = FX. Not persisted — server is the source of truth.
   symbolDigits: number
   setSymbolDigits: (digits: number) => void
+
+  // Order form draft state. Per-trade, NOT persisted: each session starts with
+  // side='buy' and empty Entry/SL/TP so a stale draft can't bleed into a new
+  // session. (riskAmount + selectedPairId are user prefs and stay persisted.)
+  side: OrderSide
+  setSide: (side: OrderSide) => void
+  entryPrice: number | null
+  setEntryPrice: (price: number | null) => void
+  slPrice: number | null
+  setSlPrice: (price: number | null) => void
+  tpPrice: number | null
+  setTpPrice: (price: number | null) => void
 }
 
 export const useAppStore = create<AppState>()(
@@ -67,6 +81,15 @@ export const useAppStore = create<AppState>()(
 
       symbolDigits: 5,
       setSymbolDigits: (symbolDigits) => set({ symbolDigits }),
+
+      side: 'buy',
+      setSide: (side) => set({ side }),
+      entryPrice: null,
+      setEntryPrice: (entryPrice) => set({ entryPrice }),
+      slPrice: null,
+      setSlPrice: (slPrice) => set({ slPrice }),
+      tpPrice: null,
+      setTpPrice: (tpPrice) => set({ tpPrice }),
     }),
     {
       name: 'ftmo-hedge-store',
