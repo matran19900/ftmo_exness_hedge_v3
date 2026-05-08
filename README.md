@@ -161,6 +161,34 @@ wscat -c "ws://localhost:8000/ws?token=$TOKEN"
 
 Tick stream chạy mỗi 0.1–1s trong giờ market mở. Switch sang USDJPY: gửi tiếp `{"type":"set_symbol","symbol":"USDJPY","timeframe":"M15"}` — server tự unsub EURUSD và sub USDJPY. Server gửi `{"type":"ping"}` mỗi 30s để giữ kết nối sống.
 
+### Verify volume calculator (sau khi step 2.4)
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin"}' \
+  | python -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+
+# EURUSD: risk $100, entry 1.0850, SL 1.0800 (50 pips)
+curl -s -X POST "http://localhost:8000/api/symbols/EURUSD/calculate-volume" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"entry":1.0850,"sl":1.0800,"risk_amount":100,"ratio":1.0}' | python -m json.tool
+```
+
+Kết quả: `volume_primary` ≈ 0.20 lot, `sl_pips` = 50.0, `quote_ccy` = "USD", `quote_to_usd_rate` = 1.0.
+
+USDJPY (`quote_ccy=JPY`) cần USDJPY tick trong cache để tính rate inverse. Nếu chưa có tick:
+
+```bash
+curl -s -X POST "http://localhost:8000/api/symbols/USDJPY/calculate-volume" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"entry":156.50,"sl":156.00,"risk_amount":100,"ratio":1.0}'
+```
+
+Lần đầu trả 503 + server tự subscribe USDJPY spots; sau vài giây retry lại sẽ pass với `quote_to_usd_rate` ≈ 0.0064.
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:
