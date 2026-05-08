@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
 from app.api.auth_ctrader import router as auth_ctrader_router
+from app.api.charts import router as charts_router
 from app.api.health import router as health_router
 from app.api.symbols import router as symbols_router
 from app.config import get_settings
@@ -125,3 +126,4 @@ app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(auth_ctrader_router)
 app.include_router(symbols_router)
+app.include_router(charts_router)

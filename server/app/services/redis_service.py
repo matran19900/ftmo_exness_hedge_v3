@@ -81,6 +81,19 @@ class RedisService:
         """Drop the active-symbols set so a re-sync rebuilds it cleanly."""
         await self._redis.delete("symbols:active")
 
+    # ----- OHLC cache -----
+
+    async def get_ohlc_cache(self, key: str) -> str | None:
+        """Return the cached OHLC JSON string for ``key`` or None if missing/expired."""
+        value = await self._redis.get(f"ohlc:{key}")
+        if value is None:
+            return None
+        return str(value)
+
+    async def set_ohlc_cache(self, key: str, json_str: str, ttl_seconds: int = 60) -> None:
+        """Cache an OHLC JSON payload under ``ohlc:{key}`` with a TTL."""
+        await self._redis.setex(f"ohlc:{key}", ttl_seconds, json_str)
+
 
 def get_redis_service() -> RedisService:
     """FastAPI dependency: build a service over the shared Redis pool."""

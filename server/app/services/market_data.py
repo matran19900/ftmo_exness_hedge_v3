@@ -20,6 +20,7 @@ from ctrader_open_api import Client, Protobuf, TcpProtocol
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAccountAuthReq,
     ProtoOAApplicationAuthReq,
+    ProtoOAGetTrendbarsReq,
     ProtoOASymbolByIdReq,
     ProtoOASymbolsListReq,
 )
@@ -38,6 +39,20 @@ logger = logging.getLogger(__name__)
 # cTrader allows ~5 outbound messages per second per app; we pace slightly under
 # that for sequential calls (used in sync_symbols).
 _INTER_REQUEST_DELAY_SECONDS = 0.25
+
+# Map our timeframe string → cTrader ProtoOATrendbarPeriod enum value (and the
+# bar-length in seconds, used to compute the fromTimestamp for a "last N bars
+# from now" query).
+_TIMEFRAME_TO_PERIOD: dict[str, tuple[int, int]] = {
+    "M1": (1, 60),
+    "M5": (5, 300),
+    "M15": (7, 900),
+    "M30": (8, 1800),
+    "H1": (9, 3600),
+    "H4": (10, 14400),
+    "D1": (12, 86400),
+    "W1": (13, 604800),
+}
 
 
 class MarketDataService:
@@ -231,6 +246,79 @@ class MarketDataService:
             len(broker_index),
         )
         return cached
+
+    async def get_trendbars(
+        self,
+        ftmo_symbol: str,
+        timeframe: str,
+        count: int,
+        redis_svc: RedisService,
+    ) -> list[dict[str, Any]]:
+        """Fetch the last ``count`` historical candles for ``ftmo_symbol``.
+
+        The cTrader symbol id and per-symbol ``digits`` come from the
+        ``symbol_config:{ftmo_symbol}`` hash that ``sync_symbols`` populated.
+        Prices are returned as floats; timestamps are unix seconds (Lightweight
+        Charts convention, per docs/08-server-api.md).
+        """
+        if not self._authenticated.is_set() or self._account_id is None:
+            raise RuntimeError("Not authenticated")
+        if timeframe not in _TIMEFRAME_TO_PERIOD:
+            raise ValueError(
+                f"Invalid timeframe: {timeframe}. Allowed: {sorted(_TIMEFRAME_TO_PERIOD)}"
+            )
+
+        config = await redis_svc.get_symbol_config(ftmo_symbol)
+        if not config or "ctrader_symbol_id" not in config:
+            raise RuntimeError(f"Symbol {ftmo_symbol} not in active set")
+        symbol_id = int(config["ctrader_symbol_id"])
+        # cTrader sends prices as integers scaled by 10**digits; symbol_config
+        # was populated by sync_symbols. Fall back to 5 (FX default) for safety.
+        digits = int(config.get("digits", "5"))
+        scale = float(10**digits)
+
+        period_enum, period_seconds = _TIMEFRAME_TO_PERIOD[timeframe]
+        now_ms = int(time.time() * 1000)
+        from_ms = now_ms - count * period_seconds * 1000
+
+        req = ProtoOAGetTrendbarsReq()
+        req.ctidTraderAccountId = self._account_id
+        req.symbolId = symbol_id
+        req.period = period_enum
+        req.fromTimestamp = from_ms
+        req.toTimestamp = now_ms
+        req.count = count
+
+        response = await self._send_and_wait(req, timeout=30.0)
+
+        candles: list[dict[str, Any]] = []
+        for tb in response.trendbar:
+            time_seconds = int(tb.utcTimestampInMinutes) * 60
+            low = tb.low / scale
+            open_ = (tb.low + tb.deltaOpen) / scale
+            high = (tb.low + tb.deltaHigh) / scale
+            close = (tb.low + tb.deltaClose) / scale
+            candles.append(
+                {
+                    "time": time_seconds,
+                    "open": open_,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": int(tb.volume),
+                }
+            )
+
+        if not candles:
+            logger.warning(
+                "get_trendbars: cTrader returned 0 candles for %s/%s (count=%d)",
+                ftmo_symbol,
+                timeframe,
+                count,
+            )
+
+        candles.sort(key=lambda c: c["time"])
+        return candles
 
     @property
     def is_connected(self) -> bool:

@@ -123,6 +123,20 @@ Phase 2 cần một cTrader market-data account để feed live price + chart da
 
 **Note về availability**: mỗi broker có symbol khác nhau. Whitelist file có 117 symbol; account của bạn có thể ít hơn. Kết quả là intersection.
 
+### Verify chart endpoint (sau khi OAuth xong)
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin"}' \
+  | python -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+
+curl -s "http://localhost:8000/api/charts/EURUSD/ohlc?timeframe=M15&count=20" \
+  -H "Authorization: Bearer $TOKEN" | python -m json.tool | head -30
+```
+
+Trả về 20 candle OHLC. Lần gọi tiếp trong 60s sẽ hit Redis cache (`ohlc:EURUSD:M15:20`) và nhanh hơn rõ rệt.
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:
