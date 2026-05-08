@@ -189,6 +189,33 @@ curl -s -X POST "http://localhost:8000/api/symbols/USDJPY/calculate-volume" \
 
 Lần đầu trả 503 + server tự subscribe USDJPY spots; sau vài giây retry lại sẽ pass với `quote_to_usd_rate` ≈ 0.0064.
 
+### Verify pairs CRUD (sau khi step 2.5)
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin"}' \
+  | python -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+
+# Create
+PAIR=$(curl -s -X POST "http://localhost:8000/api/pairs/" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"FTMO ↔ Exness Test","ftmo_account_id":"ftmo_001","exness_account_id":"exness_001","ratio":1.0}')
+PAIR_ID=$(echo "$PAIR" | python -c "import json,sys; print(json.load(sys.stdin)['pair_id'])")
+echo "Created: $PAIR_ID"
+
+# List, get, update ratio, delete
+curl -s "http://localhost:8000/api/pairs/" -H "Authorization: Bearer $TOKEN" | python -m json.tool
+curl -s "http://localhost:8000/api/pairs/$PAIR_ID" -H "Authorization: Bearer $TOKEN" | python -m json.tool
+curl -s -X PATCH "http://localhost:8000/api/pairs/$PAIR_ID" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"ratio":1.5}' | python -m json.tool
+curl -s -X DELETE -i "http://localhost:8000/api/pairs/$PAIR_ID" -H "Authorization: Bearer $TOKEN" | head -1
+# → HTTP/1.1 204 No Content
+```
+
+Phase 2 chưa validate `ftmo_account_id`/`exness_account_id` tồn tại — Phase 4 sẽ check sau khi accounts CRUD lên.
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:

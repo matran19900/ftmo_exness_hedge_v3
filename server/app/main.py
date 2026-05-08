@@ -16,6 +16,7 @@ from app.api.auth import router as auth_router
 from app.api.auth_ctrader import router as auth_ctrader_router
 from app.api.charts import router as charts_router
 from app.api.health import router as health_router
+from app.api.pairs import router as pairs_router
 from app.api.symbols import router as symbols_router
 from app.api.ws import router as ws_router
 from app.config import get_settings
@@ -132,4 +133,5 @@ app.include_router(auth_router)
 app.include_router(auth_ctrader_router)
 app.include_router(symbols_router)
 app.include_router(charts_router)
+app.include_router(pairs_router)
 app.include_router(ws_router)

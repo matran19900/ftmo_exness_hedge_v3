@@ -110,6 +110,56 @@ class RedisService:
             return None
         return str(value)
 
+    # ----- Pairs CRUD -----
+
+    async def create_pair(self, pair_id: str, fields: dict[str, Any]) -> None:
+        """Atomically create a pair: HSET pair:{id} + SADD pairs:all."""
+        pipe = self._redis.pipeline()
+        pipe.hset(f"pair:{pair_id}", mapping={k: str(v) for k, v in fields.items()})
+        pipe.sadd("pairs:all", pair_id)
+        await pipe.execute()
+
+    async def get_pair(self, pair_id: str) -> dict[str, str] | None:
+        """Return the pair hash by id, or None if not present."""
+        data = await self._redis.hgetall(f"pair:{pair_id}")  # type: ignore[misc]
+        if not data:
+            return None
+        return dict(data)
+
+    async def list_pairs(self) -> list[dict[str, str]]:
+        """Return all pairs sorted by ``created_at`` desc (newest first)."""
+        ids = await self._redis.smembers("pairs:all")  # type: ignore[misc]
+        if not ids:
+            return []
+        out: list[dict[str, str]] = []
+        for pid in ids:
+            data = await self._redis.hgetall(f"pair:{pid}")  # type: ignore[misc]
+            if data:
+                out.append(dict(data))
+        out.sort(key=lambda p: int(p.get("created_at", "0")), reverse=True)
+        return out
+
+    async def update_pair(self, pair_id: str, fields: dict[str, Any]) -> bool:
+        """Patch a pair's fields in place. Return False if the pair doesn't exist."""
+        exists = await self._redis.sismember("pairs:all", pair_id)  # type: ignore[misc]
+        if not exists:
+            return False
+        await self._redis.hset(  # type: ignore[misc]
+            f"pair:{pair_id}", mapping={k: str(v) for k, v in fields.items()}
+        )
+        return True
+
+    async def delete_pair(self, pair_id: str) -> bool:
+        """Atomically delete a pair. Return False if it didn't exist."""
+        exists = await self._redis.sismember("pairs:all", pair_id)  # type: ignore[misc]
+        if not exists:
+            return False
+        pipe = self._redis.pipeline()
+        pipe.delete(f"pair:{pair_id}")
+        pipe.srem("pairs:all", pair_id)
+        await pipe.execute()
+        return True
+
 
 def get_redis_service() -> RedisService:
     """FastAPI dependency: build a service over the shared Redis pool."""
