@@ -17,6 +17,14 @@ import { useAppStore } from '../../store'
 import { SearchSymbolPicker } from './SearchSymbolPicker'
 import { TimeframeSelector } from './TimeframeSelector'
 
+interface TrackedCandle {
+  time: number // unix seconds
+  open: number
+  high: number
+  low: number
+  close: number
+}
+
 export function HedgeChart() {
   const selectedSymbol = useAppStore((s) => s.selectedSymbol)
   const setSelectedSymbol = useAppStore((s) => s.setSelectedSymbol)
@@ -31,6 +39,10 @@ export function HedgeChart() {
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const bidLineRef = useRef<IPriceLine | null>(null)
   const askLineRef = useRef<IPriceLine | null>(null)
+  // Local mirror of the chart's last bar (unix seconds + OHLC). Lets every
+  // tick patch close/high/low without re-fetching from the chart instance,
+  // and gives us a baseline so the first tick after load doesn't reset HL.
+  const lastCandleRef = useRef<TrackedCandle | null>(null)
 
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -107,10 +119,17 @@ export function HedgeChart() {
   useEffect(() => {
     if (!selectedSymbol) {
       seriesRef.current?.setData([])
+      lastCandleRef.current = null
       return undefined
     }
 
     let cancelled = false
+    // Clear the tracked candle eagerly so any tick that arrives during the
+    // ~200ms fetch window for the new symbol is ignored (the tick effect
+    // bails when the ref is null) — prevents the previous symbol's bar from
+    // being patched with the new symbol's bid.
+    lastCandleRef.current = null
+
     async function load() {
       setLoading(true)
       setError(null)
@@ -139,6 +158,19 @@ export function HedgeChart() {
         }))
         seriesRef.current.setData(data)
         chartRef.current?.timeScale().fitContent()
+        // Seed the live-tick effect with the last historical bar as baseline.
+        if (data.length > 0) {
+          const lastBar = data[data.length - 1]!
+          lastCandleRef.current = {
+            time: lastBar.time as number,
+            open: lastBar.open,
+            high: lastBar.high,
+            low: lastBar.low,
+            close: lastBar.close,
+          }
+        } else {
+          lastCandleRef.current = null
+        }
       } catch (err) {
         if (cancelled) return
         const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data
@@ -157,7 +189,10 @@ export function HedgeChart() {
   }, [selectedSymbol, selectedTimeframe, setSymbolDigits])
 
   // Subscribe to live candle updates from the shared WS hook. `series.update`
-  // updates the matching bar in place or appends a new one.
+  // updates the matching bar in place or appends a new one. Server is the
+  // source of truth at bar boundaries — overwrite the tracked ref so the next
+  // tick builds on top of the official OHLC (corrects any drift accumulated
+  // from local tick-driven patches earlier in the bar).
   useEffect(() => {
     function handleCandle(msg: WsCandleMessage) {
       if (!seriesRef.current) return
@@ -168,6 +203,13 @@ export function HedgeChart() {
         low: msg.data.low,
         close: msg.data.close,
       })
+      lastCandleRef.current = {
+        time: msg.data.time,
+        open: msg.data.open,
+        high: msg.data.high,
+        low: msg.data.low,
+        close: msg.data.close,
+      }
     }
     registerCandleHandler(handleCandle)
     return () => registerCandleHandler(null)
@@ -228,6 +270,37 @@ export function HedgeChart() {
       askLineRef.current = null
     }
   }, [latestTick, selectedSymbol])
+
+  // Live candle update from ticks. Use `bid` as the running close (industry
+  // convention — matches TradingView / MetaTrader). High/low are monotonic
+  // within a bar: high only grows, low only shrinks. We always patch the bar
+  // at `tracked.time` (current bar) so series.update never tries to write a
+  // time earlier than the last bar — that would either no-op or throw.
+  useEffect(() => {
+    const series = seriesRef.current
+    const tracked = lastCandleRef.current
+    if (!series || !tracked || !latestTick || latestTick.bid === null) return
+
+    const newClose = latestTick.bid
+    const newHigh = Math.max(tracked.high, newClose)
+    const newLow = Math.min(tracked.low, newClose)
+
+    series.update({
+      time: tracked.time as Time,
+      open: tracked.open,
+      high: newHigh,
+      low: newLow,
+      close: newClose,
+    })
+
+    lastCandleRef.current = {
+      time: tracked.time,
+      open: tracked.open,
+      high: newHigh,
+      low: newLow,
+      close: newClose,
+    }
+  }, [latestTick])
 
   return (
     <div className="h-full bg-white border border-gray-200 rounded flex flex-col">
