@@ -68,3 +68,45 @@ export async function getSymbolMapping(ftmoSymbol: string): Promise<SymbolMappin
   const response = await apiClient.get<SymbolMapping>(`/symbols/${ftmoSymbol}`)
   return response.data
 }
+
+// ----- Charts -----
+
+export interface Candle {
+  time: number // unix seconds (Lightweight Charts convention)
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+}
+
+export interface OhlcResponse {
+  symbol: string
+  timeframe: string
+  count: number
+  candles: Candle[]
+}
+
+export type Timeframe = 'M1' | 'M5' | 'M15' | 'M30' | 'H1' | 'H4' | 'D1' | 'W1'
+
+export const TIMEFRAMES: readonly Timeframe[] = [
+  'M1',
+  'M5',
+  'M15',
+  'M30',
+  'H1',
+  'H4',
+  'D1',
+  'W1',
+] as const
+
+export async function getOhlc(
+  symbol: string,
+  timeframe: Timeframe,
+  count = 200
+): Promise<OhlcResponse> {
+  const response = await apiClient.get<OhlcResponse>(`/charts/${symbol}/ohlc`, {
+    params: { timeframe, count },
+  })
+  return response.data
+}

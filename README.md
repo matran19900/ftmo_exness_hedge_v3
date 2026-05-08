@@ -216,6 +216,18 @@ curl -s -X DELETE -i "http://localhost:8000/api/pairs/$PAIR_ID" -H "Authorizatio
 
 Phase 2 chưa validate `ftmo_account_id`/`exness_account_id` tồn tại — Phase 4 sẽ check sau khi accounts CRUD lên.
 
+### Verify chart UI (sau khi step 2.6)
+
+1. Backend chạy + cTrader OAuth done.
+2. Frontend dev: `cd web && npm run dev`.
+3. Mở http://localhost:5173, login `admin`/`admin`.
+4. Top-left chart panel: click "Select symbol...", search "EUR", chọn EURUSD.
+5. Chart load ~200 candle M15 trong 1–2 giây.
+6. Click M5/M30/H1/D1 → chart reload theo timeframe mới.
+7. Đổi symbol sang USDJPY → giá hiển thị trong khoảng 140–160 (KHÔNG 14000 — verify D-032 đã propagate sang frontend).
+8. Resize browser → canvas chart tự co dãn theo.
+9. Refresh page → `selectedSymbol` + `selectedTimeframe` persist (Zustand localStorage).
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:
