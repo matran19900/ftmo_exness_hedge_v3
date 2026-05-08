@@ -41,10 +41,6 @@ reactor: Any = _reactor
 
 logger = logging.getLogger(__name__)
 
-# cTrader allows ~5 outbound messages per second per app; we pace slightly under
-# that for sequential calls (used in sync_symbols).
-_INTER_REQUEST_DELAY_SECONDS = 0.25
-
 # Map our timeframe string → cTrader ProtoOATrendbarPeriod enum value (and the
 # bar-length in seconds, used to compute the fromTimestamp for a "last N bars
 # from now" query).
@@ -182,7 +178,8 @@ class MarketDataService:
         Steps:
             1. ``ProtoOASymbolsListReq``                     → light symbols.
             2. Match (case-insensitive) against the whitelist.
-            3. For each match, ``ProtoOASymbolByIdReq``      → digits / pip / volume metadata.
+            3. ONE batched ``ProtoOASymbolByIdReq`` carrying every matched id
+               → digits / pip / volume metadata for all symbols (step 2.7b).
             4. ``HSET symbol_config:{FTMO_NAME}`` per match.
             5. ``SADD symbols:active`` per match.
         """
@@ -220,21 +217,44 @@ class MarketDataService:
 
         # Fresh rebuild of the active set.
         await redis_svc.clear_active_symbols()
+
+        # Single batch ProtoOASymbolByIdReq containing every matched broker id.
+        # `symbolId` is a `repeated` protobuf field — appending each id and
+        # firing one request returns details for all of them in one round-trip.
+        # This collapses ~91 sequential RTTs (~60–90s) into one (~1–3s).
+        detail_req = ProtoOASymbolByIdReq()
+        detail_req.ctidTraderAccountId = self._account_id
+        for _, broker_id in matched:
+            detail_req.symbolId.append(broker_id)
+
+        logger.info("sync_symbols: requesting batch details for %d symbols", len(matched))
+        batch_started = time.monotonic()
+        try:
+            detail_resp = await self._send_and_wait(detail_req, timeout=60.0)
+        except Exception:  # noqa: BLE001
+            logger.exception("sync_symbols: batch detail request failed")
+            return 0
+
+        logger.info(
+            "sync_symbols: received batch details for %d symbols in %.2fs",
+            len(detail_resp.symbol),
+            time.monotonic() - batch_started,
+        )
+
+        # Index broker-side details by symbolId for O(1) match against `matched`.
+        detail_by_id: dict[int, Any] = {int(d.symbolId): d for d in detail_resp.symbol}
+
         cached = 0
         for ftmo_name, broker_id in matched:
+            detail = detail_by_id.get(broker_id)
+            if detail is None:
+                logger.warning(
+                    "sync_symbols: broker did not return details for %s (id=%d)",
+                    ftmo_name,
+                    broker_id,
+                )
+                continue
             try:
-                detail_req = ProtoOASymbolByIdReq()
-                detail_req.ctidTraderAccountId = self._account_id
-                detail_req.symbolId.append(broker_id)
-                detail_resp = await self._send_and_wait(detail_req, timeout=30.0)
-                if not detail_resp.symbol:
-                    logger.warning(
-                        "sync_symbols: empty detail response for %s (id=%d)",
-                        ftmo_name,
-                        broker_id,
-                    )
-                    continue
-                detail = detail_resp.symbol[0]
                 mapping = get_symbol_mapping(ftmo_name)
                 config: dict[str, Any] = {
                     "ftmo_symbol": ftmo_name,
@@ -252,10 +272,8 @@ class MarketDataService:
                 await redis_svc.set_symbol_config(ftmo_name, config)
                 await redis_svc.add_active_symbol(ftmo_name)
                 cached += 1
-                # Pace requests so we stay under the 5/sec broker limit.
-                await asyncio.sleep(_INTER_REQUEST_DELAY_SECONDS)
             except Exception:  # noqa: BLE001
-                logger.exception("sync_symbols: failed for %s (id=%d)", ftmo_name, broker_id)
+                logger.exception("sync_symbols: failed to cache %s (id=%d)", ftmo_name, broker_id)
 
         logger.info(
             "sync_symbols: cached %d/%d symbols (broker=%d available)",

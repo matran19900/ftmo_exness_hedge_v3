@@ -8,12 +8,19 @@ from __future__ import annotations
 
 import time
 from typing import Any
+from unittest.mock import AsyncMock
 
 import fakeredis.aioredis
 import httpx
 import pytest
 from app.services.market_data import MarketDataService
 from app.services.redis_service import RedisService
+from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+    ProtoOASymbolByIdReq,
+    ProtoOASymbolByIdRes,
+    ProtoOASymbolsListReq,
+    ProtoOASymbolsListRes,
+)
 from httpx import AsyncClient
 
 
@@ -208,6 +215,140 @@ async def test_login_endpoint_503_when_client_id_missing(client: AsyncClient) ->
     resp = await client.get("/api/auth/ctrader", follow_redirects=False)
     assert resp.status_code == 503
     assert "CTRADER_CLIENT_ID" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_sync_symbols_batches_detail_request(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Step 2.7b: detail fetch is a SINGLE batch request, not per-symbol.
+
+    Before this fix, sync_symbols issued one ProtoOASymbolByIdReq per matched
+    symbol (~91 round-trips, ~60-90s). Now it issues one batch request
+    carrying all matched ids (~1-3s). This test pins that contract:
+
+      - exactly 2 _send_and_wait calls (list + batch detail),
+      - the second call's request has all three matched ids in `symbolId`.
+    """
+    svc = RedisService(fake_redis)
+
+    # 1) List response: three FX symbols, all enabled.
+    list_resp = ProtoOASymbolsListRes()
+    list_resp.ctidTraderAccountId = 42
+    for sym_id, name in [(1, "EURUSD"), (4, "USDJPY"), (2, "GBPUSD")]:
+        s = list_resp.symbol.add()
+        s.symbolId = sym_id
+        s.symbolName = name
+        s.enabled = True
+
+    # 2) Batch detail response: details for all three, returned in a different
+    # order than the list to prove the endpoint indexes by symbolId.
+    detail_resp = ProtoOASymbolByIdRes()
+    detail_resp.ctidTraderAccountId = 42
+    for sym_id, digits, pip_pos in [(4, 3, 1), (1, 5, 4), (2, 5, 4)]:
+        d = detail_resp.symbol.add()
+        d.symbolId = sym_id
+        d.digits = digits
+        d.pipPosition = pip_pos
+        d.minVolume = 1000
+        d.maxVolume = 100_000_000
+        d.stepVolume = 1000
+        d.lotSize = 100_000
+
+    md = _make_service()
+    md._authenticated.set()
+    md._account_id = 42
+    md._send_and_wait = AsyncMock(side_effect=[list_resp, detail_resp])  # type: ignore[method-assign]
+
+    cached = await md.sync_symbols(svc)
+
+    assert cached == 3
+    assert md._send_and_wait.await_count == 2
+
+    first_req = md._send_and_wait.await_args_list[0].args[0]
+    second_req = md._send_and_wait.await_args_list[1].args[0]
+    assert isinstance(first_req, ProtoOASymbolsListReq)
+    assert isinstance(second_req, ProtoOASymbolByIdReq)
+    # Repeated symbolId field carries every matched broker id; order tracks
+    # the whitelist iteration order, which we don't pin in this test — just
+    # assert membership so the test stays robust to whitelist reshuffles.
+    assert sorted(second_req.symbolId) == [1, 2, 4]
+
+    # Configs were written and active set populated for all three.
+    assert sorted(await svc.get_active_symbols()) == ["EURUSD", "GBPUSD", "USDJPY"]
+    eurusd_cfg = await svc.get_symbol_config("EURUSD")
+    assert eurusd_cfg is not None
+    assert eurusd_cfg["digits"] == "5"
+    usdjpy_cfg = await svc.get_symbol_config("USDJPY")
+    assert usdjpy_cfg is not None
+    # Detail-by-id indexing: USDJPY (id=4) gets digits=3 even though the broker
+    # returned it first in the response — proves we don't rely on response order.
+    assert usdjpy_cfg["digits"] == "3"
+
+
+@pytest.mark.asyncio
+async def test_sync_symbols_skips_symbols_missing_from_batch_response(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Fail-soft: when the broker omits a symbol from the batch detail
+    response, sync_symbols logs a warning and caches the rest."""
+    svc = RedisService(fake_redis)
+
+    list_resp = ProtoOASymbolsListRes()
+    list_resp.ctidTraderAccountId = 42
+    for sym_id, name in [(1, "EURUSD"), (4, "USDJPY")]:
+        s = list_resp.symbol.add()
+        s.symbolId = sym_id
+        s.symbolName = name
+        s.enabled = True
+
+    # Broker only returns details for EURUSD (id=1); USDJPY (id=4) is missing.
+    detail_resp = ProtoOASymbolByIdRes()
+    detail_resp.ctidTraderAccountId = 42
+    d = detail_resp.symbol.add()
+    d.symbolId = 1
+    d.digits = 5
+    d.pipPosition = 4
+    d.minVolume = 1000
+    d.maxVolume = 100_000_000
+    d.stepVolume = 1000
+    d.lotSize = 100_000
+
+    md = _make_service()
+    md._authenticated.set()
+    md._account_id = 42
+    md._send_and_wait = AsyncMock(side_effect=[list_resp, detail_resp])  # type: ignore[method-assign]
+
+    cached = await md.sync_symbols(svc)
+
+    assert cached == 1
+    assert await svc.get_active_symbols() == ["EURUSD"]
+    assert await svc.get_symbol_config("USDJPY") is None
+
+
+@pytest.mark.asyncio
+async def test_sync_symbols_returns_zero_when_batch_fails(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """If the batch detail RPC raises, sync_symbols returns 0 with no caches."""
+    svc = RedisService(fake_redis)
+
+    list_resp = ProtoOASymbolsListRes()
+    list_resp.ctidTraderAccountId = 42
+    s = list_resp.symbol.add()
+    s.symbolId = 1
+    s.symbolName = "EURUSD"
+    s.enabled = True
+
+    md = _make_service()
+    md._authenticated.set()
+    md._account_id = 42
+    md._send_and_wait = AsyncMock(side_effect=[list_resp, RuntimeError("timeout")])  # type: ignore[method-assign]
+
+    cached = await md.sync_symbols(svc)
+
+    assert cached == 0
+    assert await svc.get_active_symbols() == []
 
 
 @pytest.mark.asyncio
