@@ -17,9 +17,11 @@ from app.api.auth_ctrader import router as auth_ctrader_router
 from app.api.charts import router as charts_router
 from app.api.health import router as health_router
 from app.api.symbols import router as symbols_router
+from app.api.ws import router as ws_router
 from app.config import get_settings
 from app.redis_client import close_redis, get_redis, init_redis
 from app.services import symbol_whitelist
+from app.services.broadcast import BroadcastService
 from app.services.market_data import MarketDataService
 from app.services.redis_service import RedisService
 
@@ -69,6 +71,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.market_data = None
     redis_svc = RedisService(get_redis())
+    broadcast = BroadcastService(redis_svc=redis_svc)
+    app.state.broadcast = broadcast
     creds = await redis_svc.get_ctrader_market_data_creds()
     if creds and settings.ctrader_client_id and settings.ctrader_client_secret:
         md = MarketDataService(
@@ -77,6 +81,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             client_id=settings.ctrader_client_id,
             client_secret=settings.ctrader_client_secret,
         )
+        md.inject_broadcast(broadcast)
         try:
             await md.start()
             if creds["expires_at"] > int(time.time()):
@@ -127,3 +132,4 @@ app.include_router(auth_router)
 app.include_router(auth_ctrader_router)
 app.include_router(symbols_router)
 app.include_router(charts_router)
+app.include_router(ws_router)

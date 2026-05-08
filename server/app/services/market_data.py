@@ -21,11 +21,16 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAccountAuthReq,
     ProtoOAApplicationAuthReq,
     ProtoOAGetTrendbarsReq,
+    ProtoOASubscribeLiveTrendbarReq,
+    ProtoOASubscribeSpotsReq,
     ProtoOASymbolByIdReq,
     ProtoOASymbolsListReq,
+    ProtoOAUnsubscribeLiveTrendbarReq,
+    ProtoOAUnsubscribeSpotsReq,
 )
 from twisted.internet import reactor as _reactor
 
+from app.services.broadcast import BroadcastService
 from app.services.redis_service import RedisService
 from app.services.symbol_whitelist import get_all_symbols, get_symbol_mapping
 
@@ -54,6 +59,14 @@ _TIMEFRAME_TO_PERIOD: dict[str, tuple[int, int]] = {
     "W1": (13, 604800),
 }
 
+# cTrader Open API payloadType for ProtoOASpotEvent. Verified against the
+# library's protobuf default value at module load time (the enum module
+# isn't exposed by name in this library version).
+_PROTO_OA_SPOT_EVENT = 2131
+
+# All raw cTrader prices are integers uniformly scaled by 10^5 — see D-032.
+_PRICE_SCALE = 100000.0
+
 
 class MarketDataService:
     """Async-friendly facade over a Twisted-driven cTrader client.
@@ -79,6 +92,11 @@ class MarketDataService:
         self._authenticated = asyncio.Event()  # account auth ok
         self._account_id: int | None = None
         self._access_token: str | None = None
+        # Spot/trendbar fan-out state (Phase 2.3).
+        self._broadcast: BroadcastService | None = None
+        self._symbol_id_to_name: dict[int, str] = {}
+        # (ctrader_symbol_id, period_enum) -> (ftmo_symbol, timeframe)
+        self._live_trendbar_map: dict[tuple[int, int], tuple[str, str]] = {}
 
     # ---------- public API ----------
 
@@ -272,12 +290,9 @@ class MarketDataService:
         if not config or "ctrader_symbol_id" not in config:
             raise RuntimeError(f"Symbol {ftmo_symbol} not in active set")
         symbol_id = int(config["ctrader_symbol_id"])
-        # cTrader Open API sends raw trendbar prices as integers uniformly
-        # scaled by 10^5 for ALL instruments (FX, metals, crypto, indices).
-        # The `digits` field stored in symbol_config is a display-formatting
-        # hint and MUST NOT be used for raw price reconstruction. See D-032
-        # (to be added in step 2.10 docs sync).
-        scale = 100000.0
+        # See D-032: cTrader sends raw prices uniformly scaled by 10^5; the
+        # `digits` field in symbol_config is for display formatting only.
+        scale = _PRICE_SCALE
 
         period_enum, period_seconds = _TIMEFRAME_TO_PERIOD[timeframe]
         now_ms = int(time.time() * 1000)
@@ -322,6 +337,92 @@ class MarketDataService:
         candles.sort(key=lambda c: c["time"])
         return candles
 
+    # ---------- spot / live trendbar subscriptions ----------
+
+    def inject_broadcast(self, broadcast: BroadcastService) -> None:
+        """Wire in the BroadcastService that fans out spot/candle events."""
+        self._broadcast = broadcast
+
+    async def subscribe_spots(self, ftmo_symbols: list[str], redis_svc: RedisService) -> None:
+        """Subscribe to spot tick updates for ``ftmo_symbols``. Idempotent server-side."""
+        if not self._authenticated.is_set() or self._account_id is None:
+            raise RuntimeError("Not authenticated")
+        symbol_ids: list[int] = []
+        for ftmo_sym in ftmo_symbols:
+            config = await redis_svc.get_symbol_config(ftmo_sym)
+            if not config or "ctrader_symbol_id" not in config:
+                logger.warning("subscribe_spots: skipping unknown symbol %s", ftmo_sym)
+                continue
+            sid = int(config["ctrader_symbol_id"])
+            symbol_ids.append(sid)
+            self._symbol_id_to_name[sid] = ftmo_sym
+        if not symbol_ids:
+            return
+        req = ProtoOASubscribeSpotsReq()
+        req.ctidTraderAccountId = self._account_id
+        req.symbolId.extend(symbol_ids)
+        await self._send_and_wait(req, timeout=30.0)
+        logger.info("subscribe_spots: %s", ftmo_symbols)
+
+    async def unsubscribe_spots(self, ftmo_symbols: list[str], redis_svc: RedisService) -> None:
+        """Unsubscribe spots best-effort (silently no-op if not authenticated)."""
+        if not self._authenticated.is_set() or self._account_id is None:
+            return
+        symbol_ids: list[int] = []
+        for ftmo_sym in ftmo_symbols:
+            config = await redis_svc.get_symbol_config(ftmo_sym)
+            if config and "ctrader_symbol_id" in config:
+                symbol_ids.append(int(config["ctrader_symbol_id"]))
+        if not symbol_ids:
+            return
+        req = ProtoOAUnsubscribeSpotsReq()
+        req.ctidTraderAccountId = self._account_id
+        req.symbolId.extend(symbol_ids)
+        await self._send_and_wait(req, timeout=10.0)
+        logger.info("unsubscribe_spots: %s", ftmo_symbols)
+
+    async def subscribe_live_trendbar(
+        self, ftmo_symbol: str, timeframe: str, redis_svc: RedisService
+    ) -> None:
+        """Subscribe live trendbar updates for one (symbol, timeframe) pair."""
+        if not self._authenticated.is_set() or self._account_id is None:
+            raise RuntimeError("Not authenticated")
+        if timeframe not in _TIMEFRAME_TO_PERIOD:
+            raise ValueError(f"Invalid timeframe: {timeframe}")
+        config = await redis_svc.get_symbol_config(ftmo_symbol)
+        if not config or "ctrader_symbol_id" not in config:
+            raise RuntimeError(f"Symbol {ftmo_symbol} not in active set")
+        symbol_id = int(config["ctrader_symbol_id"])
+        period_enum, _ = _TIMEFRAME_TO_PERIOD[timeframe]
+        self._live_trendbar_map[(symbol_id, period_enum)] = (ftmo_symbol, timeframe)
+        req = ProtoOASubscribeLiveTrendbarReq()
+        req.ctidTraderAccountId = self._account_id
+        req.symbolId = symbol_id
+        req.period = period_enum
+        await self._send_and_wait(req, timeout=10.0)
+        logger.info("subscribe_live_trendbar: %s %s", ftmo_symbol, timeframe)
+
+    async def unsubscribe_live_trendbar(
+        self, ftmo_symbol: str, timeframe: str, redis_svc: RedisService
+    ) -> None:
+        """Unsubscribe live trendbar best-effort."""
+        if not self._authenticated.is_set() or self._account_id is None:
+            return
+        if timeframe not in _TIMEFRAME_TO_PERIOD:
+            return
+        config = await redis_svc.get_symbol_config(ftmo_symbol)
+        if not config or "ctrader_symbol_id" not in config:
+            return
+        symbol_id = int(config["ctrader_symbol_id"])
+        period_enum, _ = _TIMEFRAME_TO_PERIOD[timeframe]
+        self._live_trendbar_map.pop((symbol_id, period_enum), None)
+        req = ProtoOAUnsubscribeLiveTrendbarReq()
+        req.ctidTraderAccountId = self._account_id
+        req.symbolId = symbol_id
+        req.period = period_enum
+        await self._send_and_wait(req, timeout=10.0)
+        logger.info("unsubscribe_live_trendbar: %s %s", ftmo_symbol, timeframe)
+
     @property
     def is_connected(self) -> bool:
         return self._connected.is_set()
@@ -357,17 +458,66 @@ class MarketDataService:
             self._loop.call_soon_threadsafe(self._authenticated.clear)
 
     def _on_message(self, _client: Any, message: Any) -> None:
-        """Unsolicited and solicited messages both flow here.
+        """Unsolicited and solicited messages flow here.
 
         Solicited responses are routed to their per-clientMsgId Deferred by the
-        underlying client; this callback only logs unexpected ones for now.
-        Phase 2.3 will dispatch ProtoOASpotEvent / ProtoOATrendbarEvent here.
+        underlying client. We only handle unsolicited stream events (spot ticks
+        and live trendbar updates) here — both arrive as ProtoOASpotEvent.
         """
         try:
             payload_type = getattr(message, "payloadType", None)
-            logger.debug("cTrader message received: payloadType=%s", payload_type)
+            if payload_type == _PROTO_OA_SPOT_EVENT:
+                spot = Protobuf.extract(message)
+                self._handle_spot_event(spot)
         except Exception:  # noqa: BLE001
-            pass
+            logger.exception("Error handling cTrader message")
+
+    def _handle_spot_event(self, spot: Any) -> None:
+        """Translate ProtoOASpotEvent into tick + (optional) candle broadcasts.
+
+        Runs in the Twisted reactor thread; all asyncio work is scheduled on
+        the captured event loop via ``asyncio.run_coroutine_threadsafe``.
+        """
+        if self._loop is None or self._broadcast is None:
+            return
+        symbol_id = int(spot.symbolId)
+        ftmo_sym = self._symbol_id_to_name.get(symbol_id)
+        if ftmo_sym is None:
+            return
+
+        bid = float(spot.bid) / _PRICE_SCALE if spot.HasField("bid") else None
+        ask = float(spot.ask) / _PRICE_SCALE if spot.HasField("ask") else None
+        if bid is not None or ask is not None:
+            tick = {
+                "type": "tick",
+                "symbol": ftmo_sym,
+                "bid": bid,
+                "ask": ask,
+                "ts": int(time.time() * 1000),
+            }
+            asyncio.run_coroutine_threadsafe(
+                self._broadcast.publish_tick(ftmo_sym, tick), self._loop
+            )
+
+        for tb in spot.trendbar:
+            period_enum = int(tb.period)
+            entry = self._live_trendbar_map.get((symbol_id, period_enum))
+            if entry is None:
+                continue
+            _, timeframe = entry
+            time_seconds = int(tb.utcTimestampInMinutes) * 60
+            low_raw = int(tb.low)
+            candle = {
+                "type": "candle_update",
+                "time": time_seconds,
+                "open": (low_raw + int(tb.deltaOpen)) / _PRICE_SCALE,
+                "high": (low_raw + int(tb.deltaHigh)) / _PRICE_SCALE,
+                "low": low_raw / _PRICE_SCALE,
+                "close": (low_raw + int(tb.deltaClose)) / _PRICE_SCALE,
+            }
+            asyncio.run_coroutine_threadsafe(
+                self._broadcast.publish_candle(ftmo_sym, timeframe, candle), self._loop
+            )
 
     # ---------- async <-> Twisted bridge ----------
 

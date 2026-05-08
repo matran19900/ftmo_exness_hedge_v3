@@ -137,6 +137,30 @@ curl -s "http://localhost:8000/api/charts/EURUSD/ohlc?timeframe=M15&count=20" \
 
 Trả về 20 candle OHLC. Lần gọi tiếp trong 60s sẽ hit Redis cache (`ohlc:EURUSD:M15:20`) và nhanh hơn rõ rệt.
 
+### Verify WebSocket endpoint (sau khi step 2.3)
+
+Cài `wscat` (1 lần / devcontainer):
+
+```bash
+npm install -g wscat
+```
+
+Connect và bật stream cho EURUSD M15:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin"}' \
+  | python -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+
+wscat -c "ws://localhost:8000/ws?token=$TOKEN"
+> {"type":"set_symbol","symbol":"EURUSD","timeframe":"M15"}
+< {"channel":"ticks:EURUSD","data":{"type":"tick","symbol":"EURUSD","bid":1.08412,"ask":1.08415,"ts":1735000000000}}
+< {"channel":"candles:EURUSD:M15","data":{"type":"candle_update","time":1735000000,"open":1.08400,...}}
+```
+
+Tick stream chạy mỗi 0.1–1s trong giờ market mở. Switch sang USDJPY: gửi tiếp `{"type":"set_symbol","symbol":"USDJPY","timeframe":"M15"}` — server tự unsub EURUSD và sub USDJPY. Server gửi `{"type":"ping"}` mỗi 30s để giữ kết nối sống.
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:

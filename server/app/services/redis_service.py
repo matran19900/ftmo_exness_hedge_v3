@@ -94,6 +94,22 @@ class RedisService:
         """Cache an OHLC JSON payload under ``ohlc:{key}`` with a TTL."""
         await self._redis.setex(f"ohlc:{key}", ttl_seconds, json_str)
 
+    # ----- Tick cache (latest bid/ask per symbol) -----
+
+    async def set_tick_cache(self, ftmo_symbol: str, json_str: str, ttl_seconds: int = 60) -> None:
+        """Cache the latest tick under ``tick:{ftmo_symbol}`` with a TTL.
+
+        Used by Phase 2.4 conversion-rate calc and Phase 3 P&L snapshots.
+        """
+        await self._redis.setex(f"tick:{ftmo_symbol}", ttl_seconds, json_str)
+
+    async def get_tick_cache(self, ftmo_symbol: str) -> str | None:
+        """Return the cached tick JSON string, or None if missing/expired."""
+        value = await self._redis.get(f"tick:{ftmo_symbol}")
+        if value is None:
+            return None
+        return str(value)
+
 
 def get_redis_service() -> RedisService:
     """FastAPI dependency: build a service over the shared Redis pool."""
