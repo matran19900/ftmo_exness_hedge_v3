@@ -84,6 +84,9 @@ export interface OhlcResponse {
   symbol: string
   timeframe: string
   count: number
+  // Display precision for the symbol (e.g. EURUSD=5, USDJPY=3, XAUUSD=2).
+  // Drives chart Y-axis priceFormat + toolbar bid/ask formatting.
+  digits: number
   candles: Candle[]
 }
 

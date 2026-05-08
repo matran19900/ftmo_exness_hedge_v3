@@ -33,6 +33,11 @@ export interface AppState {
   // Runtime-only: WS connection status for header indicator (not persisted).
   wsState: WsState
   setWsState: (state: WsState) => void
+
+  // Runtime-only: display precision for the active symbol (refreshed on each
+  // OHLC load). Default 5 = FX. Not persisted — server is the source of truth.
+  symbolDigits: number
+  setSymbolDigits: (digits: number) => void
 }
 
 export const useAppStore = create<AppState>()(
@@ -59,6 +64,9 @@ export const useAppStore = create<AppState>()(
 
       wsState: 'disconnected',
       setWsState: (wsState) => set({ wsState }),
+
+      symbolDigits: 5,
+      setSymbolDigits: (symbolDigits) => set({ symbolDigits }),
     }),
     {
       name: 'ftmo-hedge-store',

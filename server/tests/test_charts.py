@@ -115,11 +115,43 @@ async def test_ohlc_returns_correct_payload_shape(
     assert body["symbol"] == "EURUSD"
     assert body["timeframe"] == "M15"
     assert body["count"] == 3
+    # No symbol_config seeded → endpoint falls back to default 5-digit precision.
+    assert body["digits"] == 5
     assert len(body["candles"]) == 3
     first = body["candles"][0]
     for field in ("time", "open", "high", "low", "close", "volume"):
         assert field in first
     override_md.get_trendbars.assert_awaited_once_with("EURUSD", "M15", 3, _AnyArg())
+
+
+@pytest.mark.asyncio
+async def test_ohlc_digits_from_symbol_config(
+    authed_client: AsyncClient,
+    override_md: AsyncMock,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """When symbol_config has digits=3 (e.g. JPY pairs), response.digits == 3."""
+    svc = RedisService(fake_redis)
+    await svc.set_symbol_config("USDJPY", {"ctrader_symbol_id": "42", "digits": "3"})
+
+    resp = await authed_client.get("/api/charts/USDJPY/ohlc?timeframe=M15&count=3")
+    assert resp.status_code == 200
+    assert resp.json()["digits"] == 3
+
+
+@pytest.mark.asyncio
+async def test_ohlc_digits_default_when_config_missing_field(
+    authed_client: AsyncClient,
+    override_md: AsyncMock,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """symbol_config without `digits` field → fallback to default 5."""
+    svc = RedisService(fake_redis)
+    await svc.set_symbol_config("EURUSD", {"ctrader_symbol_id": "1"})
+
+    resp = await authed_client.get("/api/charts/EURUSD/ohlc?timeframe=M15&count=3")
+    assert resp.status_code == 200
+    assert resp.json()["digits"] == 5
 
 
 @pytest.mark.asyncio

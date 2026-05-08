@@ -23,6 +23,8 @@ export function HedgeChart() {
   const selectedTimeframe = useAppStore((s) => s.selectedTimeframe) as Timeframe
   const setSelectedTimeframe = useAppStore((s) => s.setSelectedTimeframe)
   const latestTick = useAppStore((s) => s.latestTick)
+  const symbolDigits = useAppStore((s) => s.symbolDigits)
+  const setSymbolDigits = useAppStore((s) => s.setSymbolDigits)
 
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -72,6 +74,10 @@ export function HedgeChart() {
       borderDownColor: '#ef4444',
       wickUpColor: '#10b981',
       wickDownColor: '#ef4444',
+      // Hide the v5 default last-close axis label + horizontal price line so
+      // the only horizontals on the chart are the explicit bid/ask we draw.
+      lastValueVisible: false,
+      priceLineVisible: false,
     })
 
     chartRef.current = chart
@@ -111,6 +117,17 @@ export function HedgeChart() {
       try {
         const res = await getOhlc(selectedSymbol!, selectedTimeframe, 200)
         if (cancelled || !seriesRef.current) return
+        // Apply per-symbol price format BEFORE setData so the very first paint
+        // uses the right precision (no flash of "1.08" → "1.08432" on EURUSD).
+        // minMove = 10^-digits: e.g. digits=5 → 0.00001, digits=3 → 0.001.
+        seriesRef.current.applyOptions({
+          priceFormat: {
+            type: 'price',
+            precision: res.digits,
+            minMove: Math.pow(10, -res.digits),
+          },
+        })
+        setSymbolDigits(res.digits)
         const data: CandlestickData[] = res.candles.map((c: Candle) => ({
           // Lightweight Charts accepts unix seconds at runtime but its Time
           // type is a tagged union — narrow with a single cast at the boundary.
@@ -137,7 +154,7 @@ export function HedgeChart() {
     return () => {
       cancelled = true
     }
-  }, [selectedSymbol, selectedTimeframe])
+  }, [selectedSymbol, selectedTimeframe, setSymbolDigits])
 
   // Subscribe to live candle updates from the shared WS hook. `series.update`
   // updates the matching bar in place or appends a new one.
@@ -222,9 +239,9 @@ export function HedgeChart() {
         <div className="flex items-center gap-3">
           {latestTick && latestTick.bid !== null && latestTick.ask !== null && (
             <span className="text-xs font-mono">
-              <span className="text-red-600">{latestTick.bid.toFixed(5)}</span>
+              <span className="text-red-600">{latestTick.bid.toFixed(symbolDigits)}</span>
               <span className="text-gray-400">{' / '}</span>
-              <span className="text-green-600">{latestTick.ask.toFixed(5)}</span>
+              <span className="text-green-600">{latestTick.ask.toFixed(symbolDigits)}</span>
             </span>
           )}
           {loading && <span className="text-xs text-gray-500">Loading...</span>}
