@@ -2,6 +2,7 @@ import {
   CandlestickSeries,
   ColorType,
   createChart,
+  CrosshairMode,
   type CandlestickData,
   type IChartApi,
   type ISeriesApi,
@@ -49,6 +50,9 @@ export function HedgeChart() {
         borderColor: '#e5e7eb',
       },
       rightPriceScale: { borderColor: '#e5e7eb' },
+      // Free cursor (no snap to candle close) — needed in step 2.7 for picking
+      // exact price levels via right-click set Entry/SL/TP.
+      crosshair: { mode: CrosshairMode.Normal },
     })
 
     // lightweight-charts v5 uses ``addSeries(SeriesDef, options)`` instead of
