@@ -188,14 +188,35 @@ export function HedgeChart() {
     }
   }, [selectedSymbol, selectedTimeframe, setSymbolDigits])
 
-  // Subscribe to live candle updates from the shared WS hook. `series.update`
-  // updates the matching bar in place or appends a new one. Server is the
-  // source of truth at bar boundaries — overwrite the tracked ref so the next
-  // tick builds on top of the official OHLC (corrects any drift accumulated
-  // from local tick-driven patches earlier in the bar).
+  // Subscribe to live candle updates from the shared WS hook.
+  //
+  // Two paths:
+  //   1. In-bar update (msg.time === tracked.time): the tick stream is the
+  //      single source of truth for in-bar redraws. Calling series.update
+  //      here would race with the tick effect and visibly flicker (server's
+  //      mid-bar snapshot close vs the fresher tick-derived close). We still
+  //      sync the server's authoritative open and any new high/low into the
+  //      ref via Math.max / Math.min so the NEXT tick effect builds from a
+  //      correct baseline — server's close is dropped because it's stale.
+  //   2. Bar boundary or first candle (different time, or no tracked bar):
+  //      server is source of truth — paint via series.update and reset ref
+  //      so subsequent ticks build on the new bar.
   useEffect(() => {
     function handleCandle(msg: WsCandleMessage) {
       if (!seriesRef.current) return
+
+      const tracked = lastCandleRef.current
+      if (tracked && msg.data.time === tracked.time) {
+        lastCandleRef.current = {
+          time: tracked.time,
+          open: msg.data.open,
+          high: Math.max(tracked.high, msg.data.high),
+          low: Math.min(tracked.low, msg.data.low),
+          close: tracked.close,
+        }
+        return
+      }
+
       seriesRef.current.update({
         time: msg.data.time as Time,
         open: msg.data.open,
