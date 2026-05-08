@@ -256,10 +256,10 @@ class MarketDataService:
     ) -> list[dict[str, Any]]:
         """Fetch the last ``count`` historical candles for ``ftmo_symbol``.
 
-        The cTrader symbol id and per-symbol ``digits`` come from the
-        ``symbol_config:{ftmo_symbol}`` hash that ``sync_symbols`` populated.
-        Prices are returned as floats; timestamps are unix seconds (Lightweight
-        Charts convention, per docs/08-server-api.md).
+        The cTrader symbol id comes from the ``symbol_config:{ftmo_symbol}``
+        hash that ``sync_symbols`` populated. Prices are returned as floats;
+        timestamps are unix seconds (Lightweight Charts convention, per
+        docs/08-server-api.md).
         """
         if not self._authenticated.is_set() or self._account_id is None:
             raise RuntimeError("Not authenticated")
@@ -272,10 +272,12 @@ class MarketDataService:
         if not config or "ctrader_symbol_id" not in config:
             raise RuntimeError(f"Symbol {ftmo_symbol} not in active set")
         symbol_id = int(config["ctrader_symbol_id"])
-        # cTrader sends prices as integers scaled by 10**digits; symbol_config
-        # was populated by sync_symbols. Fall back to 5 (FX default) for safety.
-        digits = int(config.get("digits", "5"))
-        scale = float(10**digits)
+        # cTrader Open API sends raw trendbar prices as integers uniformly
+        # scaled by 10^5 for ALL instruments (FX, metals, crypto, indices).
+        # The `digits` field stored in symbol_config is a display-formatting
+        # hint and MUST NOT be used for raw price reconstruction. See D-032
+        # (to be added in step 2.10 docs sync).
+        scale = 100000.0
 
         period_enum, period_seconds = _TIMEFRAME_TO_PERIOD[timeframe]
         now_ms = int(time.time() * 1000)

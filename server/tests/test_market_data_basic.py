@@ -32,6 +32,69 @@ def test_market_data_initial_state_is_idle() -> None:
     assert md.is_authenticated is False
 
 
+@pytest.mark.asyncio
+async def test_get_trendbars_uses_fixed_scale_not_digits(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Regression for step 2.2a: cTrader sends raw trendbar prices uniformly
+    scaled by 10^5, regardless of the symbol's display digits.
+
+    Before the fix, USDJPY (digits=3 in symbol_config) was divided by 10^3,
+    yielding 100x-too-large prices. The fix ignores `digits` and always
+    divides by 100000.0. This test proves the bug shape: with the buggy
+    `digits`-driven scale, the assertion at the bottom would fail for any
+    non-5-digit symbol.
+    """
+    from ctrader_open_api import Protobuf
+    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoMessage
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetTrendbarsRes
+
+    # Seed Redis with a USDJPY symbol_config — digits=3 (the trap).
+    svc = RedisService(fake_redis)
+    await svc.set_symbol_config(
+        "USDJPY",
+        {"ctrader_symbol_id": 4, "digits": 3},
+    )
+
+    # Build a fake cTrader response with one trendbar whose `low` is the raw
+    # integer 15690000 — i.e. price 156.90 at the correct 10^5 scale.
+    resp = ProtoOAGetTrendbarsRes()
+    resp.ctidTraderAccountId = 42
+    resp.symbolId = 4
+    resp.period = 7  # M15
+    resp.timestamp = 0  # required field
+    tb = resp.trendbar.add()
+    tb.utcTimestampInMinutes = 28_500_000  # arbitrary, ~2024-ish
+    tb.low = 15_690_000
+    tb.deltaOpen = 0
+    tb.deltaHigh = 10
+    tb.deltaClose = 5
+    tb.volume = 1234
+
+    wrapper = ProtoMessage()
+    wrapper.payloadType = resp.payloadType
+    wrapper.payload = resp.SerializeToString()
+    extracted = Protobuf.extract(wrapper)
+
+    md = _make_service()
+    md._authenticated.set()  # bypass auth gate
+    md._account_id = 42
+
+    async def fake_send_and_wait(message: Any, timeout: float = 30.0) -> Any:
+        return extracted
+
+    md._send_and_wait = fake_send_and_wait  # type: ignore[method-assign]
+
+    candles = await md.get_trendbars("USDJPY", "M15", 1, svc)
+    assert len(candles) == 1
+    candle = candles[0]
+    # Correct: 15_690_000 / 10^5 = 156.90. Buggy 10**digits=10^3 would have
+    # produced 15690.0 — assert against the correct value.
+    assert candle["low"] == pytest.approx(156.9, rel=1e-6)
+    assert candle["close"] == pytest.approx(156.90005, rel=1e-6)
+    assert candle["volume"] == 1234
+
+
 def test_protobuf_extract_unwraps_proto_message_wrapper() -> None:
     """Regression for step 2.1b: cTrader returns a ProtoMessage wrapper that
     has only payloadType / payload / clientMsgId. Callers want the inner
