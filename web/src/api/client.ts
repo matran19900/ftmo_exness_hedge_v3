@@ -131,6 +131,37 @@ export async function getOhlc(
   return response.data
 }
 
+// ----- Volume calculation -----
+
+export interface CalculateVolumeRequest {
+  entry: number
+  sl: number
+  risk_amount: number
+  ratio: number
+}
+
+export interface CalculateVolumeResponse {
+  symbol: string
+  volume_primary: number
+  volume_secondary: number
+  sl_pips: number
+  pip_value_usd_per_lot: number
+  sl_usd_per_lot: number
+  quote_ccy: string
+  quote_to_usd_rate: number
+}
+
+export async function calculateVolume(
+  symbol: string,
+  req: CalculateVolumeRequest
+): Promise<CalculateVolumeResponse> {
+  const response = await apiClient.post<CalculateVolumeResponse>(
+    `/symbols/${symbol}/calculate-volume`,
+    req
+  )
+  return response.data
+}
+
 // ----- WebSocket messages (server protocol from docs/08-server-api.md §9) -----
 
 export interface WsTickMessage {

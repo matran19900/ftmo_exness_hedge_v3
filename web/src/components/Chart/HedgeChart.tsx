@@ -14,6 +14,7 @@ import { useEffect, useRef, useState } from 'react'
 import { getOhlc, type Candle, type Timeframe, type WsCandleMessage } from '../../api/client'
 import { useWebSocket } from '../../hooks/useWebSocket'
 import { useAppStore } from '../../store'
+import { ChartContextMenu } from './ChartContextMenu'
 import { SearchSymbolPicker } from './SearchSymbolPicker'
 import { TimeframeSelector } from './TimeframeSelector'
 
@@ -33,12 +34,18 @@ export function HedgeChart() {
   const latestTick = useAppStore((s) => s.latestTick)
   const symbolDigits = useAppStore((s) => s.symbolDigits)
   const setSymbolDigits = useAppStore((s) => s.setSymbolDigits)
+  const entryPrice = useAppStore((s) => s.entryPrice)
+  const slPrice = useAppStore((s) => s.slPrice)
+  const tpPrice = useAppStore((s) => s.tpPrice)
 
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const bidLineRef = useRef<IPriceLine | null>(null)
   const askLineRef = useRef<IPriceLine | null>(null)
+  const entryLineRef = useRef<IPriceLine | null>(null)
+  const slLineRef = useRef<IPriceLine | null>(null)
+  const tpLineRef = useRef<IPriceLine | null>(null)
   // Local mirror of the chart's last bar (unix seconds + OHLC). Lets every
   // tick patch close/high/low without re-fetching from the chart instance,
   // and gives us a baseline so the first tick after load doesn't reset HL.
@@ -46,6 +53,9 @@ export function HedgeChart() {
 
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; price: number } | null>(
+    null
+  )
 
   const { registerCandleHandler } = useWebSocket()
 
@@ -112,6 +122,9 @@ export function HedgeChart() {
       seriesRef.current = null
       bidLineRef.current = null
       askLineRef.current = null
+      entryLineRef.current = null
+      slLineRef.current = null
+      tpLineRef.current = null
     }
   }, [])
 
@@ -292,6 +305,85 @@ export function HedgeChart() {
     }
   }, [latestTick, selectedSymbol])
 
+  // Setup lines (Entry blue, SL red, TP green) reactive to form state. Each
+  // line is upserted via createPriceLine + applyOptions; null/0 prices remove
+  // the line. Lines persist across symbol switches per CEO directive — the
+  // form keeps Entry/SL/TP until the user clears them or reloads.
+  useEffect(() => {
+    const series = seriesRef.current
+    if (!series) return
+
+    function upsert(
+      ref: React.MutableRefObject<IPriceLine | null>,
+      price: number | null,
+      color: string,
+      title: string
+    ) {
+      if (!series) return
+      if (price === null || price <= 0) {
+        if (ref.current) {
+          series.removePriceLine(ref.current)
+          ref.current = null
+        }
+        return
+      }
+      if (ref.current) {
+        ref.current.applyOptions({ price })
+      } else {
+        ref.current = series.createPriceLine({
+          price,
+          color,
+          lineWidth: 1,
+          lineStyle: LineStyle.Dashed,
+          axisLabelVisible: true,
+          title,
+        })
+      }
+    }
+
+    upsert(entryLineRef, entryPrice, '#3b82f6', 'Entry')
+    upsert(slLineRef, slPrice, '#dc2626', 'SL')
+    upsert(tpLineRef, tpPrice, '#16a34a', 'TP')
+  }, [entryPrice, slPrice, tpPrice])
+
+  // Right-click on the chart container → open context menu with the price
+  // under the cursor. Uses the v5 ISeriesApi.coordinateToPrice(y) — y is in
+  // chart-container coordinates, derived from clientY minus the container's
+  // bounding rect top.
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+
+    function handleContextMenu(e: MouseEvent) {
+      const series = seriesRef.current
+      if (!series || !container) return
+      e.preventDefault()
+      const rect = container.getBoundingClientRect()
+      const yInContainer = e.clientY - rect.top
+      const price = series.coordinateToPrice(yInContainer)
+      if (price === null) return
+      setContextMenu({ x: e.clientX, y: e.clientY, price: price as number })
+    }
+
+    container.addEventListener('contextmenu', handleContextMenu)
+    return () => container.removeEventListener('contextmenu', handleContextMenu)
+  }, [])
+
+  // Close the context menu on any document click. The 0ms setTimeout defers
+  // the listener registration past the same right-click event tick that just
+  // opened the menu, so the opening click doesn't immediately close it.
+  useEffect(() => {
+    if (!contextMenu) return
+    const handleClick = () => setContextMenu(null)
+    const t = window.setTimeout(() => {
+      document.addEventListener('click', handleClick)
+    }, 0)
+    return () => {
+      window.clearTimeout(t)
+      document.removeEventListener('click', handleClick)
+    }
+  }, [contextMenu])
+
   // Live candle update from ticks. Use `bid` as the running close (industry
   // convention — matches TradingView / MetaTrader). High/low are monotonic
   // within a bar: high only grows, low only shrinks. We always patch the bar
@@ -355,6 +447,16 @@ export function HedgeChart() {
         )}
         <div ref={containerRef} className="w-full h-full" />
       </div>
+
+      {contextMenu && (
+        <ChartContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          price={contextMenu.price}
+          digits={symbolDigits}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
     </div>
   )
 }

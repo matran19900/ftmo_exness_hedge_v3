@@ -3,6 +3,7 @@ import { PairPicker } from './PairPicker'
 import { PriceInput } from './PriceInput'
 import { RiskAmountInput } from './RiskAmountInput'
 import { SideSelector } from './SideSelector'
+import { VolumeCalculator } from './VolumeCalculator'
 
 export function HedgeOrderForm() {
   const selectedSymbol = useAppStore((s) => s.selectedSymbol)
@@ -46,7 +47,8 @@ export function HedgeOrderForm() {
       <RiskAmountInput />
 
       <div className="border-t border-gray-200 pt-3">
-        <div className="text-xs text-gray-500 italic">Volume preview: step 2.9</div>
+        <div className="text-xs font-medium text-gray-600 mb-2">Volume Preview</div>
+        <VolumeCalculator />
       </div>
 
       <button

@@ -278,6 +278,27 @@ curl -X POST http://localhost:8000/api/pairs/ \
   -d '{"name":"Test Pair","ftmo_account_id":"ftmo_001","exness_account_id":"exness_001","ratio":1.0}'
 ```
 
+### Verify chart-form integration (sau khi step 2.9)
+
+1. Backend chạy + cTrader OAuth + ticks streaming. Tạo ít nhất 1 pair (curl snippet ở step 2.8).
+2. `cd web && npm run dev`. Login. Chọn EURUSD → live data flowing.
+3. Right-click trên chart canvas → menu hiện 3 mục:
+   - Set as Entry (price, 5 digits)
+   - Set as SL (price, 5 digits)
+   - Set as TP (price, 5 digits)
+4. Click "Set as Entry" → form Entry populated; line **xanh dashed** ("Entry") hiện trên chart đúng giá đó.
+5. Right-click dưới Entry → "Set as SL" → form SL populated; line **đỏ dashed** ("SL") xuất hiện.
+6. Right-click trên Entry → "Set as TP" → form TP populated; line **xanh lá dashed** ("TP") xuất hiện.
+7. Sau ~300ms, Volume Preview cập nhật: Vol P, Vol S, SL distance (pips), Est. SL $.
+8. Type tay vào Entry/SL/TP → setup line trên chart đổi reactive; volume preview tính lại.
+9. Xóa Entry (delete value) → blue line biến mất.
+10. Đổi sang USDJPY → context menu hiển thị giá 3 digits. Setup line giữ nguyên (form state retained per CEO).
+11. Set SL = Entry → volume preview về "idle" (Fill Entry, SL, Risk message).
+12. DevTools Network: mỗi thay đổi form chỉ trigger 1 POST `/api/symbols/{symbol}/calculate-volume` SAU 300ms (debounce), KHÔNG mỗi keystroke.
+13. Click ngoài menu → menu đóng. Right-click → menu mở lại.
+14. F5 reload → Entry/SL/TP/side reset; risk + selectedPairId persist; setup lines biến mất theo form state.
+15. Server thiếu rate cache (cold restart) → preview hiển thị "Conversion rate not ready, retry..." trong vài giây, sau đó tự thành công khi server subscribe-on-miss xong.
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:
