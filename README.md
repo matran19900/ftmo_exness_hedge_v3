@@ -313,6 +313,18 @@ curl -X POST http://localhost:8000/api/pairs/ \
 10. Trong manual override, đổi symbol → manual override cũng clear (auto mode resume).
 11. F5 reload → toàn bộ field reset (entry/SL/TP/manualVolume KHÔNG persist; risk + selectedPairId persist).
 
+### Verify side validation + manual metrics (sau khi step 2.9b)
+
+1. Set BUY + Entry=1.085 + SL=1.090 (above Entry) → SL warning đỏ + Volume Preview hiện "BUY: SL must be below Entry". DevTools Network: KHÔNG có POST `/calculate-volume`.
+2. Đổi SL=1.080 (dưới Entry) → error clear, volume calc chạy.
+3. Đổi sang SELL với SL=1.080 (dưới Entry) → "SELL: SL must be above Entry" — không có POST.
+4. Set TP sai chiều (BUY với TP < Entry) → soft warning bên cạnh TP input, volume calc VẪN CHẠY (TP optional).
+5. Click "Override manually" với valid auto result → manual mode hiển thị Vol P (editable) + Vol S + **SL distance pips + Est. SL $** (manual mode giờ giữ metrics).
+6. Sửa Vol P thành 0.50 → Est. SL $ cập nhật theo volume mới (sl_usd_per_lot × 0.50).
+7. Tạo lỗi auto (503 / 400) trong khi manual mode → SL distance + Est. SL $ ẩn (không stale).
+8. Side error xảy ra trong manual mode: đổi SL violate side → Volume Preview hiện side error; Vol P input vẫn edit được nhưng metrics ẩn. Fix SL → metrics quay lại NGAY (state.result preserved).
+9. Phase-3 prep: Zustand `volumeReady` = true khi (auto ready hoặc manual > 0) AND không có side error; false trong các trường hợp khác.
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:

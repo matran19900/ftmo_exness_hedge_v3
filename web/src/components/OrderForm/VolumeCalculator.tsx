@@ -1,13 +1,19 @@
 import { useEffect, useState, type ChangeEvent } from 'react'
 import { calculateVolume, type CalculateVolumeResponse } from '../../api/client'
 import { useDebouncedValue } from '../../hooks/useDebouncedValue'
+import { validateSideDirection } from '../../lib/orderValidation'
 import { useAppStore } from '../../store'
 
 const DEBOUNCE_MS = 300
 // Phase 4: read ratio from PairPicker's selected pair (pair.ratio).
 const RATIO_DEFAULT = 1.0
 
-type State =
+// API lifecycle only — side-direction errors are derived from store state
+// in render (not stored here). Keeping the side error out of this state
+// means a side-direction violation never overwrites a previous successful
+// `result`, so manual-mode metrics return instantly when the user fixes
+// the direction (no need to wait for the next debounce).
+type ApiState =
   | { status: 'idle' }
   | { status: 'calculating' }
   | { status: 'ready'; result: CalculateVolumeResponse }
@@ -15,19 +21,23 @@ type State =
 
 export function VolumeCalculator() {
   const selectedSymbol = useAppStore((s) => s.selectedSymbol)
+  const side = useAppStore((s) => s.side)
   const entryPrice = useAppStore((s) => s.entryPrice)
   const slPrice = useAppStore((s) => s.slPrice)
+  const tpPrice = useAppStore((s) => s.tpPrice)
   const riskAmount = useAppStore((s) => s.riskAmount)
   const manualVolumePrimary = useAppStore((s) => s.manualVolumePrimary)
   const setManualVolumePrimary = useAppStore((s) => s.setManualVolumePrimary)
+  const setVolumeReady = useAppStore((s) => s.setVolumeReady)
 
   const debouncedEntry = useDebouncedValue(entryPrice, DEBOUNCE_MS)
   const debouncedSl = useDebouncedValue(slPrice, DEBOUNCE_MS)
   const debouncedRisk = useDebouncedValue(riskAmount, DEBOUNCE_MS)
 
-  // Validity gates the API call. When invalid, the render path returns the
-  // idle message directly — no setState needed (React 19's
-  // react-hooks/set-state-in-effect lint rule forbids that pattern).
+  // Side validation runs synchronously every render — cheap, no debounce.
+  // entrySlError is a HARD block (no API call); tpWarning is informational.
+  const { entrySlError } = validateSideDirection(side, entryPrice, slPrice, tpPrice)
+
   const inputsValid =
     !!selectedSymbol &&
     debouncedEntry !== null &&
@@ -35,9 +45,13 @@ export function VolumeCalculator() {
     debouncedRisk > 0 &&
     debouncedEntry !== debouncedSl
 
-  const [state, setState] = useState<State>({ status: 'idle' })
+  const [apiState, setApiState] = useState<ApiState>({ status: 'idle' })
 
   useEffect(() => {
+    // Hard block: skip the API entirely on side-direction violation. We do
+    // NOT setApiState here so any prior `ready.result` is preserved — when
+    // the user fixes the direction, metrics return without a fetch.
+    if (entrySlError) return
     if (!inputsValid || !selectedSymbol || debouncedEntry === null || debouncedSl === null) {
       return
     }
@@ -45,7 +59,7 @@ export function VolumeCalculator() {
     let cancelled = false
 
     async function run(symbol: string, entry: number, sl: number, risk: number) {
-      setState({ status: 'calculating' })
+      setApiState({ status: 'calculating' })
       try {
         const result = await calculateVolume(symbol, {
           entry,
@@ -53,7 +67,7 @@ export function VolumeCalculator() {
           risk_amount: risk,
           ratio: RATIO_DEFAULT,
         })
-        if (!cancelled) setState({ status: 'ready', result })
+        if (!cancelled) setApiState({ status: 'ready', result })
       } catch (err: unknown) {
         if (cancelled) return
         const status = (err as { response?: { status?: number } })?.response?.status
@@ -62,7 +76,9 @@ export function VolumeCalculator() {
         const fallback = (err as Error)?.message ?? 'Volume calc failed'
         const friendly =
           status === 503 ? 'Conversion rate not ready, retry...' : (detail ?? fallback)
-        setState({ status: 'error', error: friendly })
+        // API error: drop result so manual mode doesn't show stale metrics
+        // for the (now invalid) entry/sl/risk combination.
+        setApiState({ status: 'error', error: friendly })
       }
     }
 
@@ -71,9 +87,23 @@ export function VolumeCalculator() {
     return () => {
       cancelled = true
     }
-  }, [inputsValid, selectedSymbol, debouncedEntry, debouncedSl, debouncedRisk])
+  }, [entrySlError, inputsValid, selectedSymbol, debouncedEntry, debouncedSl, debouncedRisk])
 
   const isManualMode = manualVolumePrimary !== null
+
+  // Phase-3 submit gate: a usable volume exists when no side error blocks us
+  // AND either auto succeeded or manual override is a positive number.
+  useEffect(() => {
+    if (entrySlError) {
+      setVolumeReady(false)
+      return
+    }
+    if (isManualMode && manualVolumePrimary !== null && manualVolumePrimary > 0) {
+      setVolumeReady(true)
+      return
+    }
+    setVolumeReady(apiState.status === 'ready')
+  }, [entrySlError, isManualMode, manualVolumePrimary, apiState.status, setVolumeReady])
 
   function handleManualChange(e: ChangeEvent<HTMLInputElement>) {
     const raw = e.target.value
@@ -85,23 +115,12 @@ export function VolumeCalculator() {
 
   // ----- Render branches -----
 
-  // Auto mode: no inputs yet → idle hint.
-  if (!isManualMode && (!inputsValid || state.status === 'idle')) {
-    return (
-      <div className="text-xs text-gray-500 italic">Fill Entry, SL, Risk to preview volume.</div>
-    )
-  }
-
-  if (!isManualMode && state.status === 'calculating') {
-    return <div className="text-xs text-gray-500">Calculating...</div>
-  }
-
-  // Auto-mode error: still offer manual override so the user isn't blocked
-  // by a stale rate cache or an SL distance the server rejected.
-  if (!isManualMode && state.status === 'error') {
+  // Auto-mode side-direction violation: show the error + manual-override
+  // unblock. Mirrors the auto-mode API error block to keep parity.
+  if (!isManualMode && entrySlError) {
     return (
       <div className="space-y-2">
-        <div className="text-xs text-red-600">{state.error}</div>
+        <div className="text-xs text-red-600">{entrySlError}</div>
         <button
           type="button"
           onClick={() => setManualVolumePrimary(0.01)}
@@ -113,10 +132,38 @@ export function VolumeCalculator() {
     )
   }
 
-  // Either auto-ready or manual mode. Vol P comes from manual override or
-  // the last successful calc; Vol S = Vol P × ratio.
-  const autoResult = state.status === 'ready' ? state.result : null
-  const effectiveVolP = isManualMode ? manualVolumePrimary : (autoResult?.volume_primary ?? null)
+  // Auto-mode idle hint.
+  if (!isManualMode && (!inputsValid || apiState.status === 'idle')) {
+    return (
+      <div className="text-xs text-gray-500 italic">Fill Entry, SL, Risk to preview volume.</div>
+    )
+  }
+
+  if (!isManualMode && apiState.status === 'calculating') {
+    return <div className="text-xs text-gray-500">Calculating...</div>
+  }
+
+  // Auto-mode API error: surface the message + offer manual override.
+  if (!isManualMode && apiState.status === 'error') {
+    return (
+      <div className="space-y-2">
+        <div className="text-xs text-red-600">{apiState.error}</div>
+        <button
+          type="button"
+          onClick={() => setManualVolumePrimary(0.01)}
+          className="text-xs text-blue-600 hover:underline"
+        >
+          Override manually
+        </button>
+      </div>
+    )
+  }
+
+  // Auto-ready or manual mode. Result preserved across side-direction
+  // violations; cleared by API errors so we never show stale metrics for
+  // an entry/sl that the server actively rejected.
+  const result = apiState.status === 'ready' ? apiState.result : null
+  const effectiveVolP = isManualMode ? manualVolumePrimary : (result?.volume_primary ?? null)
   const effectiveVolS = effectiveVolP === null ? null : effectiveVolP * RATIO_DEFAULT
 
   return (
@@ -142,22 +189,28 @@ export function VolumeCalculator() {
         <span className="font-mono">{effectiveVolS?.toFixed(2)}</span>
       </div>
 
-      {/* SL distance + Est. SL $ are computed from the auto formula; suppress
-          them in manual mode where they no longer reflect the typed Vol P. */}
-      {!isManualMode && autoResult && (
+      {/* SL pips + Est. SL $ are price-derived (sl_pips depends only on
+          entry/sl/symbol; sl_usd_per_lot doesn't depend on volume), so they
+          are valid in both auto and manual modes once we have a `result`.
+          Substituting effectiveVolP into the $ calc gives the manual-mode
+          number too. Hidden during a side-direction violation so we don't
+          imply the order is placeable while it's blocked. */}
+      {result && effectiveVolP !== null && !entrySlError && (
         <>
           <div className="flex justify-between">
             <span className="text-gray-600">SL distance:</span>
-            <span className="font-mono">{autoResult.sl_pips.toFixed(1)} pips</span>
+            <span className="font-mono">{result.sl_pips.toFixed(1)} pips</span>
           </div>
           <div className="flex justify-between">
             <span className="text-gray-600">Est. SL $:</span>
-            <span className="font-mono">
-              ${(autoResult.sl_usd_per_lot * autoResult.volume_primary).toFixed(2)}
-            </span>
+            <span className="font-mono">${(result.sl_usd_per_lot * effectiveVolP).toFixed(2)}</span>
           </div>
         </>
       )}
+
+      {/* Manual-mode side error: inline message kept next to the editable
+          Vol P so the user sees why submit will be blocked. */}
+      {isManualMode && entrySlError && <div className="text-xs text-red-600">{entrySlError}</div>}
 
       <div className="border-t border-gray-100 pt-1.5">
         {isManualMode ? (
@@ -168,10 +221,10 @@ export function VolumeCalculator() {
           >
             ↻ Reset to auto
           </button>
-        ) : autoResult ? (
+        ) : result ? (
           <button
             type="button"
-            onClick={() => setManualVolumePrimary(autoResult.volume_primary)}
+            onClick={() => setManualVolumePrimary(result.volume_primary)}
             className="text-xs text-gray-500 hover:text-blue-600 hover:underline"
           >
             Override manually

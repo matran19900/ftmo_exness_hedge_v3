@@ -58,6 +58,13 @@ export interface AppState {
   // ratio). Reset on symbol switch + per session — NOT persisted.
   manualVolumePrimary: number | null
   setManualVolumePrimary: (v: number | null) => void
+
+  // True when the order has a positive effective volume (auto calc ready
+  // OR manual override set) AND no side-direction error blocks it. Phase 3
+  // submit handler reads this to enable/disable the submit button. NOT
+  // persisted (runtime).
+  volumeReady: boolean
+  setVolumeReady: (ready: boolean) => void
 }
 
 export const useAppStore = create<AppState>()(
@@ -99,6 +106,9 @@ export const useAppStore = create<AppState>()(
 
       manualVolumePrimary: null,
       setManualVolumePrimary: (manualVolumePrimary) => set({ manualVolumePrimary }),
+
+      volumeReady: false,
+      setVolumeReady: (volumeReady) => set({ volumeReady }),
     }),
     {
       name: 'ftmo-hedge-store',

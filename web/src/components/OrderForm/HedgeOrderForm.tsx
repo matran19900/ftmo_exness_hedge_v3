@@ -1,38 +1,11 @@
 import { useEffect, useRef } from 'react'
-import { useAppStore, type OrderSide } from '../../store'
+import { validateSideDirection } from '../../lib/orderValidation'
+import { useAppStore } from '../../store'
 import { PairPicker } from './PairPicker'
 import { PriceInput } from './PriceInput'
 import { RiskAmountInput } from './RiskAmountInput'
 import { SideSelector } from './SideSelector'
 import { VolumeCalculator } from './VolumeCalculator'
-
-interface ValidationWarnings {
-  sl?: string
-  tp?: string
-}
-
-// Soft validation: returns inline warnings only. Volume calc still runs even
-// when the side direction is violated — server validates SL distance and the
-// user may have a deliberate non-stop-loss configuration.
-function getValidationWarnings(
-  side: OrderSide,
-  entry: number | null,
-  sl: number | null,
-  tp: number | null
-): ValidationWarnings {
-  const warnings: ValidationWarnings = {}
-  if (entry === null) return warnings
-
-  if (side === 'buy') {
-    if (sl !== null && sl >= entry) warnings.sl = 'SL must be below Entry for BUY'
-    if (tp !== null && tp <= entry) warnings.tp = 'TP must be above Entry for BUY'
-  } else {
-    if (sl !== null && sl <= entry) warnings.sl = 'SL must be above Entry for SELL'
-    if (tp !== null && tp >= entry) warnings.tp = 'TP must be below Entry for SELL'
-  }
-
-  return warnings
-}
 
 export function HedgeOrderForm() {
   const selectedSymbol = useAppStore((s) => s.selectedSymbol)
@@ -62,7 +35,11 @@ export function HedgeOrderForm() {
     prevSymbolRef.current = selectedSymbol
   }, [selectedSymbol, setEntryPrice, setSlPrice, setTpPrice, setManualVolumePrimary])
 
-  const warnings = getValidationWarnings(side, entryPrice, slPrice, tpPrice)
+  // entrySlError is also enforced as a hard block inside VolumeCalculator;
+  // this displays the same message inline under the SL input. tpWarning
+  // stays soft (TP is optional and a wrong-direction TP doesn't prevent a
+  // valid order from being placed).
+  const { entrySlError, tpWarning } = validateSideDirection(side, entryPrice, slPrice, tpPrice)
 
   return (
     <div className="h-full bg-white border border-gray-200 rounded p-4 flex flex-col gap-3 overflow-y-auto">
@@ -90,14 +67,14 @@ export function HedgeOrderForm() {
         value={slPrice}
         onChange={setSlPrice}
         digits={symbolDigits}
-        warning={warnings.sl}
+        warning={entrySlError ?? undefined}
       />
       <PriceInput
         label="Take Profit (optional)"
         value={tpPrice}
         onChange={setTpPrice}
         digits={symbolDigits}
-        warning={warnings.tp}
+        warning={tpWarning ?? undefined}
       />
 
       <RiskAmountInput />
