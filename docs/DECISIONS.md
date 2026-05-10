@@ -120,6 +120,7 @@ Lý do: phân biệt "session expired" (toast) với "login attempt failed" (Log
 ### D-029 (Phase 1.7) — PositionList full-width dưới chart+form (không nằm trong sidebar)
 Lý do: CEO override khi planning step 1.7. Full-width có thêm chỗ cho hedge order rows (mỗi hedge gồm 2 leg).
 Trade-off: ASCII diagram trong `docs/09-frontend.md` cần cập nhật theo (làm trong step 1.8 nếu file tồn tại).
+> **OVERRIDDEN by D-042 (Phase 2.8a)**: PositionList chuyển từ full-width → 70% width (cột trái dưới chart); OrderForm chuyển sang full-height cột phải 30%.
 
 ### D-030 (Phase 1.7) — Tab state local (`useState`), không Zustand
 Lý do: lựa chọn tab Open/History là ephemeral UI state. Không cần persist qua session hay share giữa component.
@@ -133,3 +134,59 @@ Trade-off: mất CSRF protection cho OAuth flow. Risk chấp nhận được vì
 - OAuth flow chạy 1-2 lần trong vòng đời tool (initial setup + token refresh thủ công).
 - Phase 5 deploy: server private VPS qua Tailscale, OAuth callback không expose internet public.
 - Phase 5 hardening có thể revisit nếu cần (vd dùng PKCE thay state, nếu cTrader support).
+
+### D-032 (Phase 2.2a) — cTrader Open API gửi raw integer prices uniformly scaled by 10^5
+Lý do: bất kể symbol's `digits` field là gì (5 cho FX, 3 cho USDJPY, 2 cho XAUUSD), cTrader trả price/trendbar dưới dạng `int` đã nhân 10^5. Verified end-to-end trên EURUSD/USDJPY/XAUUSD/BTCUSD ở step 2.2 smoke. `digits` chỉ dành cho display formatting (priceFormat.precision) — KHÔNG dùng để rescale price từ broker. Server divide tất cả raw price cho `100000.0` ngay tại boundary; frontend format theo `digits` ở UI.
+Trade-off: nếu broker đổi convention sau này (vd 10^pipPosition), phải update tại 1 chỗ duy nhất (`_PRICE_SCALE` constant trong `market_data.py`).
+
+### D-033 (Phase 2.3) — WS auth fail trả HTTP 403 thay vì WS close 4401
+Lý do: FastAPI/Starlette validate JWT trong `Depends(get_current_user_ws)` TRƯỚC khi `accept()` WS handshake. Khi token sai, framework trả HTTP 403 tự động → WebSocket browser API thấy `error` event với HTTP 403 thay vì `close` với code 4401. Spec docs ban đầu giả định mã 4401 sau accept; thực tế FastAPI flow là pre-accept.
+Trade-off: smoke test step 2.3 PASS 10/11 với deviation này được CEO chấp nhận. Phase 5 hardening có thể revisit nếu frontend reconnect logic cần phân biệt close-code 1000/4401 (vd retry với fresh token vs hard logout). Hiện tại frontend chỉ xử lý 1 case "WS closed" và prompt re-login khi token hết hạn.
+
+### D-034 (Phase 2.4) — Bỏ `rate:*` 24h cache; dùng `tick:*` 60s cache trực tiếp
+Lý do: spec docs/07-server-services.md ban đầu đề xuất 2-tier cache (`tick:*` 60s cho live + `rate:*` 24h cho conversion rate). Thực tế: conversion rate cần real-time tick mới nhất (USD↔quote), không thể stale 24h khi market moving. Phase 2 single-admin load thấp (1 user × vài calc/giây), không cần tier 2.
+Trade-off: mỗi calc gọi vào `tick:*` cache (60s TTL). Cache miss subscribe spot, populate cache, retry. P95 <50ms cho cache hit. Phase 5 revisit nếu multi-user hoặc multi-symbol concurrent calc tăng tải Redis.
+
+### D-035 (Phase 2.6) — Lightweight Charts v5 (5.2.x) thay vì v4 trong skeleton spec
+Lý do: `npm install lightweight-charts` ở step 2.6 default v5.2.x (latest stable). v5 có breaking change: `chart.addCandlestickSeries(opts)` (v4) → `chart.addSeries(CandlestickSeries, opts)` (v5). Migration cost ~3 lines per series.
+Trade-off: chấp nhận v5 vì performance + bundle size cải thiện. v5 stable từ 2024, đã production-ready. v4 deprecated path.
+
+### D-036 (Phase 2.6a) — Crosshair mode Normal thay vì v5 default Magnet
+Lý do: v5 default `CrosshairMode.Magnet` snap crosshair vào candle close — dễ dùng cho chart phân tích nhưng cản trở set Entry/SL/TP ở giá tự do (cursor bay khỏi điểm user click). CEO directive: free cursor để pick đúng giá Y muốn. Set `crosshair: { mode: CrosshairMode.Normal }`.
+Trade-off: cursor không snap candle — user thấy crosshair theo đúng pixel chuột. Đây là behavior mong muốn cho trading tool (không phải chart analysis tool).
+
+### D-037 (Phase 2.7a) — Hide default candlestick series `priceLineVisible` và `lastValueVisible`
+Lý do: Lightweight Charts v5 default render horizontal dotted line tại close của bar cuối cùng + axis label, nhằm marker last close. Trong tool hedge, chart đã có 2 explicit price line bid/ask + setup line Entry/SL/TP — line mặc định gây nhiễu visual + cạnh tranh với bid line khi giá gần nhau.
+Trade-off: user mất "last close marker" nhưng tool đã có bid/ask + live candle close (tracked trong real-time), thông tin redundant.
+
+### D-038 (Phase 2.7a) — OHLC response include `digits` field; frontend per-symbol priceFormat
+Lý do: Y-axis precision cần khớp symbol (5 cho FX, 3 cho JPY, 2 cho XAU, ...). Server đã có `digits` trong `symbol_config:{sym}` (từ ProtoOASymbolByIdReq detail). Expose qua OHLC response → frontend `applyOptions({ priceFormat: { precision: digits, minMove: 10^-digits } })` ngay trước `setData()`. Pydantic optional default `digits=5` cho stale cache entries pre-2.7a deploy.
+Trade-off: thêm 1 field response. Backward-compatible vì optional default. Phase 5 revisit nếu broker thêm symbol mới có digits không thuộc {2, 3, 5}.
+
+### D-039 (Phase 2.7b) — sync_symbols batch fetch qua single ProtoOASymbolByIdReq
+Lý do: cTrader `ProtoOASymbolByIdReq.symbolId` là `repeated` protobuf field — append nhiều id, server trả 1 response chứa details cho tất cả. Code ban đầu loop từng symbol (91 sequential RTT × ~700ms each = ~64s) + per-iteration `asyncio.sleep(0.25)` pacing → tổng ~90s mỗi server restart. Batch single RTT ~1-3s.
+Trade-off: nếu broker hạn chế batch size, batch fail mất tất cả. Mitigate: `try/except` quanh batch RPC trả 0 cached symbols + log error → caller có thể retry on demand. Verified: 91 symbol batch chạy ổn trên cTrader Open API.
+
+### D-040 (Phase 2.7c) — Live candle close tracks bid (industry convention)
+Lý do: TradingView, MetaTrader, mọi chart platform sử dụng bid làm running close cho bar đang chạy. Tick stream arrival → patch close = tick.bid. High/low monotonic trong bar (Math.max / Math.min với tracked). Server `candle_update` broadcast vẫn authoritative tại bar boundary (corrects close, resets ref).
+Trade-off: ask không hiển thị trong candle (chỉ trong price line). Spread visible qua bid line vs ask line; đủ thông tin cho hedge trading.
+
+### D-041 (Phase 2.7e) — WS candle_update KHÔNG redraw chart in-bar; tick stream là single source of truth
+Lý do: chart flicker do 2 source redraw cùng bar trong vài ms (server candle_update mỗi vài giây + tick stream ~10/s). Mỗi `series.update(...)` trigger Lightweight Charts repaint với close khác nhau → visual flicker. Fix: handler `candle_update` chỉ sync server's authoritative open + max(high) + min(low) vào `lastCandleRef`; KHÔNG call `series.update()` cho in-bar (msg.time === tracked.time). Tick effect là path duy nhất redraw bar đang chạy.
+Trade-off: server's mid-bar close bị drop (stale snapshot). Bar boundary (msg.time > tracked.time) vẫn redraw + reset ref bình thường. Test: smooth visual end-to-end; step 2.7d (RAF throttle) reject vì 2.7e đã fix root cause.
+
+### D-042 (Phase 2.8a) — Layout: left 70% (chart top + PositionList bottom), right 30% (OrderForm full-height)
+Lý do: D-029 đặt PositionList full-width dưới chart+form, OrderForm width 380px. Step 2.8 thêm Pair + Symbol read-only + Side + Entry/SL/TP/Risk + Volume preview + Submit → form overflow theo chiều dọc, scroll khó chịu. Layout mới: OrderForm chiếm full height cột phải 30%, đủ chỗ cho mọi input + volume preview + submit không scroll. Chart vẫn chiếm 70% width như cũ.
+Trade-off: PositionList narrow lại từ 100% → 70%. Phase 3 sẽ test xem rows hedge 2-leg có đủ chỗ; nếu không, có thể bỏ wrap hoặc compact column. Override D-029.
+
+### D-043 (Phase 2.9a) — Đổi symbol → reset Entry/SL/TP/manualVolumePrimary trong form
+Lý do: form state retain on symbol switch (D ban đầu trong step 2.9) khiến giá Entry EURUSD (vd 1.085) hiển thị khi user chuyển sang USDJPY (range 140-160) — vô nghĩa và misleading. CEO directive: reset tất cả price field + manual volume khi symbol thay đổi. Ratio + selectedPairId + side + riskAmount giữ nguyên (per-symbol agnostic). `prevSymbolRef` guard tránh wipe form lúc initial mount với persisted symbol.
+Trade-off: user phải re-set price khi switch symbol — đây là behavior mong muốn vì context trade thay đổi hoàn toàn.
+
+### D-044 (Phase 2.9a, refined 2.9b) — Manual volume override trong VolumeCalculator
+Lý do: server's auto calc dựa vào risk/SL distance/conversion rate có thể sai (rate cache miss trả 503) hoặc user muốn override (vd risk lớn hơn calculated, deliberate over-leverage). Cần escape hatch. Manual mode: Vol P editable, Vol S derived (Vol P × ratio). SL distance + Est. SL $ shown khi state.result available (price-derived, valid trong cả 2 mode). "↻ Reset to auto" link reset.
+Trade-off: thêm runtime state `manualVolumePrimary`. Reset trên symbol switch + F5 (NOT persisted) để tránh stale.
+
+### D-045 (Phase 2.9b) — Side direction HARD BLOCK SL violation; soft TP warning; volumeReady flag
+Lý do: Step 2.9a soft warning cho cả SL và TP. CEO directive: SL violation BUY (SL≥Entry) hoặc SELL (SL≤Entry) → block volume calc + force user fix. TP violation chỉ là warning vì TP optional. Validation utility extracted vào `web/src/lib/orderValidation.ts` (single source of truth — HedgeOrderForm display + VolumeCalculator block). `volumeReady` flag trong store cho Phase 3 submit handler.
+Trade-off: side error path bypass API call (no POST while invalid) — tiết kiệm network + khẳng định invariant client-side. Server vẫn validate SL pip distance độc lập.

@@ -774,12 +774,13 @@ CEO chỉ điền 2 dòng cuối → CTO mới có đủ context bắt đầu wo
 | Phase | Status | Steps | Tag | Report |
 |---|---|---|---|---|
 | 1 — Foundation | ✅ done | 9/9 | `phase-1-complete` | `docs/PHASE_1_REPORT.md` |
-| 2 — Market Data + Chart + Form | ⏳ pending | 0/10 | — | — |
+| 2 — Market Data + Chart + Form | ✅ done | 21/10 | `phase-2-complete` | `docs/PHASE_2_REPORT.md` |
 | 3 — Single-leg Trading | ⏳ pending | 0/14 | — | — |
 | 4 — Hedge + Cascade | ⏳ pending | 0/11 | — | — |
 | 5 — Hardening + Deploy | ⏳ pending | 0/10 | — | — |
 
 > Phase 1 đếm 9 step khi tính cả 1.4a (sub-fix). Plan gốc có 8.
+> Phase 2 đếm 21 step khi tính 10 step chính + 11 sub-fix (2.1a, 2.1b, 2.2a, 2.6a, 2.7a, 2.7b, 2.7c, 2.7e, 2.8a, 2.9a, 2.9b). Plan gốc có 10. Step 2.7d (RAF throttle) làm xong nhưng REJECT — không merge. Chi tiết deviation xem `PHASE_2_REPORT.md`.
 
 CTO update tracker này sau mỗi phase PASS.
 
