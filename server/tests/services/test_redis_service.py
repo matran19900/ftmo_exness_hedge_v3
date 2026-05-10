@@ -57,7 +57,9 @@ async def test_setup_consumer_groups_creates_three_streams_per_account(
     await svc.add_account("ftmo", "acc_001", "FTMO 1")
     await svc.add_account("exness", "exn_001", "Exness 1")
 
-    await svc.setup_consumer_groups()
+    # Step 3.2: setup_consumer_groups now returns (ftmo_count, exness_count).
+    counts = await svc.setup_consumer_groups()
+    assert counts == (1, 1)
 
     for stream, group in [
         ("cmd_stream:ftmo:acc_001", "ftmo-acc_001"),
@@ -74,9 +76,20 @@ async def test_setup_consumer_groups_creates_three_streams_per_account(
 @pytest.mark.asyncio
 async def test_setup_consumer_groups_idempotent_second_call(svc: RedisService) -> None:
     await svc.add_account("ftmo", "acc_001", "FTMO 1")
-    await svc.setup_consumer_groups()
-    # Re-running on existing groups must succeed (every BUSYGROUP swallowed).
-    await svc.setup_consumer_groups()
+    counts1 = await svc.setup_consumer_groups()
+    # Re-running on existing groups must succeed (every BUSYGROUP swallowed)
+    # and return the same counts (idempotent: account membership unchanged).
+    counts2 = await svc.setup_consumer_groups()
+    assert counts1 == counts2 == (1, 0)
+
+
+@pytest.mark.asyncio
+async def test_setup_consumer_groups_zero_accounts_returns_zeros(
+    svc: RedisService,
+) -> None:
+    """First-boot state: no accounts → no groups, returns (0, 0). Server must still start."""
+    counts = await svc.setup_consumer_groups()
+    assert counts == (0, 0)
 
 
 @pytest.mark.asyncio

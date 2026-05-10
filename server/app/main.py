@@ -63,6 +63,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     await init_redis(settings.redis_url)
+    redis_svc = RedisService(get_redis())
+    # Create consumer groups before any client / broker code runs so a client
+    # XADDing into a stream we haven't subscribed to yet can't strand a
+    # message. Idempotent (BUSYGROUP swallowed inside _create_group), so
+    # re-runs across restarts are safe. Failures other than BUSYGROUP
+    # propagate — fail loud during startup rather than ship a half-wired
+    # server.
+    n_ftmo, n_exness = await redis_svc.setup_consumer_groups()
+    logger.info(
+        "setup_consumer_groups: created groups for %d ftmo + %d exness accounts",
+        n_ftmo,
+        n_exness,
+    )
     symbol_whitelist.load_whitelist(settings.symbol_mapping_path)
     logger.info(
         "Server ready (redis=%s, symbols=%d)",
@@ -71,7 +84,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     app.state.market_data = None
-    redis_svc = RedisService(get_redis())
     broadcast = BroadcastService(redis_svc=redis_svc)
     app.state.broadcast = broadcast
     creds = await redis_svc.get_ctrader_market_data_creds()

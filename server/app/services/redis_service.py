@@ -299,12 +299,16 @@ class RedisService:
             if "BUSYGROUP" not in str(e):
                 raise
 
-    async def setup_consumer_groups(self) -> None:
+    async def setup_consumer_groups(self) -> tuple[int, int]:
         """Create the 3 streams × 2 brokers × N accounts of consumer groups.
 
         Idempotent: BUSYGROUP errors are swallowed in ``_create_group`` so
-        repeated lifespan invocations don't fail. NOT wired to FastAPI
-        lifespan in this step (step 3.2 owns that).
+        repeated lifespan invocations don't fail. Wired to FastAPI lifespan
+        in step 3.2.
+
+        Returns ``(ftmo_count, exness_count)`` so the caller (lifespan,
+        step 3.2) can log how many accounts were processed. ``(0, 0)`` is a
+        valid result on first boot before any account is registered.
         """
         ftmo_accs = await self.get_all_account_ids("ftmo")
         for acc in ftmo_accs:
@@ -317,6 +321,8 @@ class RedisService:
             await self._create_group(f"cmd_stream:exness:{acc}", f"exness-{acc}")
             await self._create_group(f"resp_stream:exness:{acc}", "server")
             await self._create_group(f"event_stream:exness:{acc}", "server")
+
+        return len(ftmo_accs), len(exness_accs)
 
     async def push_command(
         self,

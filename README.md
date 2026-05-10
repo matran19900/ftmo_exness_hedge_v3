@@ -325,6 +325,25 @@ curl -X POST http://localhost:8000/api/pairs/ \
 8. Side error xảy ra trong manual mode: đổi SL violate side → Volume Preview hiện side error; Vol P input vẫn edit được nhưng metrics ẩn. Fix SL → metrics quay lại NGAY (state.result preserved).
 9. Phase-3 prep: Zustand `volumeReady` = true khi (auto ready hoặc manual > 0) AND không có side error; false trong các trường hợp khác.
 
+## Account Management (Phase 3+)
+
+Trước khi server có thể route command đến FTMO/Exness client, account đó phải được đăng ký vào Redis. Step 3.2 giới thiệu CLI ops `scripts/init_account.py` để add / list / remove account. Sau khi `add` hoặc `remove`, **restart server** để `setup_consumer_groups()` picks up changes (Phase 4 sẽ làm runtime).
+
+Chạy từ repo root (`/workspaces/ftmo_exness_hedge_v3`):
+
+```bash
+# Add account (validate broker + account_id format ^[a-z0-9_]{3,64}$)
+python -m scripts.init_account add --broker ftmo --account-id ftmo_acc_001 --name "FTMO Challenge $100k"
+
+# List all (or --broker ftmo|exness)
+python -m scripts.init_account list
+
+# Remove (dry-run preview; pass --yes to actually delete)
+python -m scripts.init_account remove --broker ftmo --account-id ftmo_acc_001 --yes
+```
+
+Exit codes: `0` success, `1` unexpected error, `2` validation error (bad input, duplicate add, missing `--yes`, account not found).
+
 ### Working with Claude Code
 
 Chạy Claude Code trực tiếp:
