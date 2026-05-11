@@ -368,7 +368,9 @@ async def test_callback_rejects_invalid_code(
         kwargs["transport"] = transport
         return real_async_client(*args, **kwargs)
 
-    monkeypatch.setattr("app.api.auth_ctrader.httpx.AsyncClient", patched_async_client)
+    # Step 3.3: token exchange logic moved to hedger_shared.ctrader_oauth, so
+    # the httpx.AsyncClient patch must target that module instead.
+    monkeypatch.setattr("hedger_shared.ctrader_oauth.httpx.AsyncClient", patched_async_client)
 
     resp = await client.get(
         "/api/auth/ctrader/callback",

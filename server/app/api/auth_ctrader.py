@@ -2,18 +2,26 @@
 
 Endpoints are intentionally unauthenticated: the OAuth dance is a browser
 redirect chain that cannot carry an Authorization header.
+
+Step 3.3: the URL builder, code-to-token exchange, and trading-accounts
+fetch were extracted to ``hedger_shared.ctrader_oauth`` so the FTMO
+client can reuse them for per-account trading tokens. This module keeps
+the FastAPI routing + Redis storage + MarketDataService trigger glue.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-import urllib.parse
 from typing import Annotated, Any
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
+from hedger_shared.ctrader_oauth import (  # type: ignore[import-not-found]
+    build_authorization_url,
+    exchange_code_for_token,
+    fetch_trading_accounts,
+)
 
 from app.config import Settings, get_settings
 from app.services.market_data import MarketDataService
@@ -22,13 +30,6 @@ from app.services.redis_service import RedisService, get_redis_service
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth/ctrader", tags=["ctrader-auth"])
-
-# cTrader OAuth endpoints (per ctrader_open_api.endpoints.EndPoints).
-CTRADER_AUTHORIZE_URL = "https://openapi.ctrader.com/apps/auth"
-CTRADER_TOKEN_URL = "https://openapi.ctrader.com/apps/token"
-# Trading accounts associated with the access_token. cTrader serves this over
-# GET with the access_token as a query parameter.
-CTRADER_TRADING_ACCOUNTS_URL = "https://api.spotware.com/connect/tradingaccounts"
 
 
 @router.get("")
@@ -44,12 +45,10 @@ async def ctrader_login(
         raise HTTPException(
             status_code=503, detail="cTrader client_id is not configured (CTRADER_CLIENT_ID)"
         )
-    params = {
-        "client_id": settings.ctrader_client_id,
-        "redirect_uri": settings.ctrader_redirect_uri,
-        "scope": "trading",
-    }
-    url = f"{CTRADER_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
+    url = build_authorization_url(
+        client_id=settings.ctrader_client_id,
+        redirect_uri=settings.ctrader_redirect_uri,
+    )
     logger.info("Redirecting to cTrader consent page")
     return RedirectResponse(url, status_code=302)
 
@@ -61,44 +60,31 @@ async def ctrader_callback(
     redis_svc: Annotated[RedisService, Depends(get_redis_service)],
 ) -> RedirectResponse:
     """Exchange the OAuth code, store credentials, and trigger MarketDataService."""
-    async with httpx.AsyncClient(timeout=30.0) as http:
-        token_resp = await http.get(
-            CTRADER_TOKEN_URL,
-            params={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": settings.ctrader_redirect_uri,
-                "client_id": settings.ctrader_client_id,
-                "client_secret": settings.ctrader_client_secret,
-            },
+    try:
+        token = await exchange_code_for_token(
+            client_id=settings.ctrader_client_id,
+            client_secret=settings.ctrader_client_secret,
+            code=code,
+            redirect_uri=settings.ctrader_redirect_uri,
         )
-        if token_resp.status_code != 200:
-            raise HTTPException(
-                status_code=502, detail=f"cTrader token exchange failed: {token_resp.text}"
-            )
-        token_data = token_resp.json()
-    if "accessToken" not in token_data:
-        raise HTTPException(
-            status_code=502, detail=f"cTrader token response missing accessToken: {token_data}"
-        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
 
-    access_token: str = token_data["accessToken"]
-    refresh_token: str = token_data.get("refreshToken", "")
-    expires_in: int = int(token_data.get("expiresIn", 0))
+    access_token: str = token["access_token"]
+    refresh_token: str = token["refresh_token"]
+    expires_in: int = token["expires_in"]
     expires_at: int = int(time.time()) + expires_in
 
-    async with httpx.AsyncClient(timeout=30.0) as http:
-        accounts_resp = await http.get(
-            CTRADER_TRADING_ACCOUNTS_URL, params={"oauth_token": access_token}
-        )
-        if accounts_resp.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"cTrader trading-accounts fetch failed: {accounts_resp.text}",
-            )
-        accounts_payload = accounts_resp.json()
+    try:
+        # TradingAccount is a TypedDict (structurally a dict[str, Any] at
+        # runtime) — cast keeps the local variable typed for the dict-style
+        # ``.get()`` lookups below without a stricter generic.
+        accounts: list[dict[str, Any]] = [
+            dict(a) for a in await fetch_trading_accounts(access_token)
+        ]
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
 
-    accounts: list[dict[str, Any]] = accounts_payload.get("data") or accounts_payload or []
     if not accounts:
         raise HTTPException(
             status_code=400, detail="No cTrader trading accounts associated with this user"
