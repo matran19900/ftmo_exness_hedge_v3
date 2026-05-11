@@ -76,6 +76,14 @@ logger = logging.getLogger(__name__)
 # command_loop's next XREADGROUP block window.
 _TRADING_TIMEOUT_SECONDS = 30.0
 
+# Step 3.4b: wait between ORDER_FILLED arrival and the SL/TP amend that
+# follows it inside ``place_market_order_with_sltp``. cTrader needs a
+# brief window after publishing the fill event before the resulting
+# position is amend-able; without this, the amend can return
+# ``POSITION_NOT_FOUND`` for a position the cTrader UI shows as open.
+# 100ms is a conservative default — adjust if CEO smoke surfaces a need.
+_AMEND_SETTLING_DELAY_SECONDS = 0.1
+
 
 class OrderPlacementResult(TypedDict, total=False):
     """Shape returned by ``place_market_order`` / ``place_limit_order`` /
@@ -162,6 +170,19 @@ class CtraderBridge:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._connected = asyncio.Event()  # TCP up + app auth ok
         self._authenticated = asyncio.Event()  # account auth ok
+
+        # Step 3.4b: side channel for ``ORDER_FILLED`` events that arrive
+        # AFTER the cTrader library has already popped the request's
+        # Deferred on an earlier ``ORDER_ACCEPTED``. cTrader's market-order
+        # response is a two-event sequence
+        # (``ACCEPTED`` intermediate → ``FILLED`` final, both carrying the
+        # same ``clientMsgId``), but ``Client._received`` only fires the
+        # Deferred once, so the FILLED event lands in
+        # ``_messageReceivedCallback`` (= ``_on_message`` below) instead.
+        # ``place_market_order`` registers a fill-future keyed by
+        # clientMsgId before sending; ``_on_message`` resolves that future
+        # when the matching FILLED event arrives.
+        self._pending_market_fills: dict[str, asyncio.Future[Any]] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -254,31 +275,85 @@ class CtraderBridge:
         tp_price: float,  # same — see step 3.4a docstring + place_market_order_with_sltp
         client_msg_id: str,
     ) -> OrderPlacementResult:
-        """Place a *bare* market order — fill / rejection only.
+        """Place a *bare* market order; return only after the broker FILLS it.
 
-        cTrader rejects absolute SL/TP on market orders (per
-        ``SL/TP in absolute values are allowed only for order types:
-        [LIMIT, STOP, STOP_LIMIT]``). This method ALWAYS sends the order
-        with ``stopLoss``/``takeProfit`` unset, regardless of ``sl_price``
-        / ``tp_price`` arguments. The kwargs stay in the signature for
-        API stability (callers can keep using a single shape across all
+        cTrader rejects absolute SL/TP on market orders (per ``SL/TP in
+        absolute values are allowed only for order types: [LIMIT, STOP,
+        STOP_LIMIT]``). This method ALWAYS sends the order with
+        ``stopLoss``/``takeProfit`` unset, regardless of ``sl_price`` /
+        ``tp_price`` arguments. The kwargs stay in the signature for API
+        stability (callers can keep using a single shape across all
         ``place_*`` methods); attach SL/TP after fill via
         ``place_market_order_with_sltp`` for the orchestrated 2-RTT flow.
+
+        Step 3.4b — two-event sequence:
+        cTrader emits ``ORDER_ACCEPTED`` then ``ORDER_FILLED`` for market
+        orders, both carrying the same ``clientMsgId``. The library's
+        Deferred fires once (on ACCEPTED) and is then popped; the FILLED
+        event lands in ``_on_message`` instead. We pre-register a future
+        in ``_pending_market_fills`` BEFORE sending so the unsolicited
+        FILLED event isn't lost to a race. If the first event is already
+        FILLED (fast path — instant fill, no intermediate ACCEPTED),
+        return immediately. If ACCEPTED arrives first, wait on the
+        pending-fills future. If REJECTED / ERROR — fail fast.
         """
-        req = self._build_new_order_req(
-            symbol_id=symbol_id,
-            order_type=ProtoOAOrderType.MARKET,
-            side=side,
-            volume_lots=volume_lots,
-            lot_size=lot_size,
-            sl_price=sl_price,  # builder drops these for MARKET orders
-            tp_price=tp_price,
-            entry_price=0.0,  # ignored for market orders
-        )
-        response = await self._send_and_wait(
-            req, timeout=_TRADING_TIMEOUT_SECONDS, client_msg_id=client_msg_id
-        )
-        return self._parse_order_placement(response)
+        # Pre-register the fill listener so an ORDER_FILLED arriving while
+        # we're still awaiting the Deferred isn't dropped. Use the running
+        # asyncio loop (NOT ``self._loop``) so this works in tests that
+        # mock ``_send_and_wait`` without calling ``_start()``. In
+        # production they're the same loop; the Twisted-side ``_on_message``
+        # uses ``self._loop.call_soon_threadsafe`` which is set by
+        # ``_start()``.
+        loop = asyncio.get_running_loop()
+        fill_future: asyncio.Future[Any] = loop.create_future()
+        self._pending_market_fills[client_msg_id] = fill_future
+
+        try:
+            req = self._build_new_order_req(
+                symbol_id=symbol_id,
+                order_type=ProtoOAOrderType.MARKET,
+                side=side,
+                volume_lots=volume_lots,
+                lot_size=lot_size,
+                sl_price=sl_price,  # builder drops these for MARKET orders
+                tp_price=tp_price,
+                entry_price=0.0,  # ignored for market orders
+            )
+            response = await self._send_and_wait(
+                req, timeout=_TRADING_TIMEOUT_SECONDS, client_msg_id=client_msg_id
+            )
+
+            if isinstance(response, ProtoOAExecutionEvent):
+                exec_type = int(response.executionType)
+                if exec_type == ProtoOAExecutionType.ORDER_FILLED:
+                    # Fast path: broker filled before sending an ACCEPTED
+                    # intermediate. Parse directly.
+                    return self._parse_filled_market(response)
+                if exec_type == ProtoOAExecutionType.ORDER_ACCEPTED:
+                    # Intermediate: wait for ORDER_FILLED via side channel.
+                    try:
+                        fill_event = await asyncio.wait_for(
+                            fill_future, timeout=_TRADING_TIMEOUT_SECONDS
+                        )
+                    except TimeoutError:
+                        return {
+                            "success": False,
+                            "broker_order_id": "",
+                            "fill_price": "",
+                            "fill_time": "",
+                            "commission": "",
+                            "error_code": "timeout",
+                            "error_msg": (
+                                "ORDER_FILLED did not arrive within "
+                                f"{_TRADING_TIMEOUT_SECONDS}s of ORDER_ACCEPTED"
+                            ),
+                        }
+                    return self._parse_filled_market(fill_event)
+                # ORDER_REJECTED / other terminal execution type → error.
+            # ProtoOAErrorRes / ProtoOAOrderErrorEvent / unexpected → existing parser.
+            return self._parse_order_placement(response)
+        finally:
+            self._pending_market_fills.pop(client_msg_id, None)
 
     async def place_market_order_with_sltp(
         self,
@@ -352,6 +427,16 @@ class CtraderBridge:
                     f"fill response missing positionId (broker_order_id={position_id_str!r})"
                 ),
             }
+
+        # Step 3.4b settling delay. cTrader's ORDER_FILLED arrives on the
+        # wire ~50-100ms before the resulting position is amend-able —
+        # immediate ``modify_sl_tp`` can hit POSITION_NOT_FOUND for a
+        # position that the cTrader UI clearly shows. 100ms is a safe
+        # conservative default that's still well under the 2s hedge open
+        # latency budget (D-009 acceptance #3). No retry on failure here:
+        # if amend still misses after the delay, step 3.4a's
+        # ``sl_tp_attach_failed=True`` path surfaces it to the operator.
+        await asyncio.sleep(_AMEND_SETTLING_DELAY_SECONDS)
 
         amend_msg_id = f"{client_msg_id}_amend"
         amend_result = await self.modify_sl_tp(
@@ -532,15 +617,74 @@ class CtraderBridge:
         return req
 
     @staticmethod
+    def _parse_filled_market(event: ProtoOAExecutionEvent) -> OrderPlacementResult:
+        """Extract the OPEN POSITION id + deal fields from an ORDER_FILLED event.
+
+        Step 3.4b: ``broker_order_id`` comes from ``event.position.positionId``
+        (the cTrader **open position** ID, lifecycle: open → close), NOT
+        ``event.order.orderId`` (the request-side order ID, lifecycle:
+        submit → terminal). Subsequent ``modify_sl_tp`` and ``close_position``
+        calls operate on positions and need this positionId. Step 3.4's
+        smoke test surfaced the bug: extracting ``order.orderId`` returned
+        an ID that cTrader rejected with ``POSITION_NOT_FOUND`` on amend.
+
+        Field types verified against ``OpenApiModelMessages_pb2.py``:
+          - ``event.position.positionId`` (int64)
+          - ``event.deal.executionPrice`` (DOUBLE — NOT int*10^5; D-032
+            applies to tick/trendbar wire prices only, not deal prices)
+          - ``event.deal.executionTimestamp`` (int64 epoch ms)
+          - ``event.deal.commission`` (int64; D-053 raw, consumer scales)
+        """
+        position_id = int(event.position.positionId)
+        deal = event.deal
+        return {
+            "success": True,
+            "broker_order_id": str(position_id),
+            "fill_price": str(float(deal.executionPrice)),
+            "fill_time": str(int(deal.executionTimestamp)),
+            "commission": str(int(deal.commission)),
+            "error_code": "",
+            "error_msg": "",
+        }
+
+    @staticmethod
+    def _parse_accepted_pending(event: ProtoOAExecutionEvent) -> OrderPlacementResult:
+        """Parse an ORDER_ACCEPTED event for a pending LIMIT/STOP order.
+
+        For pending orders, ``broker_order_id`` = ``event.order.orderId``
+        — there's no position yet (the order sits in the broker's book
+        until price hits the trigger). When the order later fills, an
+        unsolicited ORDER_FILLED arrives and the resulting position has
+        a NEW positionId; step 3.5's event handler will swap
+        broker_order_id orderId → positionId at that point.
+        """
+        order = event.order
+        return {
+            "success": True,
+            "broker_order_id": str(int(order.orderId)),
+            "fill_price": "",
+            "fill_time": "",
+            "commission": "",
+            "error_code": "",
+            "error_msg": "",
+        }
+
+    @staticmethod
     def _parse_order_placement(response: Any) -> OrderPlacementResult:
         """Translate the cTrader response into an ``OrderPlacementResult``.
 
-        Three response shapes are handled:
-          - ProtoOAExecutionEvent → inspect ``executionType``.
-              * ORDER_FILLED → success with fill price / time from
-                response.deal.
-              * ORDER_ACCEPTED → success with broker_order_id = response.order.orderId;
-                no fill data (pending order).
+        Used by limit/stop placement (where ORDER_ACCEPTED is the terminal
+        success event) and by the error / rejection paths for all order
+        types. Market-order fills go through ``_parse_filled_market``
+        directly from ``place_market_order``.
+
+        Response shapes handled:
+          - ProtoOAExecutionEvent →
+              * ORDER_FILLED → success via ``_parse_filled_market`` (this
+                happens on the fast-path market branch and also if the
+                broker fills a limit/stop synchronously).
+              * ORDER_ACCEPTED → success via ``_parse_accepted_pending``
+                (limit/stop in-book).
               * ORDER_REJECTED / ORDER_CANCEL_REJECTED → error path.
           - ProtoOAErrorRes → auth / transport error.
           - ProtoOAOrderErrorEvent → business-rule rejection.
@@ -560,28 +704,9 @@ class CtraderBridge:
         if isinstance(response, ProtoOAExecutionEvent):
             exec_type = int(response.executionType)
             if exec_type == ProtoOAExecutionType.ORDER_FILLED:
-                deal = response.deal
-                position_id = int(deal.positionId) if deal.HasField("positionId") else 0
-                return {
-                    "success": True,
-                    "broker_order_id": str(position_id),
-                    "fill_price": str(float(deal.executionPrice)),
-                    "fill_time": str(int(deal.executionTimestamp)),
-                    "commission": str(int(deal.commission)),
-                    "error_code": "",
-                    "error_msg": "",
-                }
+                return CtraderBridge._parse_filled_market(response)
             if exec_type == ProtoOAExecutionType.ORDER_ACCEPTED:
-                order = response.order
-                return {
-                    "success": True,
-                    "broker_order_id": str(int(order.orderId)),
-                    "fill_price": "",
-                    "fill_time": "",
-                    "commission": "",
-                    "error_code": "",
-                    "error_msg": "",
-                }
+                return CtraderBridge._parse_accepted_pending(response)
             # ORDER_REJECTED / ORDER_CANCEL_REJECTED / unexpected types.
             raw_code = str(response.errorCode) if response.HasField("errorCode") else ""
             return {
@@ -818,10 +943,33 @@ class CtraderBridge:
             self._loop.call_soon_threadsafe(self._authenticated.clear)
 
     def _on_message(self, _client: Any, message: Any) -> None:
-        """Step 3.5 will route ProtoOAExecutionEvent here for cascade events."""
-        # Step 3.3 only needs connect + heartbeat; unsolicited messages
-        # are logged at debug level so they're visible during smoke testing
-        # without flooding production logs.
+        """Runs in the Twisted reactor thread for EVERY message — solicited
+        and unsolicited. Step 3.5 will route cascade-close events here too.
+
+        Step 3.4b: when ``place_market_order`` is mid-flight, the first
+        cTrader response (``ORDER_ACCEPTED``) lands on the request's
+        Deferred (which the library pops on first match). The follow-up
+        ``ORDER_FILLED`` event carries the SAME ``clientMsgId`` but no
+        longer has a Deferred to fire — it arrives here. We resolve the
+        pre-registered fill-future so ``place_market_order`` can return
+        the fill data (positionId / deal.* fields) instead of the
+        intermediate ACCEPTED payload.
+        """
+        cmid = getattr(message, "clientMsgId", None)
+        if cmid is not None and cmid in self._pending_market_fills:
+            try:
+                inner = Protobuf.extract(message)
+                if (
+                    isinstance(inner, ProtoOAExecutionEvent)
+                    and int(inner.executionType) == ProtoOAExecutionType.ORDER_FILLED
+                ):
+                    future = self._pending_market_fills.get(cmid)
+                    if future is not None and not future.done() and self._loop is not None:
+                        self._loop.call_soon_threadsafe(future.set_result, inner)
+                        return
+            except Exception:
+                logger.exception("Failed to dispatch unsolicited ORDER_FILLED to fill-future")
+
         logger.debug(
             "cTrader unsolicited message: payloadType=%s", getattr(message, "payloadType", None)
         )

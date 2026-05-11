@@ -210,6 +210,16 @@ side-by-side so you can confirm broker-side state.
 > frontend warning toast.
 >
 > Limit / stop orders unchanged — they accept absolute SL/TP in one RTT.
+>
+> **Note (step 3.4b)**: `broker_order_id` semantics depend on order
+> type. For a **filled market order**, it's the cTrader **positionId**
+> (lifecycle: open → close; what `modify_sl_tp` and `close` operate
+> on). For a **pending limit/stop order**, it's the cTrader **orderId**
+> (lifecycle: submit → fill or cancel). When the pending order
+> eventually fills, step 3.5's event handler will issue an unsolicited
+> resp_stream entry that swaps orderId → positionId for that order_id.
+> Server-side order_service uses whichever id is current on the order
+> hash to dispatch subsequent close / modify commands.
 
 The Python preamble (run once per shell session):
 
