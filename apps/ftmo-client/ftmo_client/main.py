@@ -104,7 +104,7 @@ async def amain(settings: FtmoClientSettings | None = None) -> int:
             name="heartbeat",
         ),
         asyncio.create_task(
-            command_loop(redis, settings.ftmo_account_id, shutdown),
+            command_loop(redis, bridge, settings.ftmo_account_id, shutdown),
             name="command_loop",
         ),
     ]

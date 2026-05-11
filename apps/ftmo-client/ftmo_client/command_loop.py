@@ -20,6 +20,7 @@ import redis.asyncio as redis_asyncio
 from redis.exceptions import RedisError
 
 from ftmo_client.action_handlers import ACTION_HANDLERS
+from ftmo_client.ctrader_bridge import CtraderBridge
 from ftmo_client.shutdown import ShutdownController
 
 logger = logging.getLogger(__name__)
@@ -54,10 +55,16 @@ def _consumer_name(account_id: str) -> str:
 
 async def command_loop(
     redis: redis_asyncio.Redis,
+    bridge: CtraderBridge,
     account_id: str,
     shutdown: ShutdownController,
 ) -> None:
-    """Run XREADGROUP → dispatch → XACK forever, until shutdown is requested."""
+    """Run XREADGROUP → dispatch → XACK forever, until shutdown is requested.
+
+    Step 3.4: ``bridge`` is threaded through to the action handlers so
+    each one can drive real cTrader trading calls. The loop itself
+    doesn't touch the bridge directly; it's just a pass-through.
+    """
     stream = _stream_name(account_id)
     group = _group_name(account_id)
     consumer = _consumer_name(account_id)
@@ -85,12 +92,13 @@ async def command_loop(
 
         for _stream, msgs in entries or []:
             for msg_id, fields in msgs:
-                await _dispatch_one(redis, account_id, stream, group, msg_id, fields)
+                await _dispatch_one(redis, bridge, account_id, stream, group, msg_id, fields)
     logger.info("command_loop exiting (account=%s)", account_id)
 
 
 async def _dispatch_one(
     redis: redis_asyncio.Redis,
+    bridge: CtraderBridge,
     account_id: str,
     stream: str,
     group: str,
@@ -104,10 +112,11 @@ async def _dispatch_one(
     unknown one is a bug, not a transient fault.
 
     Handler exceptions are logged but the message is still XACKed —
-    leaving it pending would block the consumer (XPENDING grows) and
-    the server would retry, but step 3.3 stubs can't fail meaningfully
-    anyway. Step 3.4 will introduce a dead-letter or no-ack path for
-    handler failures that warrant retry.
+    leaving it pending would block the consumer (XPENDING grows). The
+    handler is responsible for publishing an error response to
+    resp_stream BEFORE raising, so the server still hears about the
+    failure even though we don't re-deliver the command. Phase 5
+    hardening can introduce a no-ack retry path if we ever need it.
     """
     action = fields.get("action", "")
     request_id = fields.get("request_id", "")
@@ -121,7 +130,7 @@ async def _dispatch_one(
         )
     else:
         try:
-            await handler(redis, account_id, fields)
+            await handler(redis, bridge, account_id, fields)
         except asyncio.CancelledError:
             raise
         except Exception:

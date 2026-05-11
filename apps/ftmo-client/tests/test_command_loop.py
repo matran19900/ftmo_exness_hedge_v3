@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 import fakeredis.aioredis
 import pytest
@@ -13,6 +14,14 @@ from ftmo_client import action_handlers
 from ftmo_client import command_loop as cmdmod
 from ftmo_client.command_loop import command_loop
 from ftmo_client.shutdown import ShutdownController
+
+
+class StubBridge:
+    """Minimal stand-in for ``CtraderBridge`` — handlers under test below
+    don't actually invoke bridge methods (they're monkeypatched on the
+    ACTION_HANDLERS table), so this just satisfies the parameter type."""
+
+    pass
 
 
 @pytest_asyncio.fixture
@@ -41,13 +50,19 @@ def test_command_loop_consumer_group_matches_server() -> None:
 async def test_command_loop_dispatches_open_to_handler(
     fake_redis: fakeredis.aioredis.FakeRedis,
     consumer_ready: None,
-    caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    seen: list[dict[str, str]] = []
+    """Handler receives (redis, bridge, account_id, fields). Step 3.4 added
+    ``bridge`` as the 2nd positional arg — pin the contract here."""
+    seen: list[dict[str, Any]] = []
 
-    async def fake_open(_redis: object, account_id: str, fields: dict[str, str]) -> None:
-        seen.append({"account_id": account_id, **fields})
+    async def fake_open(
+        _redis: object,
+        bridge: object,
+        account_id: str,
+        fields: dict[str, str],
+    ) -> None:
+        seen.append({"bridge": bridge, "account_id": account_id, **fields})
 
     monkeypatch.setitem(action_handlers.ACTION_HANDLERS, "open", fake_open)
 
@@ -64,9 +79,11 @@ async def test_command_loop_dispatches_open_to_handler(
         },
     )
 
+    bridge = StubBridge()
     shutdown = ShutdownController()
-    task = asyncio.create_task(command_loop(fake_redis, "ftmo_001", shutdown))
-    # Poll until the dispatch fires; bound the test runtime so a hang surfaces.
+    task = asyncio.create_task(
+        command_loop(fake_redis, bridge, "ftmo_001", shutdown)  # type: ignore[arg-type]
+    )
     for _ in range(50):
         if seen:
             break
@@ -77,13 +94,23 @@ async def test_command_loop_dispatches_open_to_handler(
     assert len(seen) == 1
     assert seen[0]["order_id"] == "ord_001"
     assert seen[0]["account_id"] == "ftmo_001"
+    # The exact bridge instance reaches the handler — confirms passthrough.
+    assert seen[0]["bridge"] is bridge
 
 
 @pytest.mark.asyncio
 async def test_command_loop_xacks_after_handler_returns(
     fake_redis: fakeredis.aioredis.FakeRedis,
     consumer_ready: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A no-op handler still triggers XACK from the loop."""
+
+    async def noop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setitem(action_handlers.ACTION_HANDLERS, "open", noop)
+
     await fake_redis.xadd(
         "cmd_stream:ftmo:ftmo_001",
         {
@@ -97,9 +124,11 @@ async def test_command_loop_xacks_after_handler_returns(
         },
     )
 
+    bridge = StubBridge()
     shutdown = ShutdownController()
-    task = asyncio.create_task(command_loop(fake_redis, "ftmo_001", shutdown))
-    # Drain interval is 5s; poll the pending count to detect the ack.
+    task = asyncio.create_task(
+        command_loop(fake_redis, bridge, "ftmo_001", shutdown)  # type: ignore[arg-type]
+    )
     for _ in range(50):
         info = await fake_redis.xpending("cmd_stream:ftmo:ftmo_001", "ftmo-ftmo_001")
         if info["pending"] == 0:
@@ -126,9 +155,12 @@ async def test_command_loop_handles_unknown_action_with_ack(
         },
     )
 
+    bridge = StubBridge()
     shutdown = ShutdownController()
     with caplog.at_level(logging.WARNING):
-        task = asyncio.create_task(command_loop(fake_redis, "ftmo_001", shutdown))
+        task = asyncio.create_task(
+            command_loop(fake_redis, bridge, "ftmo_001", shutdown)  # type: ignore[arg-type]
+        )
         for _ in range(50):
             info = await fake_redis.xpending("cmd_stream:ftmo:ftmo_001", "ftmo-ftmo_001")
             if info["pending"] == 0:
@@ -137,7 +169,6 @@ async def test_command_loop_handles_unknown_action_with_ack(
         shutdown.request_shutdown()
         await asyncio.wait_for(task, timeout=6.0)
 
-    # Pending zero + warning logged.
     info = await fake_redis.xpending("cmd_stream:ftmo:ftmo_001", "ftmo-ftmo_001")
     assert info["pending"] == 0
     assert any("unknown action" in rec.message for rec in caplog.records)
@@ -150,10 +181,14 @@ async def test_command_loop_xacks_even_when_handler_raises(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A handler exception is logged + the message is still XACKed (step
-    3.3 contract — step 3.4 will introduce a no-ack retry path)."""
+    """A handler exception is logged + the message is still XACKed.
 
-    async def boom(*_args: object, **_kwargs: object) -> None:
+    Handlers in step 3.4 try-except to publish error responses BEFORE
+    raising, but if they raise anyway (bug), the loop still ACKs so the
+    consumer doesn't stall on a poison message.
+    """
+
+    async def boom(*_args: Any, **_kwargs: Any) -> None:
         raise RuntimeError("simulated bug")
 
     monkeypatch.setitem(action_handlers.ACTION_HANDLERS, "open", boom)
@@ -171,9 +206,12 @@ async def test_command_loop_xacks_even_when_handler_raises(
         },
     )
 
+    bridge = StubBridge()
     shutdown = ShutdownController()
     with caplog.at_level(logging.ERROR):
-        task = asyncio.create_task(command_loop(fake_redis, "ftmo_001", shutdown))
+        task = asyncio.create_task(
+            command_loop(fake_redis, bridge, "ftmo_001", shutdown)  # type: ignore[arg-type]
+        )
         for _ in range(50):
             info = await fake_redis.xpending("cmd_stream:ftmo:ftmo_001", "ftmo-ftmo_001")
             if info["pending"] == 0:
@@ -193,9 +231,13 @@ async def test_command_loop_respects_shutdown_immediately(
     consumer_ready: None,
 ) -> None:
     """If shutdown is set before the loop starts iterating, exit cleanly."""
+    bridge = StubBridge()
     shutdown = ShutdownController()
     shutdown.request_shutdown()
-    await asyncio.wait_for(command_loop(fake_redis, "ftmo_001", shutdown), timeout=2.0)
+    await asyncio.wait_for(
+        command_loop(fake_redis, bridge, "ftmo_001", shutdown),  # type: ignore[arg-type]
+        timeout=2.0,
+    )
 
 
 @pytest.mark.asyncio
@@ -211,17 +253,21 @@ async def test_command_loop_swallows_redis_error_and_retries(
         async def xreadgroup(self, *_args: object, **_kwargs: object) -> None:
             call_count["n"] += 1
             if call_count["n"] >= 3:
-                # Stop after a few attempts so the test bounds.
                 raise asyncio.CancelledError
             raise RedisErrorImport("simulated unavailable")
 
         async def xack(self, *_args: object, **_kwargs: object) -> int:
             return 0
 
-    # Patch the backoff so the test doesn't sleep a real second.
     monkeypatch.setattr(cmdmod, "ERROR_BACKOFF_SECONDS", 0.01)
 
+    bridge = StubBridge()
     shutdown = ShutdownController()
     with pytest.raises(asyncio.CancelledError):
-        await command_loop(ErroringRedis(), "ftmo_001", shutdown)  # type: ignore[arg-type]
+        await command_loop(
+            ErroringRedis(),  # type: ignore[arg-type]
+            bridge,  # type: ignore[arg-type]
+            "ftmo_001",
+            shutdown,
+        )
     assert call_count["n"] >= 2  # retried at least once after the first error

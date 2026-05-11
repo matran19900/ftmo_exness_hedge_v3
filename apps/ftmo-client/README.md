@@ -182,6 +182,169 @@ This is the first step that touches FTMO live. **No orders are placed**
   skew)`** — Re-run `run_oauth_flow`. Step 3.5 will add automatic
   refresh using the stored `refresh_token`.
 
+## Smoke test: real trading (step 3.4)
+
+Step 3.4 replaces the stub action handlers with real cTrader calls. After
+running the step 3.3 connect smoke above and confirming the heartbeat is
+green, exercise the trading path with these 7 sub-tests. Each is a
+Python REPL snippet from the devcontainer — `redis-cli` isn't installed,
+so we use `redis.asyncio.from_url` to XADD commands the same way the
+server will in step 3.6+.
+
+Prerequisite for every sub-test below: ftmo-client is running in another
+terminal (`python -m ftmo_client.main`), and the cTrader UI is open
+side-by-side so you can confirm broker-side state.
+
+The Python preamble (run once per shell session):
+
+```python
+import asyncio, time, uuid
+import redis.asyncio as r
+client = r.from_url("redis://192.168.88.4:6379/2", decode_responses=True)
+
+async def xadd(action, **fields):
+    fields["action"] = action
+    # Server normally sets request_id; for manual smoke we synthesize it.
+    fields.setdefault("request_id", uuid.uuid4().hex)
+    fields.setdefault("created_at", str(int(time.time() * 1000)))
+    msg_id = await client.xadd(
+        "cmd_stream:ftmo:ftmo_acc_001", fields, maxlen=10000, approximate=True
+    )
+    return msg_id
+
+async def drain_resp(after_id="0"):
+    return await client.xread({"resp_stream:ftmo:ftmo_acc_001": after_id}, block=2000)
+```
+
+### 1. Place market order
+
+```python
+await xadd("open",
+    order_id="ord_test_market",
+    symbol="EURUSD",
+    side="buy",
+    order_type="market",
+    volume_lots="0.01",
+    sl="1.07000",  # below current bid (check live spread first)
+    tp="1.09500",
+    entry_price="0",
+)
+await drain_resp()
+```
+
+Expected: ftmo-client log
+`[STUB step 3.4]` is GONE; instead see `published response: action=open
+order_id=ord_test_market status=success`. The `resp_stream` entry has
+`status=success`, `broker_order_id=<positionId>`, `fill_price=<float>`,
+`fill_time=<ms>`. cTrader UI shows the new open position.
+
+### 2. Place limit order
+
+```python
+await xadd("open",
+    order_id="ord_test_limit",
+    symbol="EURUSD",
+    side="buy",
+    order_type="limit",
+    volume_lots="0.01",
+    entry_price="1.07000",  # well below current ask
+    sl="1.06000",
+    tp="1.08000",
+)
+await drain_resp()
+```
+
+Expected: `resp_stream` entry has `status=success` with
+`broker_order_id=<pending orderId>`, `fill_price=""`, `fill_time=""`.
+cTrader UI shows a pending limit order.
+
+### 3. Place stop order
+
+```python
+await xadd("open",
+    order_id="ord_test_stop",
+    symbol="EURUSD",
+    side="buy",
+    order_type="stop",
+    volume_lots="0.01",
+    entry_price="1.10000",  # above current ask
+    sl="1.09000",
+    tp="1.11000",
+)
+await drain_resp()
+```
+
+Expected: same as limit — `status=success`, pending `broker_order_id`.
+
+### 4. Modify SL/TP of the position from sub-test 1
+
+```python
+# Use the broker_order_id from sub-test 1's resp entry.
+await xadd("modify_sl_tp",
+    order_id="ord_test_market",
+    broker_order_id="<positionId from #1>",
+    sl="1.06800",
+    tp="1.09800",
+)
+await drain_resp()
+```
+
+Expected: `resp_stream` entry `status=success`, `new_sl=1.068`,
+`new_tp=1.098`. cTrader UI shows updated SL/TP on the position.
+
+### 5. Close the position from sub-test 1
+
+```python
+await xadd("close",
+    order_id="ord_test_market",
+    symbol="EURUSD",  # needed for volume conversion
+    broker_order_id="<positionId from #1>",
+    volume_lots="0.01",
+)
+await drain_resp()
+```
+
+Expected: `status=success`, `close_price=<float>`, `close_time=<ms>`.
+Position disappears from cTrader UI.
+
+### 6. Error case — close a non-existent position
+
+```python
+await xadd("close",
+    order_id="ord_test_bad_close",
+    symbol="EURUSD",
+    broker_order_id="99999999",
+    volume_lots="0.01",
+)
+await drain_resp()
+```
+
+Expected: `status=error`,
+`error_code=position_not_found` (or `broker_error` if cTrader returns a
+different code — note the exact `error_msg` and feed it back to CTO so
+`retcode_mapping.py` can be extended).
+
+### 7. Error case — open with invalid SL distance
+
+```python
+# BUY with SL above current bid (invalid direction).
+await xadd("open",
+    order_id="ord_test_bad_sl",
+    symbol="EURUSD",
+    side="buy",
+    order_type="market",
+    volume_lots="0.01",
+    sl="9.99999",  # nonsense, above any FX bid
+    tp="0",
+    entry_price="0",
+)
+await drain_resp()
+```
+
+Expected: `status=error` with `error_code` in
+`{invalid_sl_distance, price_off, broker_error}`. Capture the exact
+`error_msg` for `retcode_mapping.py` extension.
+
 ## Tests
 
 ```bash
@@ -190,5 +353,6 @@ pytest -q
 ```
 
 Uses `fakeredis[lua]` so no live Redis is needed for unit tests. The
-cTrader bridge is mocked in `test_main_wiring.py`; wire-level tests
-against the real broker are CEO-driven via the smoke test above.
+cTrader bridge is mocked in `test_main_wiring.py` +
+`test_ctrader_bridge_actions.py`; wire-level tests against the real
+broker are CEO-driven via the smoke section above.

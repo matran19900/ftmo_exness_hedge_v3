@@ -9,9 +9,31 @@ Do NOT extract prematurely.
 Per-account: each FTMO client process drives ONE FTMO account. The
 bridge is constructed with that account's access_token and
 ctid_trader_account_id and immediately runs application + account auth
-on connect. Trading methods (``place_market_order``, ``close_position``,
-``modify_sl_tp``) are placeholders here — step 3.4 wires them to real
-cTrader protobuf requests.
+on connect.
+
+Step 3.4 fills in the trading methods (``place_market_order``,
+``place_limit_order``, ``place_stop_order``, ``close_position``,
+``modify_sl_tp``) with real cTrader protobuf calls. Each method:
+
+  - Maps lots → cTrader volume units using ``lot_size`` from the
+    caller-supplied symbol_config (cTrader convention: volume field is
+    in 0.01 base-currency units, equal to lots * lot_size).
+  - Sends prices as raw doubles (cTrader uses double-precision floats
+    for stopLoss / takeProfit / limitPrice / stopPrice — only spot
+    tick/trendbar prices use the int*10^5 wire format from D-032).
+  - Passes the caller's ``client_msg_id`` (the request_id from the
+    cmd_stream entry) to cTrader's ``clientMsgId`` so a retried command
+    receives the same response back from the broker.
+  - Returns a TypedDict (``OrderPlacementResult`` / ``ClosePositionResult``
+    / ``ModifySltpResult``) with all fields as strings so the caller
+    can XADD them straight into the resp_stream.
+
+cTrader response handling: a successful ProtoOANewOrderReq triggers a
+ProtoOAExecutionEvent with ``executionType=ORDER_FILLED`` (market) or
+``ORDER_ACCEPTED`` (limit/stop). Failures come back as
+``ORDER_REJECTED`` execution events OR ProtoOAErrorRes (auth/transport)
+OR ProtoOAOrderErrorEvent (business-rule rejection). All three are
+mapped to error fields via ``retcode_mapping.map_ctrader_error``.
 """
 
 from __future__ import annotations
@@ -19,14 +41,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 from ctrader_open_api import Client, Protobuf, TcpProtocol
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAccountAuthReq,
+    ProtoOAAmendPositionSLTPReq,
     ProtoOAApplicationAuthReq,
+    ProtoOAClosePositionReq,
+    ProtoOAErrorRes,
+    ProtoOAExecutionEvent,
+    ProtoOANewOrderReq,
+    ProtoOAOrderErrorEvent,
+)
+from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+    ProtoOAExecutionType,
+    ProtoOAOrderType,
+    ProtoOATradeSide,
 )
 from twisted.internet import reactor as _reactor
+
+from ftmo_client.retcode_mapping import map_ctrader_error
 
 # Twisted's reactor is a process-global singleton typed as the bare base
 # module by its partial stubs. Alias as Any so attribute access doesn't
@@ -34,6 +69,44 @@ from twisted.internet import reactor as _reactor
 reactor: Any = _reactor
 
 logger = logging.getLogger(__name__)
+
+# Default timeout for trading-call round-trips. cTrader typically replies
+# within ~200ms but slow market hours + retry paths can push it to ~5s; 30s
+# is a generous ceiling that still lets a stuck request fail before the
+# command_loop's next XREADGROUP block window.
+_TRADING_TIMEOUT_SECONDS = 30.0
+
+
+class OrderPlacementResult(TypedDict):
+    """Shape returned by ``place_market_order`` / ``place_limit_order`` /
+    ``place_stop_order``. All values are stringified so the caller can
+    XADD them straight into the resp_stream without additional formatting.
+    """
+
+    success: bool
+    broker_order_id: str  # cTrader positionId (filled) or orderId (pending)
+    fill_price: str  # filled price as string; "" if pending
+    fill_time: str  # epoch ms as string; "" if pending
+    commission: str  # raw cTrader value (moneyDigits-scaled); "" if unknown
+    error_code: str  # "" on success; mapped retcode on error
+    error_msg: str  # "" on success; human-readable cTrader reason on error
+
+
+class ClosePositionResult(TypedDict):
+    success: bool
+    close_price: str
+    close_time: str
+    realized_pnl: str  # raw cTrader moneyDigits-scaled value; "" if unknown
+    error_code: str
+    error_msg: str
+
+
+class ModifySltpResult(TypedDict):
+    success: bool
+    new_sl: str
+    new_tp: str
+    error_code: str
+    error_msg: str
 
 
 class CtraderBridge:
@@ -150,25 +223,382 @@ class CtraderBridge:
         self._authenticated.clear()
         logger.info("cTrader bridge stopped for account=%s", self._account_id)
 
-    # ---------- step-3.4 placeholders ----------
+    # ---------- trading methods ----------
 
-    async def place_market_order(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise NotImplementedError("step 3.4 will wire ProtoOANewOrderReq (market)")
+    async def place_market_order(
+        self,
+        *,
+        symbol_id: int,
+        side: Literal["buy", "sell"],
+        volume_lots: float,
+        lot_size: int,
+        sl_price: float,
+        tp_price: float,
+        client_msg_id: str,
+    ) -> OrderPlacementResult:
+        """Place a market order. Returns immediately after fill / rejection."""
+        req = self._build_new_order_req(
+            symbol_id=symbol_id,
+            order_type=ProtoOAOrderType.MARKET,
+            side=side,
+            volume_lots=volume_lots,
+            lot_size=lot_size,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            entry_price=0.0,  # ignored for market orders
+        )
+        response = await self._send_and_wait(
+            req, timeout=_TRADING_TIMEOUT_SECONDS, client_msg_id=client_msg_id
+        )
+        return self._parse_order_placement(response)
 
-    async def place_limit_order(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise NotImplementedError("step 3.4 will wire ProtoOANewOrderReq (limit)")
+    async def place_limit_order(
+        self,
+        *,
+        symbol_id: int,
+        side: Literal["buy", "sell"],
+        volume_lots: float,
+        lot_size: int,
+        entry_price: float,
+        sl_price: float,
+        tp_price: float,
+        client_msg_id: str,
+    ) -> OrderPlacementResult:
+        """Place a limit order. Returns after broker accepts / rejects it."""
+        req = self._build_new_order_req(
+            symbol_id=symbol_id,
+            order_type=ProtoOAOrderType.LIMIT,
+            side=side,
+            volume_lots=volume_lots,
+            lot_size=lot_size,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            entry_price=entry_price,
+        )
+        response = await self._send_and_wait(
+            req, timeout=_TRADING_TIMEOUT_SECONDS, client_msg_id=client_msg_id
+        )
+        return self._parse_order_placement(response)
 
-    async def place_stop_order(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise NotImplementedError("step 3.4 will wire ProtoOANewOrderReq (stop)")
+    async def place_stop_order(
+        self,
+        *,
+        symbol_id: int,
+        side: Literal["buy", "sell"],
+        volume_lots: float,
+        lot_size: int,
+        entry_price: float,
+        sl_price: float,
+        tp_price: float,
+        client_msg_id: str,
+    ) -> OrderPlacementResult:
+        """Place a stop order. Returns after broker accepts / rejects it."""
+        req = self._build_new_order_req(
+            symbol_id=symbol_id,
+            order_type=ProtoOAOrderType.STOP,
+            side=side,
+            volume_lots=volume_lots,
+            lot_size=lot_size,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            entry_price=entry_price,
+        )
+        response = await self._send_and_wait(
+            req, timeout=_TRADING_TIMEOUT_SECONDS, client_msg_id=client_msg_id
+        )
+        return self._parse_order_placement(response)
 
-    async def close_position(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise NotImplementedError("step 3.4 will wire ProtoOAClosePositionReq")
+    async def close_position(
+        self,
+        *,
+        position_id: int,
+        volume_lots: float,
+        lot_size: int,
+        client_msg_id: str,
+    ) -> ClosePositionResult:
+        """Close (fully or partially) an existing position by cTrader positionId."""
+        req = ProtoOAClosePositionReq()
+        req.ctidTraderAccountId = self._ctid_trader_account_id
+        req.positionId = position_id
+        req.volume = int(volume_lots * lot_size)
+        response = await self._send_and_wait(
+            req, timeout=_TRADING_TIMEOUT_SECONDS, client_msg_id=client_msg_id
+        )
+        return self._parse_close_position(response)
 
-    async def modify_sl_tp(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise NotImplementedError("step 3.4 will wire ProtoOAAmendPositionSLTPReq")
+    async def modify_sl_tp(
+        self,
+        *,
+        position_id: int,
+        sl_price: float,
+        tp_price: float,
+        client_msg_id: str,
+    ) -> ModifySltpResult:
+        """Amend a position's stopLoss / takeProfit prices.
+
+        Pass ``sl_price=0`` or ``tp_price=0`` to clear that side — the
+        cTrader proto skips unset double fields, so the protobuf builder
+        below only assigns the field when the price is positive.
+        """
+        req = ProtoOAAmendPositionSLTPReq()
+        req.ctidTraderAccountId = self._ctid_trader_account_id
+        req.positionId = position_id
+        if sl_price > 0:
+            req.stopLoss = sl_price
+        if tp_price > 0:
+            req.takeProfit = tp_price
+        response = await self._send_and_wait(
+            req, timeout=_TRADING_TIMEOUT_SECONDS, client_msg_id=client_msg_id
+        )
+        return self._parse_modify_sl_tp(response, sl_price, tp_price)
 
     async def subscribe_execution_events(self) -> None:
         raise NotImplementedError("step 3.5 will subscribe ProtoOAExecutionEvent")
+
+    # ---------- protobuf builders + response parsers ----------
+
+    def _build_new_order_req(
+        self,
+        *,
+        symbol_id: int,
+        order_type: int,  # ProtoOAOrderType enum value
+        side: Literal["buy", "sell"],
+        volume_lots: float,
+        lot_size: int,
+        sl_price: float,
+        tp_price: float,
+        entry_price: float,
+    ) -> ProtoOANewOrderReq:
+        """Compose ProtoOANewOrderReq with the right field set for the order_type.
+
+        Volume conversion: cTrader's ``volume`` field is in 0.01 base-currency
+        units, equal to ``lots * lot_size`` where ``lot_size`` is the broker's
+        cached cTrader value (e.g. EURUSD 1 lot → lot_size = 10_000_000;
+        0.01 lot → volume = 100_000).
+
+        Prices (limitPrice, stopPrice, stopLoss, takeProfit) are doubles on
+        ProtoOANewOrderReq — NOT the int*10^5 wire format used for tick/
+        trendbar messages (D-032). We send raw price floats here.
+        """
+        req = ProtoOANewOrderReq()
+        req.ctidTraderAccountId = self._ctid_trader_account_id
+        req.symbolId = symbol_id
+        req.orderType = order_type
+        req.tradeSide = ProtoOATradeSide.BUY if side == "buy" else ProtoOATradeSide.SELL
+        req.volume = int(volume_lots * lot_size)
+        if sl_price > 0:
+            req.stopLoss = sl_price
+        if tp_price > 0:
+            req.takeProfit = tp_price
+        if order_type == ProtoOAOrderType.LIMIT:
+            req.limitPrice = entry_price
+        elif order_type == ProtoOAOrderType.STOP:
+            req.stopPrice = entry_price
+        return req
+
+    @staticmethod
+    def _parse_order_placement(response: Any) -> OrderPlacementResult:
+        """Translate the cTrader response into an ``OrderPlacementResult``.
+
+        Three response shapes are handled:
+          - ProtoOAExecutionEvent → inspect ``executionType``.
+              * ORDER_FILLED → success with fill price / time from
+                response.deal.
+              * ORDER_ACCEPTED → success with broker_order_id = response.order.orderId;
+                no fill data (pending order).
+              * ORDER_REJECTED / ORDER_CANCEL_REJECTED → error path.
+          - ProtoOAErrorRes → auth / transport error.
+          - ProtoOAOrderErrorEvent → business-rule rejection.
+
+        Anything else (defensive) → generic broker_error.
+        """
+        empty: OrderPlacementResult = {
+            "success": False,
+            "broker_order_id": "",
+            "fill_price": "",
+            "fill_time": "",
+            "commission": "",
+            "error_code": "",
+            "error_msg": "",
+        }
+
+        if isinstance(response, ProtoOAExecutionEvent):
+            exec_type = int(response.executionType)
+            if exec_type == ProtoOAExecutionType.ORDER_FILLED:
+                deal = response.deal
+                position_id = int(deal.positionId) if deal.HasField("positionId") else 0
+                return {
+                    "success": True,
+                    "broker_order_id": str(position_id),
+                    "fill_price": str(float(deal.executionPrice)),
+                    "fill_time": str(int(deal.executionTimestamp)),
+                    "commission": str(int(deal.commission)),
+                    "error_code": "",
+                    "error_msg": "",
+                }
+            if exec_type == ProtoOAExecutionType.ORDER_ACCEPTED:
+                order = response.order
+                return {
+                    "success": True,
+                    "broker_order_id": str(int(order.orderId)),
+                    "fill_price": "",
+                    "fill_time": "",
+                    "commission": "",
+                    "error_code": "",
+                    "error_msg": "",
+                }
+            # ORDER_REJECTED / ORDER_CANCEL_REJECTED / unexpected types.
+            raw_code = str(response.errorCode) if response.HasField("errorCode") else ""
+            return {
+                **empty,
+                "error_code": map_ctrader_error(raw_code),
+                "error_msg": raw_code or f"executionType={exec_type}",
+            }
+
+        if isinstance(response, ProtoOAOrderErrorEvent):
+            return {
+                **empty,
+                "error_code": map_ctrader_error(str(response.errorCode)),
+                "error_msg": str(response.description or response.errorCode),
+            }
+
+        if isinstance(response, ProtoOAErrorRes):
+            return {
+                **empty,
+                "error_code": map_ctrader_error(str(response.errorCode)),
+                "error_msg": str(response.description or response.errorCode),
+            }
+
+        return {
+            **empty,
+            "error_code": "broker_error",
+            "error_msg": f"unexpected response: {type(response).__name__}",
+        }
+
+    @staticmethod
+    def _parse_close_position(response: Any) -> ClosePositionResult:
+        """Map a cTrader response to ``ClosePositionResult``.
+
+        On success: pull close_price + close_time from the deal sub-message.
+        On error: same three response shapes as ``_parse_order_placement``.
+        """
+        empty: ClosePositionResult = {
+            "success": False,
+            "close_price": "",
+            "close_time": "",
+            "realized_pnl": "",
+            "error_code": "",
+            "error_msg": "",
+        }
+
+        if isinstance(response, ProtoOAExecutionEvent):
+            exec_type = int(response.executionType)
+            if exec_type == ProtoOAExecutionType.ORDER_FILLED:
+                deal = response.deal
+                # closePositionDetail carries realized P&L on a closing deal.
+                realized = ""
+                if deal.HasField("closePositionDetail"):
+                    realized = str(int(deal.closePositionDetail.grossProfit))
+                return {
+                    "success": True,
+                    "close_price": str(float(deal.executionPrice)),
+                    "close_time": str(int(deal.executionTimestamp)),
+                    "realized_pnl": realized,
+                    "error_code": "",
+                    "error_msg": "",
+                }
+            raw_code = str(response.errorCode) if response.HasField("errorCode") else ""
+            return {
+                **empty,
+                "error_code": map_ctrader_error(raw_code),
+                "error_msg": raw_code or f"executionType={exec_type}",
+            }
+
+        if isinstance(response, ProtoOAOrderErrorEvent):
+            return {
+                **empty,
+                "error_code": map_ctrader_error(str(response.errorCode)),
+                "error_msg": str(response.description or response.errorCode),
+            }
+
+        if isinstance(response, ProtoOAErrorRes):
+            return {
+                **empty,
+                "error_code": map_ctrader_error(str(response.errorCode)),
+                "error_msg": str(response.description or response.errorCode),
+            }
+
+        return {
+            **empty,
+            "error_code": "broker_error",
+            "error_msg": f"unexpected response: {type(response).__name__}",
+        }
+
+    @staticmethod
+    def _parse_modify_sl_tp(
+        response: Any, requested_sl: float, requested_tp: float
+    ) -> ModifySltpResult:
+        """Map the amend response. cTrader sends an execution event with
+        ``executionType=ORDER_REPLACED`` (or similar) on success; we treat
+        any non-error response as success and echo back the requested
+        prices for the client (the broker confirms by NOT erroring)."""
+        empty: ModifySltpResult = {
+            "success": False,
+            "new_sl": "",
+            "new_tp": "",
+            "error_code": "",
+            "error_msg": "",
+        }
+
+        if isinstance(response, ProtoOAExecutionEvent):
+            exec_type = int(response.executionType)
+            if exec_type in (
+                ProtoOAExecutionType.ORDER_REPLACED,
+                ProtoOAExecutionType.ORDER_ACCEPTED,
+                ProtoOAExecutionType.ORDER_FILLED,
+            ):
+                # cTrader echoes the new prices on response.position when amending.
+                new_sl = ""
+                new_tp = ""
+                if response.HasField("position"):
+                    pos = response.position
+                    if pos.HasField("stopLoss"):
+                        new_sl = str(float(pos.stopLoss))
+                    if pos.HasField("takeProfit"):
+                        new_tp = str(float(pos.takeProfit))
+                return {
+                    "success": True,
+                    "new_sl": new_sl or str(requested_sl),
+                    "new_tp": new_tp or str(requested_tp),
+                    "error_code": "",
+                    "error_msg": "",
+                }
+            raw_code = str(response.errorCode) if response.HasField("errorCode") else ""
+            return {
+                **empty,
+                "error_code": map_ctrader_error(raw_code),
+                "error_msg": raw_code or f"executionType={exec_type}",
+            }
+
+        if isinstance(response, ProtoOAOrderErrorEvent):
+            return {
+                **empty,
+                "error_code": map_ctrader_error(str(response.errorCode)),
+                "error_msg": str(response.description or response.errorCode),
+            }
+
+        if isinstance(response, ProtoOAErrorRes):
+            return {
+                **empty,
+                "error_code": map_ctrader_error(str(response.errorCode)),
+                "error_msg": str(response.description or response.errorCode),
+            }
+
+        return {
+            **empty,
+            "error_code": "broker_error",
+            "error_msg": f"unexpected response: {type(response).__name__}",
+        }
 
     # ---------- private lifecycle ----------
 
@@ -263,13 +693,24 @@ class CtraderBridge:
 
     # ---------- async <-> Twisted bridge ----------
 
-    async def _send_and_wait(self, message: Any, timeout: float = 30.0) -> Any:
+    async def _send_and_wait(
+        self,
+        message: Any,
+        timeout: float = 30.0,
+        client_msg_id: str | None = None,
+    ) -> Any:
         """Send a request through Twisted and await the response in asyncio.
 
         Same shape as ``MarketDataService._send_and_wait`` (server, Phase 2.1):
         the cTrader library delivers responses as a ``ProtoMessage`` wrapper;
         we unwrap once via ``Protobuf.extract`` so callers always see the
         already-decoded inner protobuf.
+
+        ``client_msg_id`` is forwarded as cTrader's ``clientMsgId`` so a
+        retried command (same request_id from the cmd_stream) lands in the
+        broker's deduplication table and the eventual execution event
+        carries the same id back — the bridge can route the response to the
+        right Deferred.
         """
         if self._loop is None or self._client is None:
             raise RuntimeError("CtraderBridge not started")
@@ -289,7 +730,14 @@ class CtraderBridge:
                 )
 
         def send_in_reactor() -> None:
-            d = client.send(message)
+            # cTrader's Deferred has its own ``responseTimeoutInSeconds`` (5s
+            # default) — pass our ceiling so the broker-side wait matches the
+            # asyncio-side wait_for, otherwise short-lived deferred timeouts
+            # would error before our wait elapses.
+            send_kwargs: dict[str, Any] = {"responseTimeoutInSeconds": timeout}
+            if client_msg_id is not None:
+                send_kwargs["clientMsgId"] = client_msg_id
+            d = client.send(message, **send_kwargs)
             d.addCallback(on_success)
             d.addErrback(on_error)
 
