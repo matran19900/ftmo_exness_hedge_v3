@@ -87,6 +87,27 @@ else
   echo "  Skipped: web/package.json not present yet (will be created in step 1.4)"
 fi
 
+echo "[post-create] Step 9: hedger-ftmo-client editable (--no-deps to bypass resolver)..."
+cd "$REPO_ROOT/server"
+source .venv/bin/activate
+cd "$REPO_ROOT/apps/ftmo-client"
+pip install --no-deps -e .
+
+echo "[post-create] Step 10: hedger-ftmo-client runtime deps (manual)..."
+pip install \
+  "pydantic>=2.7,<3" \
+  "pydantic-settings>=2.4,<3" \
+  "redis[hiredis]>=5.0,<6" \
+  "httpx>=0.27,<0.28" \
+  "twisted>=23,<26" \
+  "protobuf>=4.25,<6" \
+  "service_identity>=24,<26" \
+  "pyOpenSSL>=24,<26"
+
+deactivate
+
+cd "$REPO_ROOT"
+
 echo "[post-create] Done."
 echo ""
 echo "Next steps:"

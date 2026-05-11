@@ -6,7 +6,7 @@ dependencies = [
   "pydantic>=2.7,<3",
   # httpx is pulled in for hedger_shared.ctrader_oauth (extracted from
   # server in step 3.3 so server + ftmo-client share the OAuth helpers).
-  "httpx>=0.27,<0.29",
+  "httpx>=0.27,<0.28",
 ]
 
 [build-system]

@@ -11,22 +11,43 @@ replace the stubs with real broker calls + response publishing.
 
 ## Install
 
-The package is part of the monorepo. Install in editable mode from the
-repo root:
+The package is part of the monorepo and declares `hedger-shared` as a dep.
+Since `hedger-shared` is a sibling package (not on PyPI), install via the
+monorepo pattern that bypasses pip's resolver for sibling-package deps:
 
 ```bash
 cd apps/ftmo-client
-pip install -e .[dev]
-# Or install the runtime-only deps:
-pip install -e .
+
+# Install ftmo-client itself, bypassing resolver
+pip install --no-deps -e .
+
+# Install runtime deps explicitly
+pip install \
+  "pydantic>=2.7,<3" \
+  "pydantic-settings>=2.4,<3" \
+  "redis[hiredis]>=5.0,<6" \
+  "httpx>=0.27,<0.28" \
+  "twisted>=23,<26" \
+  "protobuf>=4.25,<6" \
+  "service_identity>=24,<26" \
+  "pyOpenSSL>=24,<26"
+
+# Install dev/test deps
+pip install \
+  "fakeredis[lua]>=2.24" \
+  "mypy>=1.10" \
+  "pytest>=8" \
+  "pytest-asyncio>=0.23" \
+  "pytest-mock>=3.14" \
+  "ruff>=0.5"
 ```
 
-`hedger-shared` is a sibling package and must be installed as well —
-the devcontainer post-create script handles this; for ad-hoc shells:
+`hedger-shared` must be installed first from `../../shared/` (the devcontainer
+post-create script handles this automatically; for ad-hoc shells outside the
+devcontainer, run `pip install -e ../../shared` BEFORE the commands above).
 
-```bash
-pip install -e ../../shared
-```
+Do NOT use `pip install -e .[dev]` — it fails because the resolver can't find
+`hedger-shared` on PyPI.
 
 ## Configure
 
