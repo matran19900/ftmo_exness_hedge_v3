@@ -115,8 +115,53 @@ async def test_amain_wires_tasks_and_shuts_down_cleanly(
     init_kwargs = next(c["init"] for c in patched_bridge if "init" in c)
     assert init_kwargs["account_id"] == "ftmo_001"
     assert init_kwargs["ctid_trader_account_id"] == 42
+    # Step 3.5: bridge must receive the redis client so it can publish
+    # unsolicited events to event_stream:ftmo:{acc}.
+    assert init_kwargs.get("redis") is patched_redis
     assert any("connected" in c for c in patched_bridge)
     assert any("disconnected" in c for c in patched_bridge)
+
+
+@pytest.mark.asyncio
+async def test_amain_starts_account_info_task(
+    patched_redis: fakeredis.aioredis.FakeRedis,
+    patched_bridge: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Step 3.5: amain creates an ``account_info`` task alongside
+    heartbeat + command_loop. We patch the loop coroutine to set a
+    flag so we can verify it actually got scheduled."""
+    token = TokenResponse(
+        access_token="acc",
+        refresh_token="ref",
+        expires_in=3600,
+        token_type="Bearer",
+    )
+    await save_token(patched_redis, "ftmo_001", token, ctid_trader_account_id=42)
+
+    account_info_called = asyncio.Event()
+
+    async def fake_account_info_loop(
+        _bridge: Any, _redis: Any, account_id: str, _shutdown: Any
+    ) -> None:
+        assert account_id == "ftmo_001"
+        account_info_called.set()
+        await asyncio.Event().wait()  # block until cancelled
+
+    monkeypatch.setattr(main_module, "account_info_loop", fake_account_info_loop)
+
+    amain_task = asyncio.create_task(amain(_settings()))
+    # Wait for the account_info_loop to be entered.
+    try:
+        await asyncio.wait_for(account_info_called.wait(), timeout=1.0)
+    finally:
+        amain_task.cancel()
+        try:
+            await amain_task
+        except asyncio.CancelledError:
+            pass
+
+    assert account_info_called.is_set()
 
 
 @pytest.mark.asyncio

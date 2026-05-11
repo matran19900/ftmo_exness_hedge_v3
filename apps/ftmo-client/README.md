@@ -387,6 +387,200 @@ Expected: `status=error` with `error_code` in
 `{invalid_sl_distance, price_off, broker_error}`. Capture the exact
 `error_msg` for `retcode_mapping.py` extension.
 
+## Smoke test: events + account info (step 3.5)
+
+Step 3.5 adds two new behaviors: unsolicited events from cTrader are
+published to `event_stream:ftmo:{account_id}`, and account info
+(balance/margin) is HSET to `account:ftmo:{account_id}` every 30s.
+This smoke verifies both — same Python preamble as the step 3.4
+section above; reuse the same shell session.
+
+> See `docs/ctrader-execution-events.md §3.2-3.6, §4.3, §10` for the
+> documented protobuf shapes that drive each sub-test. `close_reason`
+> is inferred from price comparison vs `position.stopLoss` /
+> `position.takeProfit` (cTrader does not provide a structured
+> close-reason field — verified via DESCRIPTOR inspection in step 3.5).
+
+Helpers (extend the step-3.4 preamble):
+
+```python
+async def drain_event(n: int = 1):
+    # Read the next n entries from event_stream (block 2s for activity).
+    entries = await client.xread({f"event_stream:ftmo:{ACC}": "$"}, block=2000, count=n)
+    print(entries)
+
+async def show_account_info():
+    info = await client.hgetall(f"account:ftmo:{ACC}")
+    print(info)
+```
+
+### Sub-test 1 — Pending limit fill → `pending_filled`
+
+Place a LIMIT well below market (so it sits pending), then either
+wait for market to retrace or move the cTrader UI's limit price to
+trigger an instant fill.
+
+```python
+await xadd("open",
+    order_id="ord_pf",
+    symbol="EURUSD",
+    side="buy",
+    order_type="limit",
+    volume_lots="0.01",
+    entry_price="1.00000",  # well below market
+    sl="0.99500",
+    tp="1.01000",
+)
+await drain_resp()  # status=success, broker_order_id=<orderId>
+# Wait for fill (or amend the limit price on cTrader UI to current bid).
+await drain_event()
+```
+
+Expected event_stream entry:
+```
+event_type=pending_filled
+broker_order_id=<positionId>   ← NEW; replaces orderId on order:{id}
+position_id=<positionId>
+order_id_old=<original orderId>
+fill_price=<float>
+fill_time=<epoch ms>
+```
+
+### Sub-test 2 — User close on cTrader UI → `position_closed, close_reason=manual`
+
+Open a position via FTMO client (step 3.4 path), then close it on the
+cTrader UI.
+
+```python
+await xadd("open",
+    order_id="ord_close",
+    symbol="EURUSD",
+    side="buy",
+    order_type="market",
+    volume_lots="0.01",
+    sl="0",
+    tp="0",          # no SL/TP set → heuristic returns "manual"
+    entry_price="0",
+)
+await drain_resp()
+# Now close via cTrader UI (right-click position → Close)
+await drain_event()
+```
+
+Expected:
+```
+event_type=position_closed
+broker_order_id=<positionId>
+close_price=<actual close>
+close_time=<epoch ms>
+realized_pnl=<raw int, scale by money_digits>
+close_reason=manual
+```
+
+### Sub-test 3 — SL hit → `close_reason=sl`
+
+Open a position with a tight SL just outside spread; wait for market
+to drift through.
+
+```python
+await xadd("open",
+    order_id="ord_sl",
+    symbol="EURUSD",
+    side="buy",
+    order_type="market",
+    volume_lots="0.01",
+    sl="1.08000",    # set 5-10 pips below current bid
+    tp="1.10000",
+    entry_price="0",
+)
+await drain_resp()
+# Wait for market move (may take minutes; skip if smoke time-boxed).
+await drain_event()
+```
+
+Expected `close_reason=sl` (close_price within 1 pip of SL).
+
+### Sub-test 4 — TP hit → `close_reason=tp`
+
+Same as sub-test 3 but with a tight TP.
+
+```python
+await xadd("open",
+    order_id="ord_tp",
+    symbol="EURUSD",
+    side="buy",
+    order_type="market",
+    volume_lots="0.01",
+    sl="1.06000",
+    tp="1.08500",    # 5-10 pips above current ask
+    entry_price="0",
+)
+```
+
+Expected `close_reason=tp`.
+
+### Sub-test 5 — User modify SL/TP on cTrader UI → `position_modified`
+
+Open a position, then drag the SL or TP line on the cTrader UI to a
+new price.
+
+```python
+await xadd("open",
+    order_id="ord_mod",
+    symbol="EURUSD",
+    side="buy",
+    order_type="market",
+    volume_lots="0.01",
+    sl="1.07000",
+    tp="1.09000",
+    entry_price="0",
+)
+await drain_resp()
+# Drag SL on cTrader UI to e.g. 1.06500.
+await drain_event()
+```
+
+Expected:
+```
+event_type=position_modified
+broker_order_id=<positionId>
+new_sl=<new SL>
+new_tp=<existing TP, or empty if cleared>
+```
+
+### Sub-test 6 — Account info publishing after 35s
+
+After the FTMO client has run for >30s post-startup, verify the
+account info hash is populated.
+
+```python
+await show_account_info()
+```
+
+Expected fields:
+```
+balance=<raw int>        ← e.g. "100000" for $1000.00 with money_digits=2
+equity=<same as balance> ← step 3.5 limitation; documented in docs/ctrader-execution-events.md §10
+margin=<raw int>         ← sum of usedMargin across open positions
+free_margin=<balance - margin>
+currency=USD
+money_digits=2
+updated_at=<epoch ms>
+```
+
+### Sub-test 7 — Account info updates every poll
+
+Capture `updated_at` from sub-test 6, wait 31s, re-read. The value
+must change (otherwise the loop isn't running or is stuck).
+
+```python
+import time
+before = (await client.hgetall(f"account:ftmo:{ACC}"))["updated_at"]
+await asyncio.sleep(31)
+after = (await client.hgetall(f"account:ftmo:{ACC}"))["updated_at"]
+assert int(after) > int(before), f"updated_at didn't change: {before} → {after}"
+```
+
 ## Tests
 
 ```bash

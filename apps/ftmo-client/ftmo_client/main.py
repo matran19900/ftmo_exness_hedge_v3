@@ -14,6 +14,7 @@ import sys
 
 import redis.asyncio as redis_asyncio
 
+from ftmo_client.account_info import account_info_loop
 from ftmo_client.command_loop import command_loop
 from ftmo_client.config import FtmoClientSettings
 from ftmo_client.ctrader_bridge import CtraderBridge
@@ -77,6 +78,7 @@ async def amain(settings: FtmoClientSettings | None = None) -> int:
         ctid_trader_account_id=int(token["ctid_trader_account_id"]),
         client_id=settings.ctrader_client_id,
         client_secret=settings.ctrader_client_secret,
+        redis=redis,  # step 3.5: needed for unsolicited event publishing
         host=settings.ctrader_host,
         port=settings.ctrader_port,
     )
@@ -106,6 +108,10 @@ async def amain(settings: FtmoClientSettings | None = None) -> int:
         asyncio.create_task(
             command_loop(redis, bridge, settings.ftmo_account_id, shutdown),
             name="command_loop",
+        ),
+        asyncio.create_task(
+            account_info_loop(bridge, redis, settings.ftmo_account_id, shutdown),
+            name="account_info",
         ),
     ]
 

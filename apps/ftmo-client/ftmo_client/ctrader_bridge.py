@@ -43,6 +43,7 @@ import logging
 import threading
 from typing import Any, Literal, TypedDict
 
+import redis.asyncio as redis_asyncio
 from ctrader_open_api import Client, Protobuf, TcpProtocol
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAccountAuthReq,
@@ -53,14 +54,20 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAExecutionEvent,
     ProtoOANewOrderReq,
     ProtoOAOrderErrorEvent,
+    ProtoOAReconcileReq,
+    ProtoOAReconcileRes,
+    ProtoOATraderReq,
+    ProtoOATraderRes,
 )
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
     ProtoOAExecutionType,
     ProtoOAOrderType,
     ProtoOATradeSide,
 )
+from redis.exceptions import RedisError
 from twisted.internet import reactor as _reactor
 
+from ftmo_client.event_publisher import build_event_payload
 from ftmo_client.retcode_mapping import map_ctrader_error
 
 # Twisted's reactor is a process-global singleton typed as the bare base
@@ -135,6 +142,27 @@ class ModifySltpResult(TypedDict):
     error_msg: str
 
 
+class AccountInfo(TypedDict):
+    """Account-level snapshot polled every 30s by ``account_info_loop``.
+
+    All money fields are raw cTrader integers — the consumer scales by
+    ``money_digits`` (per-account exponent, typically 2). ``balance``
+    comes from ProtoOATraderRes; ``margin`` is the sum of
+    ``ProtoOAPosition.usedMargin`` over the reconcile snapshot. Equity
+    requires unrealized P&L (a separate cTrader call); for step 3.5 we
+    set ``equity = balance`` and document the limitation — accurate
+    only when no positions are open. Future step can wire
+    ProtoOAGetPositionUnrealizedPnLReq for true equity.
+    """
+
+    balance: int
+    equity: int
+    margin: int
+    free_margin: int
+    currency: str
+    money_digits: int
+
+
 class CtraderBridge:
     """Async-friendly facade over a Twisted-driven cTrader trading client.
 
@@ -155,14 +183,22 @@ class CtraderBridge:
         ctid_trader_account_id: int,
         client_id: str,
         client_secret: str,
+        redis: redis_asyncio.Redis | None = None,
         host: str = "live.ctraderapi.com",
         port: int = 5035,
     ) -> None:
+        """``redis`` is required for unsolicited event publishing (step
+        3.5). It's typed Optional only so existing tests that
+        instantiate the bridge without a Redis fixture keep working —
+        production callers (``main.amain``) always pass it. ``_on_message``
+        skips the publish step when ``self._redis is None``.
+        """
         self._account_id = account_id
         self._access_token = access_token
         self._ctid_trader_account_id = ctid_trader_account_id
         self._client_id = client_id
         self._client_secret = client_secret
+        self._redis = redis
         self._host = host
         self._port = port
         self._client: Any = None  # ctrader_open_api.Client; untyped lib
@@ -635,7 +671,74 @@ class CtraderBridge:
         return self._parse_modify_sl_tp(response, sl_price, tp_price)
 
     async def subscribe_execution_events(self) -> None:
-        raise NotImplementedError("step 3.5 will subscribe ProtoOAExecutionEvent")
+        """No-op in step 3.5.
+
+        Empirical observation (step 3.5 smoke): cTrader broadcasts
+        execution events on the account auth'd connection without an
+        explicit subscribe — ``ProtoOASubscribeSpotsReq`` is for spot
+        ticks only, not for executions. ``_on_message`` already
+        receives every event for this account once
+        ``_authenticate`` completes. Keeping this method as a
+        documented no-op so any future caller doesn't crash with
+        NotImplementedError; the docstring is the contract.
+        """
+        return None
+
+    async def get_account_info(self) -> AccountInfo:
+        """Poll ProtoOATraderReq + ProtoOAReconcileReq for balance + margin.
+
+        Step 3.5 limitation: ``equity = balance``. True equity would
+        require unrealized P&L from
+        ``ProtoOAGetPositionUnrealizedPnLReq`` (an extra round-trip
+        per poll) or recomputing from spot ticks. For step 3.5 we
+        accept this approximation; future step can layer in true
+        equity if the operator needs intra-trade margin tracking.
+
+        Currency is hard-coded ``"USD"`` (FTMO funded accounts are
+        USD-denominated; the alternative would be a one-time
+        ProtoOAAssetListReq + map from ``trader.depositAssetId`` →
+        asset name, which is out of scope per step §2). If a non-USD
+        FTMO product is ever supported, swap this to the proper
+        asset lookup.
+
+        Raises whatever ``_send_and_wait`` raises — typically
+        ``RuntimeError`` for transport errors, ``TimeoutError`` for
+        stalled responses. The poll loop catches and continues.
+        """
+        from uuid import uuid4  # noqa: PLC0415 — local to keep top-level imports tidy
+
+        trader_req = ProtoOATraderReq()
+        trader_req.ctidTraderAccountId = self._ctid_trader_account_id
+        trader_res = await self._send_and_wait(trader_req, timeout=10.0, client_msg_id=uuid4().hex)
+        if not isinstance(trader_res, ProtoOATraderRes):
+            raise RuntimeError(
+                f"get_account_info: unexpected response for TraderReq: {type(trader_res).__name__}"
+            )
+        trader = trader_res.trader
+        balance = int(trader.balance)
+        money_digits = int(trader.moneyDigits) if trader.HasField("moneyDigits") else 2
+
+        reconcile_req = ProtoOAReconcileReq()
+        reconcile_req.ctidTraderAccountId = self._ctid_trader_account_id
+        reconcile_res = await self._send_and_wait(
+            reconcile_req, timeout=10.0, client_msg_id=uuid4().hex
+        )
+        if not isinstance(reconcile_res, ProtoOAReconcileRes):
+            raise RuntimeError(
+                f"get_account_info: unexpected response for ReconcileReq: "
+                f"{type(reconcile_res).__name__}"
+            )
+        used_margin = sum(
+            int(p.usedMargin) if p.HasField("usedMargin") else 0 for p in reconcile_res.position
+        )
+        return AccountInfo(
+            balance=balance,
+            equity=balance,  # see docstring — equity == balance approximation
+            margin=used_margin,
+            free_margin=balance - used_margin,
+            currency="USD",
+            money_digits=money_digits,
+        )
 
     # ---------- protobuf builders + response parsers ----------
 
@@ -1061,35 +1164,102 @@ class CtraderBridge:
 
     def _on_message(self, _client: Any, message: Any) -> None:
         """Runs in the Twisted reactor thread for EVERY message — solicited
-        and unsolicited. Step 3.5 will route cascade-close events here too.
+        and unsolicited.
 
-        Step 3.4b/3.4c: when ``place_market_order`` or ``close_position``
-        is mid-flight, the first cTrader response (``ORDER_ACCEPTED``)
-        lands on the request's Deferred (which the library pops on first
-        match). The follow-up ``ORDER_FILLED`` event carries the SAME
-        ``clientMsgId`` but no longer has a Deferred to fire — it
-        arrives here. We resolve the pre-registered execution-future so
-        the caller can return the fill data (positionId / deal.* fields,
-        including ``deal.closePositionDetail.grossProfit`` for closes)
-        instead of the intermediate ACCEPTED payload.
+        Step 3.4b/3.4c (solicited path): when ``place_market_order`` or
+        ``close_position`` is mid-flight, the first cTrader response
+        (``ORDER_ACCEPTED``) lands on the request's Deferred (which the
+        library pops on first match). The follow-up ``ORDER_FILLED``
+        event carries the SAME ``clientMsgId`` but no longer has a
+        Deferred to fire — it arrives here. We resolve the
+        pre-registered execution-future so the caller can return the
+        fill data instead of the intermediate ACCEPTED payload.
+
+        Step 3.5 (unsolicited path): any execution event WITHOUT a
+        matching pending entry is treated as unsolicited — user closed
+        on the cTrader UI, SL/TP hit, pending order fill, etc. We
+        translate it to an event_stream payload via
+        ``event_publisher.build_event_payload`` and schedule an
+        async XADD on the asyncio loop from this Twisted thread via
+        ``loop.call_soon_threadsafe(asyncio.create_task, ...)``. Errors
+        in the publish path are logged but don't crash the reactor.
         """
-        cmid = getattr(message, "clientMsgId", None)
-        if cmid is not None and cmid in self._pending_executions:
-            try:
-                inner = Protobuf.extract(message)
-                if (
-                    isinstance(inner, ProtoOAExecutionEvent)
-                    and int(inner.executionType) == ProtoOAExecutionType.ORDER_FILLED
-                ):
-                    future = self._pending_executions.get(cmid)
-                    if future is not None and not future.done() and self._loop is not None:
-                        self._loop.call_soon_threadsafe(future.set_result, inner)
-                        return
-            except Exception:
-                logger.exception("Failed to dispatch unsolicited ORDER_FILLED to fill-future")
+        try:
+            inner = Protobuf.extract(message)
+        except Exception:
+            logger.exception("Failed to extract inner protobuf from %r", message)
+            return
 
-        logger.debug(
-            "cTrader unsolicited message: payloadType=%s", getattr(message, "payloadType", None)
+        if not isinstance(inner, ProtoOAExecutionEvent):
+            logger.debug(
+                "cTrader unsolicited message: payloadType=%s",
+                getattr(message, "payloadType", None),
+            )
+            return
+
+        cmid = getattr(message, "clientMsgId", None) or ""
+
+        # Solicited: matches a pending request waiting for ORDER_FILLED.
+        if cmid and cmid in self._pending_executions:
+            if int(inner.executionType) == ProtoOAExecutionType.ORDER_FILLED:
+                future = self._pending_executions.get(cmid)
+                if future is not None and not future.done() and self._loop is not None:
+                    self._loop.call_soon_threadsafe(future.set_result, inner)
+                    return
+            # Other executionType (REPLACED on a different correlation,
+            # late REJECTED, etc.) while a fill-future is pending —
+            # let it fall through to the unsolicited publish path.
+
+        # Unsolicited: schedule async publish to event_stream.
+        if self._redis is None or self._loop is None:
+            logger.debug(
+                "Unsolicited execution event ignored (no redis/loop wired): executionType=%s",
+                int(inner.executionType),
+            )
+            return
+        self._loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(self._publish_unsolicited_event(inner))
+        )
+
+    async def _publish_unsolicited_event(self, event: ProtoOAExecutionEvent) -> None:
+        """Build the event_stream payload + XADD it. Runs in the asyncio
+        loop. Errors are logged and swallowed — a single dropped event
+        must not take down the bridge.
+
+        ``maxlen=10000 approximate=True`` caps the stream length so a
+        long-running client doesn't grow the stream unboundedly; the
+        server's event_handler runs continuously and acks fast, so
+        10k is far above the practical lag ceiling.
+        """
+        payload = build_event_payload(event)
+        if payload is None:
+            logger.debug(
+                "Unsolicited event with no matching event_type; skipped. executionType=%s",
+                int(event.executionType),
+            )
+            return
+        if self._redis is None:
+            logger.debug("No redis on bridge; skipping unsolicited publish")
+            return
+        stream = f"event_stream:ftmo:{self._account_id}"
+        try:
+            await self._redis.xadd(
+                stream,
+                payload,  # type: ignore[arg-type]
+                maxlen=10000,
+                approximate=True,
+            )
+        except RedisError:
+            logger.exception(
+                "Failed to publish unsolicited event to %s (event_type=%s)",
+                stream,
+                payload.get("event_type", ""),
+            )
+            return
+        logger.info(
+            "published unsolicited event: type=%s position_id=%s",
+            payload.get("event_type", ""),
+            payload.get("position_id", ""),
         )
 
     # ---------- async <-> Twisted bridge ----------

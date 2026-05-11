@@ -119,22 +119,69 @@ Later when price hits limit/stop:
 
 Step 3.4 sub-test 5 smoke evidence của bug trước fix: resp_stream `error_msg='executionType=2'` mặc dù cTrader UI shows position closed. Cause: bridge consumed ACCEPTED, dropped FILLED.
 
-### 3.2 User đóng lệnh tay trên cTrader Desktop/Web
-[chưa observe — placeholder cho step 3.5 / 3.7 update]
-Expected (theo extrapolation từ §3.1):
-- Unsolicited `ProtoOAExecutionEvent` (no `clientMsgId` correlation, since không phải request initiated)
-- `executionType = ORDER_FILLED`
-- `deal.closePositionDetail` same shape as 3.1
-- Server's event_handler routes via positionId lookup → fan out cascade-close to hedge legs
+### 3.2 User đóng lệnh tay trên cTrader Desktop/Web — bridge handling verified step 3.5
+```
+[broker] ProtoOAExecutionEvent (UNSOLICITED — no clientMsgId)
+  executionType = ORDER_FILLED (3)
+  position.positionId = <positionId being closed>
+  position.stopLoss, position.takeProfit (echoed for reason inference)
+  deal.executionPrice = close price (DOUBLE — D-064)
+  deal.executionTimestamp = close time (epoch ms)
+  deal.commission = close-side commission (raw int)
+  deal.closePositionDetail.grossProfit = realized P&L (raw int, D-053)
+```
 
-### 3.3 SL hit auto-close
-[chưa observe — placeholder for step 3.5+]
+**Bridge handling** (step 3.5): `_on_message` sees `clientMsgId == ""`
+→ unsolicited path → ``event_publisher.build_event_payload`` →
+XADD `event_stream:ftmo:{account_id}` with:
+- `event_type = "position_closed"`
+- `broker_order_id = position.positionId`
+- `close_reason` inferred via price comparison (see §3.6 below)
 
-### 3.4 TP hit auto-close
-[chưa observe — placeholder for step 3.5+]
+### 3.3 SL hit auto-close — same wire shape as §3.2
+Identical execution event shape to §3.2 (cTrader does NOT emit a
+distinct event type or flag for SL-triggered closes). The bridge
+distinguishes via the heuristic in §3.6: if `close_price ≈
+position.stopLoss` within the configured tolerance,
+`event_type = position_closed` and `close_reason = "sl"`.
+
+[Empirical confirmation pending step 3.5 smoke run — placeholder
+section reserved for SL/TP-close inspector logs if the heuristic
+ever misclassifies.]
+
+### 3.4 TP hit auto-close — same wire shape as §3.2
+Same as §3.3 but matched against `position.takeProfit`:
+`close_reason = "tp"`.
 
 ### 3.5 Margin call / stop-out
-[chưa observe — placeholder for step 3.5+]
+[chưa observe — placeholder for Phase 4+ smoke]
+Expected wire shape: combination of
+`ProtoOAMarginCallTriggerEvent` (separate unsolicited event published
+to the account auth'd connection) PLUS one or more
+`ProtoOAExecutionEvent(ORDER_FILLED)` for each position closed by the
+margin engine. The bridge currently classifies the close events as
+`close_reason = "manual"` since the heuristic doesn't correlate with
+margin-call timing. A future step can layer margin-call event
+correlation to upgrade these to `close_reason = "stopout"`.
+
+### 3.6 Bridge close-reason heuristic (step 3.5)
+cTrader does NOT expose a structured close-reason field — verified
+via DESCRIPTOR inspection of `ProtoOADeal` and
+`ProtoOAClosePositionDetail` (step 3.5). The bridge infers reason
+from echoed position SL/TP:
+
+| Heuristic | Resulting `close_reason` |
+|---|---|
+| `abs(close_price - position.stopLoss) ≤ 1e-4` (1 pip) | `"sl"` |
+| `abs(close_price - position.takeProfit) ≤ 1e-4` | `"tp"` |
+| No SL set AND no TP set | `"manual"` |
+| All other cases (has SL/TP but no match within tolerance) | `"manual"` |
+
+Implementation: `ftmo_client/event_publisher.py::_infer_close_reason`.
+Tolerance constant `_SL_TP_PRICE_TOLERANCE = 1e-4`. The `"unknown"`
+and `"stopout"` protocol values (see `docs/05-redis-protocol.md §5`)
+are reserved for future enhancements; the heuristic does not emit
+them today.
 
 ## 4. SL/TP modification flows
 
@@ -159,11 +206,27 @@ Test contracts pinning this behavior (step 3.4c):
 - `"New TP for BUY position should be >= current BID price"` → SL/TP direction violation. cTrader returns this as `ProtoOAErrorRes` hoặc `ProtoOAOrderErrorEvent` với errorCode tương ứng.
 - **Atomicity quirk**: cTrader treats SL+TP as a single atomic amend — nếu 1 field invalid, reject toàn bộ (cả SL lẫn TP đều không set), KHÔNG partial. Documented; no bridge-side workaround (caller must send a valid pair).
 
-### 4.3 User sửa SL/TP tay trên cTrader Desktop/Web
-[chưa observe — placeholder cho step 3.5 / 3.7 update]
-Expected:
-- Unsolicited `ProtoOAExecutionEvent` (executionType=ORDER_REPLACED hoặc tương tự)
-- Server detect qua positionId, update order:{id} hash + propagate to hedge leg
+### 4.3 User sửa SL/TP tay trên cTrader Desktop/Web — bridge handling step 3.5
+```
+[broker] ProtoOAExecutionEvent (UNSOLICITED — no clientMsgId)
+  executionType = ORDER_REPLACED (4)
+  position.positionId = <positionId being amended>
+  position.stopLoss, position.takeProfit (the NEW values)
+  (no deal data — modify doesn't create a deal)
+```
+
+**Bridge handling** (step 3.5): `_on_message` → unsolicited path →
+XADD `event_stream:ftmo:{account_id}`:
+- `event_type = "position_modified"`
+- `broker_order_id = position.positionId`
+- `new_sl = position.stopLoss` (empty string if cleared)
+- `new_tp = position.takeProfit` (empty string if cleared)
+
+Server's event_handler (step 3.7) uses this to update the
+`order:{order_id}` hash + propagate to hedge leg via cmd_stream
+modify on the Exness account.
+
+[Empirical confirmation pending step 3.5 smoke run.]
 
 ## 5. Timing & latency (empirical from step 3.4 smoke)
 
@@ -285,8 +348,54 @@ ProtoOAClosePositionDetail (step 3.4c — full set verified):
 - `_parse_filled_close.realized_pnl` ← `event.deal.closePositionDetail.grossProfit` (raw int, consumer scales by moneyDigits). Defensive `HasField` check so a malformed event yields empty string instead of crashing.
 - We do NOT extract `closePositionDetail.commission` separately — the close-side `deal.commission` carries the same value at the deal level (consistent with open path). Operator-facing net P&L (gross − commission − swap) is composed at the consumer (server or web layer), not in the bridge.
 
+## 10. Account info polling (step 3.5)
+
+cTrader does NOT expose `equity` / `margin` / `free_margin` directly
+on `ProtoOATrader`. Verified via DESCRIPTOR inspection:
+
+```
+ProtoOATrader (full field list):
+  ctidTraderAccountId (int64, required)
+  balance (int64, required) ← raw, scaled by moneyDigits
+  balanceVersion (int64, optional)
+  managerBonus, ibBonus, nonWithdrawableBonus (int64, optional)
+  accessRights (enum, optional)
+  depositAssetId (int64, required) ← FK to asset list; "USD" for FTMO
+  swapFree, leverageInCents, totalMarginCalculationType
+  maxLeverage, frenchRisk, traderLogin, accountType
+  brokerName (string), registrationTimestamp (int64)
+  isLimitedRisk (bool), limitedRiskMarginCalculationStrategy (enum)
+  moneyDigits (uint32, optional) ← scale exponent for balance
+```
+
+`equity` / `margin` are derived at the consumer:
+- **balance** ← `ProtoOATraderReq` / `ProtoOATraderRes.trader.balance` (raw int)
+- **margin** ← sum of `ProtoOAPosition.usedMargin` over the
+  `ProtoOAReconcileReq` snapshot's `position` array (raw int)
+- **free_margin** ← `balance - margin`
+- **equity** ← step 3.5 limitation: set equal to balance. True equity
+  requires `ProtoOAGetPositionUnrealizedPnLReq` (a 3rd round-trip per
+  poll) or recomputing per-position P&L from spot ticks. Future step
+  can wire in true equity if the operator needs intra-trade margin
+  tracking.
+- **currency** ← hard-coded `"USD"` (FTMO funded accounts are
+  USD-denominated). Future step can swap in `ProtoOAAssetListReq` +
+  asset lookup if non-USD products are ever supported.
+- **money_digits** ← `trader.moneyDigits`; default 2 if the broker
+  omits the optional field.
+
+**Polling cadence**: 30s, configurable via
+`ACCOUNT_INFO_INTERVAL_SECONDS` in `ftmo_client.account_info`. HSETs
+`account:ftmo:{account_id}` with the seven fields above plus
+`updated_at` (epoch ms). Consumer reads via `HGETALL`.
+
+**Failure mode**: a single poll error (cTrader timeout, transport
+error, Redis flap) is logged and the loop continues to the next
+interval — same shape as `heartbeat_loop`.
+
 ## 9. Update log
 
 | Date | Step | Update |
 |---|---|---|
 | 2026-05-11 | 3.4c | Initial creation. Sections 1, 2.1-2.4, 3.1, 4.1-4.2, 5, 6, 7, 8 verified empirically through smoke step 3.4 + protobuf DESCRIPTOR inspection. Sections 3.2-3.5, 4.3 placeholder for step 3.5+ (unsolicited events). |
+| 2026-05-11 | 3.5 | Sections 3.2 (manual close), 3.3 (SL hit), 3.4 (TP hit), 4.3 (manual modify) populated with bridge handling. Section 3.6 added documenting the close-reason inference heuristic (no protobuf close_reason field exists — verified by DESCRIPTOR inspection). Section 10 added for account info polling (balance via ProtoOATraderReq, margin via ProtoOAReconcileReq sum). Section 3.5 (margin call / stop-out) remains a placeholder pending margin-call event correlation in Phase 4+. |
