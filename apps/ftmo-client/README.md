@@ -220,6 +220,22 @@ side-by-side so you can confirm broker-side state.
 > resp_stream entry that swaps orderId → positionId for that order_id.
 > Server-side order_service uses whichever id is current on the order
 > hash to dispatch subsequent close / modify commands.
+>
+> **Note (step 3.4c)**: `close_position` now uses the same two-event
+> handling as `place_market_order` — cTrader emits `ORDER_ACCEPTED`
+> then `ORDER_FILLED` for a close, both carrying the same
+> `clientMsgId`, and only the `ORDER_FILLED` event has the
+> `deal.closePositionDetail` sub-message that carries `realized_pnl`.
+> The bridge waits for `ORDER_FILLED` via the `_pending_executions`
+> side channel (renamed from `_pending_market_fills` in 3.4c so it
+> covers both open and close). `modify_sl_tp` is unchanged — it's a
+> single-event response (`ORDER_REPLACED`).
+>
+> See `docs/ctrader-execution-events.md` for the documented cTrader
+> event behavior reverse-engineered from smoke tests + protobuf
+> DESCRIPTOR inspection. Update that file when you discover new
+> behaviors (unsolicited fills from manual closes, SL/TP hits,
+> margin-call stop-outs, etc.).
 
 The Python preamble (run once per shell session):
 

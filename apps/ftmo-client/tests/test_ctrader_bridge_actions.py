@@ -59,8 +59,14 @@ def _make_execution_event(
     error_code: str | None = None,
     position_sl: float | None = None,
     position_tp: float | None = None,
+    close_gross_profit: int | None = None,
 ) -> ProtoOAExecutionEvent:
-    """Build a minimal but valid ProtoOAExecutionEvent for parser tests."""
+    """Build a minimal but valid ProtoOAExecutionEvent for parser tests.
+
+    ``close_gross_profit`` (step 3.4c): when set, populates
+    ``deal.closePositionDetail.grossProfit`` — used by close-side tests
+    to verify the realized_pnl path. Only meaningful on ORDER_FILLED.
+    """
     evt = ProtoOAExecutionEvent()
     evt.ctidTraderAccountId = CTID
     evt.executionType = exec_type
@@ -82,6 +88,8 @@ def _make_execution_event(
         evt.deal.commission = deal_commission
         if position_id is not None:
             evt.deal.positionId = position_id
+        if close_gross_profit is not None:
+            evt.deal.closePositionDetail.grossProfit = close_gross_profit
     if error_code is not None:
         evt.errorCode = error_code
     return evt
@@ -785,7 +793,7 @@ async def test_place_market_order_waits_for_filled_after_accepted(
     bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Bridge sees ORDER_ACCEPTED first; must wait for the FOLLOWING
-    ORDER_FILLED (delivered through the ``_pending_market_fills``
+    ORDER_FILLED (delivered through the ``_pending_executions``
     side channel) before returning. The returned result MUST carry
     ``position.positionId`` from the FILLED event, NOT
     ``order.orderId`` from the intermediate ACCEPTED event.
@@ -813,7 +821,7 @@ async def test_place_market_order_waits_for_filled_after_accepted(
         async def fire_fill() -> None:
             # Yield once so the bridge has time to register and await.
             await asyncio.sleep(0)
-            future = bridge._pending_market_fills.get(str(cmid))
+            future = bridge._pending_executions.get(str(cmid))
             if future is not None and not future.done():
                 future.set_result(filled_event)
 
@@ -1077,7 +1085,7 @@ async def test_on_message_dispatches_unsolicited_filled_to_pending_future(
     wrapper = _FakeWrapper(inner_filled, client_msg_id="req_xyz")
 
     fill_future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-    bridge._pending_market_fills["req_xyz"] = fill_future
+    bridge._pending_executions["req_xyz"] = fill_future
 
     bridge._on_message(None, wrapper)
 
@@ -1090,7 +1098,7 @@ async def test_on_message_dispatches_unsolicited_filled_to_pending_future(
 async def test_on_message_ignores_non_matching_client_msg_id(
     bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A wrapper with a clientMsgId NOT in ``_pending_market_fills``
+    """A wrapper with a clientMsgId NOT in ``_pending_executions``
     must NOT touch any future. Logs at debug, returns silently."""
     _patch_extract(monkeypatch)
     bridge._loop = asyncio.get_running_loop()
@@ -1102,7 +1110,7 @@ async def test_on_message_ignores_non_matching_client_msg_id(
 
     # Register one pending future under a DIFFERENT clientMsgId.
     other_future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-    bridge._pending_market_fills["req_in_flight"] = other_future
+    bridge._pending_executions["req_in_flight"] = other_future
 
     bridge._on_message(None, wrapper)
     await asyncio.sleep(0)  # allow any scheduled callbacks to run
@@ -1112,10 +1120,10 @@ async def test_on_message_ignores_non_matching_client_msg_id(
 
 
 @pytest.mark.asyncio
-async def test_pending_market_fills_cleaned_up_after_return(
+async def test_pending_executions_cleaned_up_after_return(
     bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``_pending_market_fills`` entry is removed in the ``finally`` block
+    """``_pending_executions`` entry is removed in the ``finally`` block
     regardless of success / error. Otherwise a long-running process
     accumulates orphan futures and leaks memory."""
 
@@ -1137,4 +1145,354 @@ async def test_pending_market_fills_cleaned_up_after_return(
         tp_price=0,
         client_msg_id="req_cleanup",
     )
-    assert "req_cleanup" not in bridge._pending_market_fills
+    assert "req_cleanup" not in bridge._pending_executions
+
+
+# ---------- Step 3.4c: close_position 2-event sequence ----------
+
+
+@pytest.mark.asyncio
+async def test_close_position_waits_for_filled_after_accepted(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Smoke evidence from step 3.4 sub-test 5: cTrader closes a position
+    via a 2-event sequence (ORDER_ACCEPTED then ORDER_FILLED with
+    closePositionDetail). Bridge MUST wait for the FILLED event before
+    parsing — otherwise resp_stream gets ``error_msg='executionType=2'``
+    even though the position closed successfully.
+
+    This test mirrors ``test_place_market_order_waits_for_filled_after_accepted``
+    but for the close path: stub returns ACCEPTED first, schedules a
+    follow-up that resolves the ``_pending_executions`` future with
+    the FILLED+closePositionDetail event."""
+
+    async def stub_send(_msg: Any, **kw: Any) -> Any:
+        cmid = kw.get("client_msg_id")
+        filled_event = _make_execution_event(
+            ProtoOAExecutionType.ORDER_FILLED,
+            position_id=5451198,
+            deal_price=1.08600,
+            deal_ts=1735000000456,
+            deal_commission=5,
+            close_gross_profit=1840,  # raw int per D-053 (e.g. $1.84 with moneyDigits=2)
+        )
+
+        async def fire_fill() -> None:
+            await asyncio.sleep(0)
+            future = bridge._pending_executions.get(str(cmid))
+            if future is not None and not future.done():
+                future.set_result(filled_event)
+
+        asyncio.get_running_loop().create_task(fire_fill())
+        return _make_execution_event(ProtoOAExecutionType.ORDER_ACCEPTED, order_id=8324918)
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    result = await bridge.close_position(
+        position_id=5451198,
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        client_msg_id="req_close_2evt",
+    )
+
+    assert result["success"] is True
+    assert result["close_price"] == "1.086"
+    assert result["close_time"] == "1735000000456"
+    # realized_pnl is raw int from closePositionDetail.grossProfit per D-053.
+    assert result["realized_pnl"] == "1840"
+    assert result["error_code"] == ""
+
+
+@pytest.mark.asyncio
+async def test_close_position_fast_path_filled_first(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fast path: broker fills the close before sending an ACCEPTED
+    intermediate. Bridge must parse + return from the first response
+    without touching the side channel."""
+
+    async def stub_send(_msg: Any, **_kw: Any) -> Any:
+        return _make_execution_event(
+            ProtoOAExecutionType.ORDER_FILLED,
+            position_id=5451198,
+            deal_price=1.08500,
+            deal_ts=1735000000789,
+            close_gross_profit=-250,  # loss
+        )
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    result = await bridge.close_position(
+        position_id=5451198,
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        client_msg_id="req_fast_close",
+    )
+    assert result["success"] is True
+    assert result["close_price"] == "1.085"
+    assert result["realized_pnl"] == "-250"
+
+
+@pytest.mark.asyncio
+async def test_close_position_accepted_then_timeout(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACCEPTED arrives but ORDER_FILLED never follows (broker hang) →
+    bridge returns ``error_code=timeout`` rather than blocking
+    indefinitely. Same shape as place_market_order's accepted-timeout
+    test."""
+
+    async def stub_send(_msg: Any, **_kw: Any) -> Any:
+        # No follow-up fill — pending_executions future never resolves.
+        return _make_execution_event(ProtoOAExecutionType.ORDER_ACCEPTED, order_id=999)
+
+    real_wait_for = asyncio.wait_for
+
+    async def fast_wait_for(coro: Any, timeout: float) -> Any:
+        # Shorten the wait so tests don't pause for the full 30s ceiling.
+        return await real_wait_for(coro, timeout=0.1)
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    monkeypatch.setattr("ftmo_client.ctrader_bridge.asyncio.wait_for", fast_wait_for)
+
+    result = await bridge.close_position(
+        position_id=5451198,
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        client_msg_id="req_close_to",
+    )
+    assert result["success"] is False
+    assert result["error_code"] == "timeout"
+    assert result["close_price"] == ""
+    assert result["realized_pnl"] == ""
+
+
+@pytest.mark.asyncio
+async def test_close_position_rejected_execution_event(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When cTrader rejects the close via ProtoOAExecutionEvent
+    (executionType=ORDER_REJECTED with an errorCode), bridge returns
+    a clean error result. Distinct from the existing
+    ``test_close_position_rejected_returns_error`` which uses
+    ProtoOAErrorRes — this one covers the execution-event rejection
+    path that falls through ``close_position`` to
+    ``_parse_close_position``."""
+
+    async def stub_send(_msg: Any, **_kw: Any) -> Any:
+        return _make_execution_event(
+            ProtoOAExecutionType.ORDER_REJECTED,
+            error_code="POSITION_NOT_FOUND",
+        )
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    result = await bridge.close_position(
+        position_id=99999999,
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        client_msg_id="r",
+    )
+    assert result["success"] is False
+    assert result["error_code"] == "position_not_found"
+
+
+@pytest.mark.asyncio
+async def test_close_position_parses_close_position_detail_path(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Protobuf path pin: realized_pnl MUST come from
+    ``event.deal.closePositionDetail.grossProfit``, not from any other
+    field. This test ensures a regression doesn't accidentally point
+    the parser at e.g. ``deal.commission`` or a sibling field.
+
+    Verified via DESCRIPTOR inspection (step 3.4c):
+      ProtoOADeal.closePositionDetail (type=11 message, num=16, label=OPTIONAL)
+        → ProtoOAClosePositionDetail
+          grossProfit (type=3 int64, num=2, label=REQUIRED)
+    """
+
+    async def stub_send(_msg: Any, **_kw: Any) -> Any:
+        evt = _make_execution_event(
+            ProtoOAExecutionType.ORDER_FILLED,
+            position_id=5451198,
+            deal_price=1.08600,
+            deal_ts=1735000000456,
+            deal_commission=5,
+            close_gross_profit=42424,
+        )
+        # Sanity: assert the path on the synthesized event itself so the
+        # test pins the protobuf address, not the bridge.
+        assert evt.deal.HasField("closePositionDetail")
+        assert int(evt.deal.closePositionDetail.grossProfit) == 42424
+        return evt
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    result = await bridge.close_position(
+        position_id=5451198,
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        client_msg_id="r",
+    )
+    assert result["realized_pnl"] == "42424"
+
+
+@pytest.mark.asyncio
+async def test_close_position_missing_close_position_detail_yields_empty_pnl(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defensive: if a malformed ORDER_FILLED arrives without
+    ``closePositionDetail`` (e.g. partial protobuf, broker bug),
+    ``realized_pnl`` is empty but close_price / close_time still parse
+    so the consumer at least knows the trade closed."""
+
+    async def stub_send(_msg: Any, **_kw: Any) -> Any:
+        return _make_execution_event(
+            ProtoOAExecutionType.ORDER_FILLED,
+            position_id=5451198,
+            deal_price=1.08600,
+            deal_ts=1735000000456,
+            # close_gross_profit deliberately omitted
+        )
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    result = await bridge.close_position(
+        position_id=5451198,
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        client_msg_id="r",
+    )
+    assert result["success"] is True
+    assert result["close_price"] == "1.086"
+    assert result["realized_pnl"] == ""
+
+
+@pytest.mark.asyncio
+async def test_close_position_cleans_up_pending_executions(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``close_position`` must also remove its ``_pending_executions``
+    entry in the finally block (same hygiene as place_market_order).
+    Long-running ftmo-client processes process hundreds of opens+closes
+    per day — an orphan-future leak per close would balloon memory."""
+
+    async def stub_send(_msg: Any, **_kw: Any) -> Any:
+        return _make_execution_event(
+            ProtoOAExecutionType.ORDER_FILLED,
+            position_id=42,
+            deal_price=1.0,
+            deal_ts=1,
+            close_gross_profit=100,
+        )
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    await bridge.close_position(
+        position_id=42,
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        client_msg_id="req_close_cleanup",
+    )
+    assert "req_close_cleanup" not in bridge._pending_executions
+
+
+@pytest.mark.asyncio
+async def test_on_message_dispatches_unsolicited_close_filled(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end path for the close 2-event flow's side channel:
+    register a pending close-fill future, fire ``_on_message`` with a
+    matching ORDER_FILLED wrapper that has closePositionDetail set,
+    assert the future resolves to the inner event. This exercises the
+    exact production code path that fixes step 3.4 sub-test 5."""
+    _patch_extract(monkeypatch)
+    bridge._loop = asyncio.get_running_loop()
+
+    inner_filled = _make_execution_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=5451198,
+        deal_price=1.08600,
+        deal_ts=1735000000456,
+        close_gross_profit=1840,
+    )
+    wrapper = _FakeWrapper(inner_filled, client_msg_id="req_close_dispatch")
+
+    fill_future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    bridge._pending_executions["req_close_dispatch"] = fill_future
+
+    bridge._on_message(None, wrapper)
+
+    resolved = await asyncio.wait_for(fill_future, timeout=1.0)
+    assert int(resolved.position.positionId) == 5451198
+    assert resolved.deal.HasField("closePositionDetail")
+    assert int(resolved.deal.closePositionDetail.grossProfit) == 1840
+
+
+# ---------- Step 3.4c: modify_sl_tp single-event contract pinning ----------
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_tp_does_not_use_pending_executions_channel(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Modify is a SINGLE-EVENT response (ORDER_REPLACED) per smoke
+    evidence step 3.4 sub-test 4. Unlike open/close, modify must NOT
+    pre-register a future in ``_pending_executions`` — there's no
+    intermediate ACCEPTED to wait past. Pin the contract: after a
+    successful modify, the dict has NO entry under the modify's
+    clientMsgId."""
+
+    async def stub_send(message: Any, **kw: Any) -> Any:
+        # During the call, _pending_executions must NOT contain this cmid.
+        cmid = kw.get("client_msg_id")
+        assert cmid not in bridge._pending_executions, (
+            "modify_sl_tp should not register in _pending_executions — it's a single-event call"
+        )
+        return _make_execution_event(
+            ProtoOAExecutionType.ORDER_REPLACED,
+            position_id=987,
+            position_sl=1.07000,
+            position_tp=1.09000,
+        )
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    result = await bridge.modify_sl_tp(
+        position_id=987,
+        sl_price=1.07000,
+        tp_price=1.09000,
+        client_msg_id="req_modify",
+    )
+
+    assert result["success"] is True
+    # Post-call: nothing leaked.
+    assert "req_modify" not in bridge._pending_executions
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_tp_single_order_replaced_event_is_terminal(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ORDER_REPLACED is the terminal event for modify — bridge
+    returns success immediately, no waiting for any follow-up event.
+    Contract pinned so a future refactor that accidentally introduces
+    a 2-event wait here gets caught."""
+    send_calls = 0
+
+    async def stub_send(_msg: Any, **_kw: Any) -> Any:
+        nonlocal send_calls
+        send_calls += 1
+        return _make_execution_event(
+            ProtoOAExecutionType.ORDER_REPLACED,
+            position_id=987,
+            position_sl=1.07000,
+            position_tp=1.09000,
+        )
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    result = await bridge.modify_sl_tp(
+        position_id=987,
+        sl_price=1.07000,
+        tp_price=1.09000,
+        client_msg_id="r",
+    )
+
+    assert send_calls == 1, "modify should send exactly one request, expect one event"
+    assert result["success"] is True
+    assert result["new_sl"] == "1.07"
+    assert result["new_tp"] == "1.09"
