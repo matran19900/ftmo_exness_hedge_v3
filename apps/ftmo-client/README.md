@@ -195,6 +195,22 @@ Prerequisite for every sub-test below: ftmo-client is running in another
 terminal (`python -m ftmo_client.main`), and the cTrader UI is open
 side-by-side so you can confirm broker-side state.
 
+> **Note (step 3.4a)**: Market orders use a **2-RTT sequence** — the bridge
+> sends the order without SL/TP, then issues `ProtoOAAmendPositionSLTPReq`
+> against the resulting position. cTrader rejects absolute SL/TP on plain
+> market sends (`SL/TP in absolute values are allowed only for order types:
+> [LIMIT, STOP, STOP_LIMIT]`), so the split is required.
+>
+> If the amend step fails after the fill succeeds, the position stays
+> **open WITHOUT SL/TP**. The response still has `status=success`, but
+> with extra fields `sl_tp_attach_failed=True`,
+> `sl_tp_attach_error_code=…`, `sl_tp_attach_error_msg=…`. The operator
+> must attach SL/TP manually via the cTrader UI (or issue a fresh
+> `modify_sl_tp` command) in that case. Phase 4+ will surface this as a
+> frontend warning toast.
+>
+> Limit / stop orders unchanged — they accept absolute SL/TP in one RTT.
+
 The Python preamble (run once per shell session):
 
 ```python

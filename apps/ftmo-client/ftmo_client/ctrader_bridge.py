@@ -77,10 +77,16 @@ logger = logging.getLogger(__name__)
 _TRADING_TIMEOUT_SECONDS = 30.0
 
 
-class OrderPlacementResult(TypedDict):
+class OrderPlacementResult(TypedDict, total=False):
     """Shape returned by ``place_market_order`` / ``place_limit_order`` /
-    ``place_stop_order``. All values are stringified so the caller can
-    XADD them straight into the resp_stream without additional formatting.
+    ``place_stop_order`` / ``place_market_order_with_sltp``.
+
+    ``total=False`` because the post-fill amend fields (``sl_tp_attach_*``)
+    are populated only by ``place_market_order_with_sltp`` when the fill
+    succeeded but the SL/TP amend was rejected — the simpler placement
+    methods never set them. The base fields below are populated by every
+    method, just not statically required by the TypedDict (mypy treats them
+    as optional even though the parsers always emit them).
     """
 
     success: bool
@@ -90,6 +96,18 @@ class OrderPlacementResult(TypedDict):
     commission: str  # raw cTrader value (moneyDigits-scaled); "" if unknown
     error_code: str  # "" on success; mapped retcode on error
     error_msg: str  # "" on success; human-readable cTrader reason on error
+
+    # Step 3.4a: set ONLY when ``place_market_order_with_sltp`` filled the
+    # market order but the subsequent SL/TP amend failed. The position is
+    # OPEN without stop-loss / take-profit; operator must attach SL/TP
+    # manually via the cTrader UI or by issuing a fresh ``modify_sl_tp``
+    # command. ``status=success`` is still set on the resp_stream entry —
+    # the fill itself succeeded — so the server's response_handler must
+    # branch on ``sl_tp_attach_failed`` to raise an operator-visible
+    # warning (frontend toast, log, etc.).
+    sl_tp_attach_failed: bool
+    sl_tp_attach_error_code: str
+    sl_tp_attach_error_msg: str
 
 
 class ClosePositionResult(TypedDict):
@@ -232,18 +250,28 @@ class CtraderBridge:
         side: Literal["buy", "sell"],
         volume_lots: float,
         lot_size: int,
-        sl_price: float,
-        tp_price: float,
+        sl_price: float,  # accepted for API stability; NOT sent on market orders
+        tp_price: float,  # same — see step 3.4a docstring + place_market_order_with_sltp
         client_msg_id: str,
     ) -> OrderPlacementResult:
-        """Place a market order. Returns immediately after fill / rejection."""
+        """Place a *bare* market order — fill / rejection only.
+
+        cTrader rejects absolute SL/TP on market orders (per
+        ``SL/TP in absolute values are allowed only for order types:
+        [LIMIT, STOP, STOP_LIMIT]``). This method ALWAYS sends the order
+        with ``stopLoss``/``takeProfit`` unset, regardless of ``sl_price``
+        / ``tp_price`` arguments. The kwargs stay in the signature for
+        API stability (callers can keep using a single shape across all
+        ``place_*`` methods); attach SL/TP after fill via
+        ``place_market_order_with_sltp`` for the orchestrated 2-RTT flow.
+        """
         req = self._build_new_order_req(
             symbol_id=symbol_id,
             order_type=ProtoOAOrderType.MARKET,
             side=side,
             volume_lots=volume_lots,
             lot_size=lot_size,
-            sl_price=sl_price,
+            sl_price=sl_price,  # builder drops these for MARKET orders
             tp_price=tp_price,
             entry_price=0.0,  # ignored for market orders
         )
@@ -251,6 +279,103 @@ class CtraderBridge:
             req, timeout=_TRADING_TIMEOUT_SECONDS, client_msg_id=client_msg_id
         )
         return self._parse_order_placement(response)
+
+    async def place_market_order_with_sltp(
+        self,
+        *,
+        symbol_id: int,
+        side: Literal["buy", "sell"],
+        volume_lots: float,
+        lot_size: int,
+        sl_price: float,
+        tp_price: float,
+        client_msg_id: str,
+    ) -> OrderPlacementResult:
+        """Place a market order, then attach SL/TP via amend (2-RTT).
+
+        Failure modes (and what the returned ``OrderPlacementResult``
+        looks like for each):
+
+        - **Fill rejected** → returns the fill error as-is
+          (``success=False`` + ``error_code``/``error_msg``). The amend
+          is never attempted.
+        - **No SL/TP requested** (both 0) → returns the fill result
+          unchanged; no amend round-trip.
+        - **Fill OK + amend OK** → returns the fill result as-is
+          (``success=True``, no ``sl_tp_attach_*`` fields set).
+        - **Fill OK + amend rejected** → returns the fill result with
+          ``success=True`` (the order IS open at the broker), plus three
+          extra fields: ``sl_tp_attach_failed=True``,
+          ``sl_tp_attach_error_code``, ``sl_tp_attach_error_msg``. The
+          server's response_handler must branch on
+          ``sl_tp_attach_failed`` to surface a warning — operator has to
+          attach SL/TP manually (cTrader UI or a fresh ``modify_sl_tp``
+          command). We deliberately do NOT close the position on amend
+          failure; rollback would risk turning a transient broker hiccup
+          into an unrecoverable hedge breakdown.
+
+        The amend uses ``client_msg_id={original}_amend`` so cTrader's
+        deduplication treats the fill and the amend as distinct
+        requests; otherwise a retry of the composite would conflate.
+        """
+        fill_result = await self.place_market_order(
+            symbol_id=symbol_id,
+            side=side,
+            volume_lots=volume_lots,
+            lot_size=lot_size,
+            sl_price=0.0,  # ignored inside place_market_order anyway
+            tp_price=0.0,
+            client_msg_id=client_msg_id,
+        )
+        if not fill_result.get("success"):
+            return fill_result
+        # Both unset → caller wanted a bare position. Nothing to amend.
+        if sl_price == 0.0 and tp_price == 0.0:
+            return fill_result
+
+        position_id_str = fill_result.get("broker_order_id", "")
+        try:
+            position_id = int(position_id_str)
+        except ValueError:
+            # Shouldn't happen — fill success without a numeric positionId
+            # would be a parser bug, but guard so we don't crash a flow.
+            logger.error(
+                "place_market_order_with_sltp: fill success but broker_order_id=%r "
+                "is not an int; cannot amend",
+                position_id_str,
+            )
+            return {
+                **fill_result,
+                "sl_tp_attach_failed": True,
+                "sl_tp_attach_error_code": "broker_error",
+                "sl_tp_attach_error_msg": (
+                    f"fill response missing positionId (broker_order_id={position_id_str!r})"
+                ),
+            }
+
+        amend_msg_id = f"{client_msg_id}_amend"
+        amend_result = await self.modify_sl_tp(
+            position_id=position_id,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            client_msg_id=amend_msg_id,
+        )
+        if amend_result.get("success"):
+            return fill_result
+
+        # Fill OK, amend rejected. Position is open without SL/TP.
+        logger.warning(
+            "market order filled but SL/TP amend failed: position_id=%d error_code=%s msg=%s",
+            position_id,
+            amend_result.get("error_code", ""),
+            amend_result.get("error_msg", ""),
+        )
+        return {
+            **fill_result,
+            "sl_tp_attach_failed": True,
+            "sl_tp_attach_error_code": amend_result.get("error_code", "broker_error"),
+            "sl_tp_attach_error_msg": amend_result.get("error_msg", ""),
+        }
 
     async def place_limit_order(
         self,
@@ -379,6 +504,15 @@ class CtraderBridge:
         Prices (limitPrice, stopPrice, stopLoss, takeProfit) are doubles on
         ProtoOANewOrderReq — NOT the int*10^5 wire format used for tick/
         trendbar messages (D-032). We send raw price floats here.
+
+        cTrader constraint (step 3.4a): absolute ``stopLoss``/``takeProfit``
+        are accepted ONLY on LIMIT / STOP / STOP_LIMIT orders. Sending them
+        on a MARKET order returns ``invalid_request`` with the message
+        ``SL/TP in absolute values are allowed only for order types: [LIMIT,
+        STOP, STOP_LIMIT]``. For market orders, attach SL/TP after fill via
+        ``modify_sl_tp`` — the orchestration lives in
+        ``place_market_order_with_sltp``. This builder therefore skips
+        ``stopLoss``/``takeProfit`` whenever ``order_type == MARKET``.
         """
         req = ProtoOANewOrderReq()
         req.ctidTraderAccountId = self._ctid_trader_account_id
@@ -386,10 +520,11 @@ class CtraderBridge:
         req.orderType = order_type
         req.tradeSide = ProtoOATradeSide.BUY if side == "buy" else ProtoOATradeSide.SELL
         req.volume = int(volume_lots * lot_size)
-        if sl_price > 0:
-            req.stopLoss = sl_price
-        if tp_price > 0:
-            req.takeProfit = tp_price
+        if order_type != ProtoOAOrderType.MARKET:
+            if sl_price > 0:
+                req.stopLoss = sl_price
+            if tp_price > 0:
+                req.takeProfit = tp_price
         if order_type == ProtoOAOrderType.LIMIT:
             req.limitPrice = entry_price
         elif order_type == ProtoOAOrderType.STOP:

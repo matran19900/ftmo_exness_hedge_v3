@@ -141,8 +141,14 @@ async def handle_open(
 
     try:
         if order_type == "market":
+            # Step 3.4a: market orders go through the 2-RTT composite —
+            # cTrader rejects absolute SL/TP on plain market sends, so the
+            # bridge places the order then amends SL/TP onto the filled
+            # position. The result may carry ``sl_tp_attach_failed=True``
+            # when the fill succeeded but the amend was rejected; that
+            # flag flows through to resp_stream via _publish_response.
             result: dict[str, Any] = dict(
-                await bridge.place_market_order(
+                await bridge.place_market_order_with_sltp(
                     symbol_id=symbol_id,
                     side=side,  # type: ignore[arg-type]  # validated above
                     volume_lots=volume_lots,

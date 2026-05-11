@@ -63,6 +63,11 @@ class FakeBridge:
     async def place_market_order(self, **kwargs: Any) -> Any:
         return await self._invoke("place_market_order", **kwargs)
 
+    async def place_market_order_with_sltp(self, **kwargs: Any) -> Any:
+        # Step 3.4a composite: ``handle_open`` market branch routes here
+        # now instead of the bare ``place_market_order``.
+        return await self._invoke("place_market_order_with_sltp", **kwargs)
+
     async def place_limit_order(self, **kwargs: Any) -> Any:
         return await self._invoke("place_limit_order", **kwargs)
 
@@ -153,7 +158,9 @@ async def test_handle_open_market_dispatches_and_publishes_success(
 
     assert len(bridge.calls) == 1
     name, kw = bridge.calls[0]
-    assert name == "place_market_order"
+    # Step 3.4a: market branch routes through the composite, not the bare
+    # ``place_market_order`` — cTrader rejects absolute SL/TP on market sends.
+    assert name == "place_market_order_with_sltp"
     assert kw["symbol_id"] == 1
     assert kw["lot_size"] == 10_000_000
     assert kw["side"] == "buy"
@@ -168,6 +175,59 @@ async def test_handle_open_market_dispatches_and_publishes_success(
     assert resp["status"] == "success"
     assert resp["broker_order_id"] == "987654321"
     assert resp["fill_price"] == "1.08412"
+    # Step 3.4a: clean happy path → no amend-failure flag on the resp.
+    assert "sl_tp_attach_failed" not in resp
+
+
+@pytest.mark.asyncio
+async def test_handle_open_market_sl_tp_amend_failure_marks_resp(
+    seeded_symbol: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Step 3.4a: composite returned fill-success + amend-failure → the
+    resp_stream entry has ``status=success`` (position IS open) but also
+    carries ``sl_tp_attach_failed=True`` plus the amend error fields, so
+    the server's response_handler can warn the operator."""
+    bridge = FakeBridge()
+    bridge.next_result = {
+        "success": True,
+        "broker_order_id": "987654321",
+        "fill_price": "1.08412",
+        "fill_time": "1735000000123",
+        "commission": "5",
+        "error_code": "",
+        "error_msg": "",
+        "sl_tp_attach_failed": True,
+        "sl_tp_attach_error_code": "invalid_sl_distance",
+        "sl_tp_attach_error_msg": "SL too close to price",
+    }
+
+    await handle_open(
+        seeded_symbol,
+        _as_bridge(bridge),
+        ACC,
+        {
+            "request_id": "req_amend_fail",
+            "order_id": "ord_amend_fail",
+            "action": "open",
+            "order_type": "market",
+            "symbol": "EURUSD",
+            "side": "buy",
+            "volume_lots": "0.01",
+            "sl": "1.08400",
+            "tp": "1.09000",
+            "entry_price": "0",
+        },
+    )
+
+    [resp] = await _drain_resp(seeded_symbol)
+    # Fill succeeded → status=success even though SL/TP didn't attach.
+    assert resp["status"] == "success"
+    assert resp["broker_order_id"] == "987654321"
+    # The warning bits propagate so the server-side response_handler can
+    # branch on them. Boolean → "True" string after Redis stringification.
+    assert resp["sl_tp_attach_failed"] == "True"
+    assert resp["sl_tp_attach_error_code"] == "invalid_sl_distance"
+    assert "SL too close" in resp["sl_tp_attach_error_msg"]
 
 
 @pytest.mark.asyncio

@@ -128,9 +128,14 @@ async def test_place_market_order_builds_protobuf(
     assert msg.tradeSide == ProtoOATradeSide.BUY
     # 0.01 lot * 10_000_000 lot_size = 100_000 (cTrader cents-of-base).
     assert msg.volume == 100_000
-    assert msg.stopLoss == pytest.approx(1.08000)
-    assert msg.takeProfit == pytest.approx(1.09000)
-    # Market orders never set limitPrice / stopPrice.
+    # Step 3.4a: market orders MUST NOT carry absolute SL/TP — cTrader
+    # rejects them with "SL/TP in absolute values are allowed only for
+    # order types: [LIMIT, STOP, STOP_LIMIT]". The values supplied in the
+    # kwargs are intentionally ignored on the bare-market path; the
+    # ``place_market_order_with_sltp`` composite handles them post-fill.
+    assert not msg.HasField("stopLoss")
+    assert not msg.HasField("takeProfit")
+    # Market orders also never set limitPrice / stopPrice.
     assert not msg.HasField("limitPrice")
     assert not msg.HasField("stopPrice")
     assert captured["client_msg_id"] == "req_abc"
@@ -510,3 +515,228 @@ async def test_unexpected_response_type_returns_broker_error(
     assert result["success"] is False
     assert result["error_code"] == "broker_error"
     assert "unexpected response" in result["error_msg"]
+
+
+# ---------- place_market_order_with_sltp (step 3.4a composite) ----------
+
+
+@pytest.mark.asyncio
+async def test_place_market_order_with_sltp_happy_path_fills_then_amends(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fill OK + amend OK → result is the fill, no sl_tp_attach_* fields."""
+    calls: list[tuple[str, Any]] = []
+
+    async def stub_send(message: Any, **kw: Any) -> Any:
+        cmid = kw.get("client_msg_id")
+        calls.append((type(message).__name__, cmid))
+        if isinstance(message, ProtoOANewOrderReq):
+            return _make_execution_event(
+                ProtoOAExecutionType.ORDER_FILLED,
+                position_id=987654321,
+                deal_price=1.08412,
+                deal_ts=1735000000123,
+            )
+        if isinstance(message, ProtoOAAmendPositionSLTPReq):
+            return _make_execution_event(
+                ProtoOAExecutionType.ORDER_REPLACED,
+                position_id=987654321,
+                position_sl=1.08000,
+                position_tp=1.09000,
+            )
+        raise AssertionError(f"unexpected message {message!r}")
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    result = await bridge.place_market_order_with_sltp(
+        symbol_id=1,
+        side="buy",
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        sl_price=1.08000,
+        tp_price=1.09000,
+        client_msg_id="req_abc",
+    )
+
+    # Two distinct cTrader calls, with distinct client_msg_ids.
+    assert len(calls) == 2
+    assert calls[0] == ("ProtoOANewOrderReq", "req_abc")
+    assert calls[1] == ("ProtoOAAmendPositionSLTPReq", "req_abc_amend")
+
+    assert result["success"] is True
+    assert result["broker_order_id"] == "987654321"
+    assert result["fill_price"] == "1.08412"
+    assert "sl_tp_attach_failed" not in result
+
+
+@pytest.mark.asyncio
+async def test_place_market_order_with_sltp_fill_fails_no_amend(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fill rejected → returns fill error verbatim, amend never sent."""
+    calls: list[str] = []
+
+    async def stub_send(message: Any, **_kw: Any) -> Any:
+        calls.append(type(message).__name__)
+        return _make_execution_event(
+            ProtoOAExecutionType.ORDER_REJECTED, error_code="MARKET_CLOSED"
+        )
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    result = await bridge.place_market_order_with_sltp(
+        symbol_id=1,
+        side="buy",
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        sl_price=1.08,
+        tp_price=1.09,
+        client_msg_id="r",
+    )
+
+    assert calls == ["ProtoOANewOrderReq"]  # amend not attempted
+    assert result["success"] is False
+    assert result["error_code"] == "market_closed"
+    assert "sl_tp_attach_failed" not in result
+
+
+@pytest.mark.asyncio
+async def test_place_market_order_with_sltp_amend_fail_marks_result(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fill OK + amend rejected → fill result + sl_tp_attach_failed=True."""
+
+    async def stub_send(message: Any, **_kw: Any) -> Any:
+        if isinstance(message, ProtoOANewOrderReq):
+            return _make_execution_event(
+                ProtoOAExecutionType.ORDER_FILLED,
+                position_id=987654321,
+                deal_price=1.08412,
+                deal_ts=1735000000123,
+            )
+        if isinstance(message, ProtoOAAmendPositionSLTPReq):
+            evt = ProtoOAOrderErrorEvent()
+            evt.ctidTraderAccountId = CTID
+            evt.errorCode = "INVALID_STOPS_LEVEL"
+            evt.description = "SL too close"
+            return evt
+        raise AssertionError(f"unexpected message {message!r}")
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    result = await bridge.place_market_order_with_sltp(
+        symbol_id=1,
+        side="buy",
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        sl_price=1.08000,
+        tp_price=1.09000,
+        client_msg_id="r",
+    )
+
+    # Fill itself succeeded — position is open at the broker.
+    assert result["success"] is True
+    assert result["broker_order_id"] == "987654321"
+    assert result["fill_price"] == "1.08412"
+    # Amend warning propagates so resp_stream sees it.
+    assert result["sl_tp_attach_failed"] is True
+    assert result["sl_tp_attach_error_code"] == "invalid_sl_distance"
+    assert "SL too close" in result["sl_tp_attach_error_msg"]
+
+
+@pytest.mark.asyncio
+async def test_place_market_order_with_sltp_no_sl_no_tp_skips_amend(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SL=0 AND TP=0 → caller wanted a bare position; no amend round-trip."""
+    calls: list[str] = []
+
+    async def stub_send(message: Any, **_kw: Any) -> Any:
+        calls.append(type(message).__name__)
+        return _make_execution_event(
+            ProtoOAExecutionType.ORDER_FILLED,
+            position_id=987,
+            deal_price=1.08,
+            deal_ts=1,
+        )
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    result = await bridge.place_market_order_with_sltp(
+        symbol_id=1,
+        side="buy",
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        sl_price=0,
+        tp_price=0,
+        client_msg_id="r",
+    )
+
+    assert calls == ["ProtoOANewOrderReq"]  # amend skipped
+    assert result["success"] is True
+    assert "sl_tp_attach_failed" not in result
+
+
+@pytest.mark.asyncio
+async def test_place_market_order_with_sltp_amend_uses_suffix_msg_id(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Amend MUST use a distinct client_msg_id so cTrader doesn't dedup it
+    against the fill. Suffix ``_amend`` is the agreed convention."""
+    seen_msg_ids: list[str | None] = []
+
+    async def stub_send(message: Any, **kw: Any) -> Any:
+        seen_msg_ids.append(kw.get("client_msg_id"))
+        if isinstance(message, ProtoOANewOrderReq):
+            return _make_execution_event(
+                ProtoOAExecutionType.ORDER_FILLED,
+                position_id=42,
+                deal_price=1.0,
+                deal_ts=1,
+            )
+        # amend
+        return _make_execution_event(
+            ProtoOAExecutionType.ORDER_REPLACED,
+            position_id=42,
+        )
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    await bridge.place_market_order_with_sltp(
+        symbol_id=1,
+        side="buy",
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        sl_price=0.9,
+        tp_price=1.1,
+        client_msg_id="my_req_id",
+    )
+
+    assert seen_msg_ids == ["my_req_id", "my_req_id_amend"]
+
+
+@pytest.mark.asyncio
+async def test_place_market_order_with_sltp_only_sl_set_triggers_amend(
+    bridge: CtraderBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even when only SL is set (TP=0), the amend still fires — the
+    'skip' branch requires BOTH to be 0."""
+    calls: list[str] = []
+
+    async def stub_send(message: Any, **_kw: Any) -> Any:
+        calls.append(type(message).__name__)
+        if isinstance(message, ProtoOANewOrderReq):
+            return _make_execution_event(
+                ProtoOAExecutionType.ORDER_FILLED,
+                position_id=99,
+                deal_price=1.0,
+                deal_ts=1,
+            )
+        return _make_execution_event(ProtoOAExecutionType.ORDER_REPLACED, position_id=99)
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+    await bridge.place_market_order_with_sltp(
+        symbol_id=1,
+        side="buy",
+        volume_lots=0.01,
+        lot_size=10_000_000,
+        sl_price=0.95,
+        tp_price=0,
+        client_msg_id="r",
+    )
+    assert calls == ["ProtoOANewOrderReq", "ProtoOAAmendPositionSLTPReq"]
