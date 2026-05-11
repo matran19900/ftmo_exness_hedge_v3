@@ -29,6 +29,7 @@ export function VolumeCalculator() {
   const manualVolumePrimary = useAppStore((s) => s.manualVolumePrimary)
   const setManualVolumePrimary = useAppStore((s) => s.setManualVolumePrimary)
   const setVolumeReady = useAppStore((s) => s.setVolumeReady)
+  const setEffectiveVolumeLots = useAppStore((s) => s.setEffectiveVolumeLots)
 
   const debouncedEntry = useDebouncedValue(entryPrice, DEBOUNCE_MS)
   const debouncedSl = useDebouncedValue(slPrice, DEBOUNCE_MS)
@@ -93,17 +94,35 @@ export function VolumeCalculator() {
 
   // Phase-3 submit gate: a usable volume exists when no side error blocks us
   // AND either auto succeeded or manual override is a positive number.
+  // Step 3.11 piggy-backs ``effectiveVolumeLots`` here so the form's submit
+  // handler can read the exact number to ship to POST /api/orders without
+  // re-running ``calculateVolume`` itself.
   useEffect(() => {
     if (entrySlError) {
       setVolumeReady(false)
+      setEffectiveVolumeLots(null)
       return
     }
     if (isManualMode && manualVolumePrimary !== null && manualVolumePrimary > 0) {
       setVolumeReady(true)
+      setEffectiveVolumeLots(manualVolumePrimary)
       return
     }
-    setVolumeReady(apiState.status === 'ready')
-  }, [entrySlError, isManualMode, manualVolumePrimary, apiState.status, setVolumeReady])
+    if (apiState.status === 'ready') {
+      setVolumeReady(true)
+      setEffectiveVolumeLots(apiState.result.volume_primary)
+      return
+    }
+    setVolumeReady(false)
+    setEffectiveVolumeLots(null)
+  }, [
+    entrySlError,
+    isManualMode,
+    manualVolumePrimary,
+    apiState,
+    setVolumeReady,
+    setEffectiveVolumeLots,
+  ])
 
   function handleManualChange(e: ChangeEvent<HTMLInputElement>) {
     const raw = e.target.value

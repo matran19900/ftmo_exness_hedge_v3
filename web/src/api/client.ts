@@ -162,6 +162,104 @@ export async function calculateVolume(
   return response.data
 }
 
+// ----- Order create (step 3.6 / 3.11) -----
+
+export interface OrderCreateRequest {
+  pair_id: string
+  symbol: string
+  side: 'buy' | 'sell'
+  order_type: 'market' | 'limit' | 'stop'
+  volume_lots: number
+  // ``0`` means "no SL / TP" (matches the cmd_stream protocol in
+  // docs/05 §4.2). Frontend translates blank inputs to 0 before
+  // posting.
+  sl: number
+  tp: number
+  // ``0`` for market orders (server uses bid/ask for direction
+  // validation in that case). Required > 0 for limit / stop —
+  // step 3.6 service rejects with ``missing_entry_price`` otherwise.
+  entry_price: number
+}
+
+export interface OrderCreateResponse {
+  order_id: string
+  request_id: string
+  status: 'accepted'
+  message: string
+}
+
+export async function createOrder(req: OrderCreateRequest): Promise<OrderCreateResponse> {
+  const response = await apiClient.post<OrderCreateResponse>('/orders', req)
+  return response.data
+}
+
+// Step 3.11: maps step-3.6 ``OrderValidationError.error_code`` strings
+// to Vietnamese operator-facing messages. Fallback to the server's raw
+// ``message`` if the code isn't in the map (covers new codes added by
+// future steps).
+export const ORDER_ERROR_MESSAGES: Record<string, string> = {
+  pair_not_found: 'Không tìm thấy pair',
+  pair_disabled: 'Pair đã bị vô hiệu hóa',
+  account_not_found: 'Không tìm thấy account FTMO',
+  account_disabled: 'Account FTMO đã bị vô hiệu hóa',
+  client_offline: 'FTMO client đang offline',
+  symbol_inactive: 'Symbol chưa được kích hoạt',
+  symbol_not_synced: 'Symbol chưa được đồng bộ từ broker',
+  invalid_volume: 'Volume không hợp lệ (vượt min/max/step)',
+  missing_entry_price: 'Thiếu entry price cho lệnh limit/stop',
+  invalid_sl_direction: 'SL sai hướng so với side',
+  invalid_tp_direction: 'TP sai hướng so với side',
+  no_tick_data: 'Chưa có dữ liệu giá hiện tại cho symbol',
+  validation_error: 'Dữ liệu không hợp lệ',
+  order_corrupt: 'Order data bị lỗi (báo admin)',
+}
+
+/**
+ * Extract a user-facing error message from a failed ``createOrder``
+ * (or any of the step-3.9 mutation endpoints).
+ *
+ * The server's ``HTTPException(detail={"error_code", "message"})``
+ * shape lives at ``err.response.data.detail``. If ``error_code``
+ * matches our map we use the Vietnamese translation; otherwise we
+ * fall through to the raw ``message`` (already user-friendly per
+ * step 3.6's ``OrderValidationError`` constructor).
+ */
+export function formatOrderError(err: unknown): string {
+  if (
+    typeof err === 'object' &&
+    err !== null &&
+    'response' in err &&
+    typeof (err as { response?: unknown }).response === 'object'
+  ) {
+    const resp = (err as { response?: { data?: unknown } }).response
+    const data = resp?.data
+    if (
+      typeof data === 'object' &&
+      data !== null &&
+      'detail' in data &&
+      typeof (data as { detail?: unknown }).detail === 'object'
+    ) {
+      const detail = (data as { detail: { error_code?: unknown; message?: unknown } }).detail
+      const code = typeof detail.error_code === 'string' ? detail.error_code : undefined
+      const message = typeof detail.message === 'string' ? detail.message : undefined
+      if (code && code in ORDER_ERROR_MESSAGES) {
+        return ORDER_ERROR_MESSAGES[code]!
+      }
+      if (message) return message
+    }
+    // 422 (Pydantic) shape: detail is an array of {loc, msg, type}.
+    if (
+      typeof data === 'object' &&
+      data !== null &&
+      Array.isArray((data as { detail?: unknown }).detail)
+    ) {
+      return 'Dữ liệu form không hợp lệ'
+    }
+  }
+  if (err instanceof Error && err.message) return err.message
+  return 'Lỗi kết nối server'
+}
+
 // ----- Orders (step 3.6 + 3.9) -----
 
 export interface Order {

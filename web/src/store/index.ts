@@ -72,6 +72,16 @@ export interface AppState {
   volumeReady: boolean
   setVolumeReady: (ready: boolean) => void
 
+  // Step 3.11: the effective per-leg volume (in lots) that the submit
+  // handler ships to POST /api/orders. ``VolumeCalculator`` is the
+  // sole writer — it pushes either the server's auto-computed
+  // ``volume_primary`` or the user's manual override here whenever
+  // a positive value is available. ``null`` means "no usable volume
+  // yet"; the form's Place button stays disabled in that state.
+  // NOT persisted (derived from per-session inputs).
+  effectiveVolumeLots: number | null
+  setEffectiveVolumeLots: (v: number | null) => void
+
   // ----- Step 3.10: server-derived order/position state -----
   //
   // These slices are populated from initial REST loads (PositionList
@@ -136,6 +146,9 @@ export const useAppStore = create<AppState>()(
 
       volumeReady: false,
       setVolumeReady: (volumeReady) => set({ volumeReady }),
+
+      effectiveVolumeLots: null,
+      setEffectiveVolumeLots: (effectiveVolumeLots) => set({ effectiveVolumeLots }),
 
       // ----- Step 3.10 server-derived slices -----
 
