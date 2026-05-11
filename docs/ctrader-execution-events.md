@@ -265,6 +265,35 @@ Implementation: `ftmo_client/event_publisher.py::_infer_close_reason`.
 Matrix test: `test_close_reason_matrix` parametrizes all 10 rows
 above + the no-order-field case.
 
+## 3.7 ORDER_CANCELLED noise — cTrader internal SL/TP cleanup (D-080)
+
+cTrader maintains an internal **STOP_LOSS_TAKE_PROFIT** synthetic
+order alongside any position that carries SL or TP. When that
+position closes — for ANY reason, including the SL/TP trigger
+itself, manual UI close, or our API close — the broker
+cleans up the synthetic order and emits an `ORDER_CANCELLED`
+execution event with the synthetic order's internal `orderId`.
+
+The internal `orderId` has NO matching row in our Redis state — we
+never opened it. Step 3.5 bridge translates every `ORDER_CANCELLED`
+event into an `order_cancelled` event_stream entry; step 3.7
+server `event_handler._handle_order_cancelled` silently drops any
+event whose `broker_order_id` has no matching
+`p_broker_order_id_to_order:{id}` side-index entry (logged at
+DEBUG, not WARNING — these are routine).
+
+Distinguishing legitimate cancellations (operator cancels their
+own pending LIMIT/STOP order from the cTrader UI) from D-080
+noise: a legitimate cancellation's `broker_order_id` IS in our
+side-index (the pending order was opened by us). The handler
+updates the order row to `status=cancelled` + drops the index in
+that case.
+
+Test: `test_order_cancelled_unknown_broker_order_id_silently_ignored`
+pins the D-080 silent-drop contract.
+Test: `test_order_cancelled_matching_pending_order_marks_cancelled`
+pins the legitimate-cancel path.
+
 ## 4. SL/TP modification flows
 
 ### 4.1 Modify qua API (server initiated) — successful flow (step 3.4 verified, step 3.4c documented)
@@ -680,3 +709,4 @@ first.
 | 2026-05-11 | 3.5 | Sections 3.2 (manual close), 3.3 (SL hit), 3.4 (TP hit), 4.3 (manual modify) populated with bridge handling. Section 3.6 added documenting the close-reason inference heuristic (no protobuf close_reason field exists — verified by DESCRIPTOR inspection). Section 10 added for account info polling (balance via ProtoOATraderReq, margin via ProtoOAReconcileReq sum). Section 3.5 (margin call / stop-out) remains a placeholder pending margin-call event correlation in Phase 4+. |
 | 2026-05-11 | 3.5a | Rewrite close_reason via structured order metadata (`order.orderType` + `order.closingOrder` + `closePositionDetail.grossProfit` sign); replace the 1-pip price-tolerance heuristic. Add extended `closePositionDetail` field publishing on `position_closed` payloads (`commission`, `swap`, `balance_after_close`, `money_digits`, `closed_volume`). §3.2-3.4 rewritten to show the structured signals. §3.6 replaced with the new mapping table + CEO sample. §8 ProtoOAOrder full field list (including `closingOrder`, `isStopOut`) + ProtoOAOrderType enum verified (STOP_LOSS_TAKE_PROFIT=4, NOT 6). |
 | 2026-05-11 | 3.5b | §11 added — reconciliation flow on client restart (`ProtoOAReconcileReq` → `reconcile_snapshot` event_stream entry; 3-attempt exponential backoff retry; failure-tolerant). §12 added — `fetch_close_history` command flow that pulls deal history via `ProtoOADealListByPositionIdReq` and publishes reconstructed `position_closed` events with `reconstructed=true`. DESCRIPTOR inspection: `ProtoOADealListByPositionIdReq.fromTimestamp`/`toTimestamp` are REQUIRED (label=2), not optional — bridge sets `fromTimestamp=0` / `toTimestamp=now_ms` for full history. |
+| 2026-05-11 | 3.7 | §3.7 added — D-080 ORDER_CANCELLED noise pattern: cTrader emits an internal-orderId `ORDER_CANCELLED` event whenever a position with SL/TP closes (cleanup of the synthetic STOP_LOSS_TAKE_PROFIT order). Server's event_handler silently drops these by comparing `broker_order_id` against the `p_broker_order_id_to_order:{id}` side-index — a legitimate operator-cancelled pending order has a hit; the D-080 noise events don't. Logged at DEBUG only. |

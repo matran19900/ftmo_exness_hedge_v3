@@ -100,6 +100,29 @@ class OrderHash(TypedDict, total=False):
     # Errors / retry
     s_error_msg: str
     s_retry_count: str
+    # Step 3.7: response/event handler outputs.
+    # Open-error path (cmd ACK with status=error).
+    p_error_code: str
+    p_error_msg: str
+    # Close-error path (close ACK with status=error; position not closed).
+    p_close_error_code: str
+    p_close_error_msg: str
+    # Modify-error path (amend rejected by broker).
+    p_modify_error_code: str
+    p_modify_error_msg: str
+    # SL/TP attach warning (D-059: market fill OK but amend rejected).
+    p_sl_tp_warning: str
+    p_sl_tp_warning_msg: str
+    # Extended close-detail fields from step 3.5a position_closed
+    # payload (p_close_reason is also declared above in the primary-leg
+    # block — kept there as the canonical site).
+    p_swap: str
+    p_balance_after_close: str
+    p_money_digits: str
+    p_closed_volume: str
+    # Step 3.5b reconcile marker: order's close was reconstructed
+    # from cTrader deal history, not received live.
+    p_reconstructed: str
 
 
 class PositionPnlSnapshot(TypedDict, total=False):
@@ -530,6 +553,38 @@ class RedisService:
                 out.append(_to_order_hash(data))
         return out
 
+    async def list_open_orders_by_account(
+        self,
+        broker: Broker,
+        account_id: str,
+    ) -> list[OrderHash]:
+        """Return orders whose primary leg is still open on
+        ``({broker}, {account_id})``.
+
+        "Open" means ``status in {pending, filled}`` — the status the
+        FTMO leg can be in BEFORE the close event lands. Used by the
+        step-3.7 reconcile flow: for each Redis-open order, check
+        whether the matching positionId / orderId is still present in
+        ``ProtoOAReconcileRes``. If not, the order closed during the
+        offline window and we dispatch ``fetch_close_history``.
+
+        Filter is applied client-side (per-account membership of the
+        global ``orders:by_status:*`` sets) — no SCAN, no KEYS. The
+        cardinality of open orders per account is small (operator
+        rarely runs >50 simultaneous hedges), so the linear scan is
+        fine. If Phase 4+ ever sees this dominate latency, add a
+        per-account index.
+        """
+        _validate_broker(broker)
+        _validate_account_id(account_id)
+        account_field = "ftmo_account_id" if broker == "ftmo" else "exness_account_id"
+        out: list[OrderHash] = []
+        for status in ("pending", "filled"):
+            for order in await self.list_orders_by_status(status):
+                if order.get(account_field) == account_id:
+                    out.append(order)
+        return out
+
     async def list_closed_orders(self, limit: int, offset: int) -> list[OrderHash]:
         """Page the closed-history ZSET, newest first.
 
@@ -618,6 +673,30 @@ class RedisService:
         if not oid:
             return None
         return await self.get_order(oid)
+
+    async def find_order_id_by_p_broker_order_id(self, broker_order_id: str) -> str | None:
+        """Same as ``find_order_by_p_broker_order_id`` but returns the
+        order_id string directly (saves one HGETALL when the caller
+        only needs the id, e.g. ``event_handler`` resolving a
+        ``position_closed`` event to dispatch updates).
+        """
+        oid = await self._redis.get(f"p_broker_order_id_to_order:{broker_order_id}")
+        return oid if oid else None
+
+    async def unlink_broker_order_id(self, leg: LegPrefix, broker_order_id: str) -> None:
+        """Drop the ``{leg}_broker_order_id_to_order:{id}`` side-index entry.
+
+        Step 3.7 uses this for two cases:
+          - ``pending_filled``: drop the old orderId mapping and create
+            the new positionId mapping (the broker_order_id swap per
+            D-061).
+          - ``order_cancelled`` for an order we own: drop the index so
+            a future event with the same id doesn't accidentally route
+            to a stale order row.
+        """
+        if leg not in ("p", "s"):
+            raise ValueError(f"leg must be 'p' or 's', got {leg!r}")
+        await self._redis.delete(f"{leg}_broker_order_id_to_order:{broker_order_id}")
 
     # ----- Position P&L cache + snapshots (docs §8) -----
 
