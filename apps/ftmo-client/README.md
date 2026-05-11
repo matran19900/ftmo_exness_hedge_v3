@@ -581,6 +581,86 @@ after = (await client.hgetall(f"account:ftmo:{ACC}"))["updated_at"]
 assert int(after) > int(before), f"updated_at didn't change: {before} → {after}"
 ```
 
+### Reconciliation smoke (step 3.5b)
+
+Two sub-tests verify the reconcile + `fetch_close_history` path. See
+`docs/ctrader-execution-events.md §11-§12` for the documented
+protobuf flows.
+
+#### Sub-test 8 — Reconcile snapshot on startup → `reconcile_snapshot`
+
+Open a position via the FTMO client (e.g. reuse Sub-test 1 / 2's
+order). Stop the client cleanly (Ctrl-C / SIGTERM). Restart the
+client. Verify `event_stream:ftmo:{ACC}` gets a new entry with
+`event_type=reconcile_snapshot` and the open position appears in the
+`positions` JSON array.
+
+```python
+# After client restart, drain the new event_stream entry.
+entries = await client.xread({f"event_stream:ftmo:{ACC}": "$"}, block=5000, count=5)
+print(entries)
+
+# Or fetch the latest entry directly:
+recent = await client.xrevrange(f"event_stream:ftmo:{ACC}", count=1)
+entry_id, fields = recent[0]
+assert fields["event_type"] == "reconcile_snapshot"
+positions = json.loads(fields["positions"])
+print(f"snapshot positions: {positions}")
+assert any(p["position_id"] for p in positions), "expected at least one open position"
+```
+
+#### Sub-test 9 — fetch_close_history reconstructs an offline close
+
+End-to-end: open a position, close it manually on cTrader UI WHILE
+the client is OFFLINE (so the client never sees the live close
+event), then restart the client and drive a `fetch_close_history`
+command for that position_id. The client should publish a
+reconstructed `position_closed` event with `reconstructed=true`.
+
+```python
+# 1. Stop the client (Ctrl-C).
+# 2. On cTrader UI, close position 5451198 manually.
+# 3. Wait 30s.
+# 4. Restart the client and wait for reconcile_snapshot.
+# 5. Manually issue fetch_close_history for the closed position.
+
+import uuid, time
+req_id = uuid.uuid4().hex
+await client.xadd(
+    f"cmd_stream:ftmo:{ACC}",
+    {
+        "action": "fetch_close_history",
+        "order_id": "ord_offline_close",
+        "broker_order_id": "5451198",
+        "request_id": req_id,
+        "created_at": str(int(time.time() * 1000)),
+    },
+)
+
+# 6. Drain the resulting event_stream + resp_stream entries.
+event_entries = await client.xrevrange(f"event_stream:ftmo:{ACC}", count=5)
+for entry_id, fields in event_entries:
+    if fields.get("event_type") == "position_closed" and fields.get("reconstructed") == "true":
+        print(f"reconstructed: {fields}")
+        assert fields["broker_order_id"] == "5451198"
+        assert fields["close_reason"] == "unknown"   # deal history lacks orderType
+        assert fields["realized_pnl"] != ""
+        assert fields["balance_after_close"] != ""
+        break
+
+resp_entries = await client.xrevrange(f"resp_stream:ftmo:{ACC}", count=5)
+for _id, resp in resp_entries:
+    if resp.get("request_id") == req_id:
+        assert resp["status"] == "success"
+        assert resp["action"] == "fetch_close_history"
+        break
+```
+
+If the position is still open on cTrader (e.g. you forgot step 2), the
+client publishes `status=error error_code=not_found` to resp_stream
+and no event_stream entry is added. That's the contract — the server
+consumer treats `not_found` as a signal to investigate manually.
+
 ## Tests
 
 ```bash

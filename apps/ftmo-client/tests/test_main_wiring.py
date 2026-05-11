@@ -52,7 +52,8 @@ def patched_redis(
 def patched_bridge(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     """Stub CtraderBridge so the test never opens a real connection.
 
-    Returns a list captured of disconnect calls; tests assert on it.
+    Returns a list captured of init / connect / reconcile / disconnect
+    events; tests assert on it for wiring correctness.
     """
     captured: list[dict[str, Any]] = []
 
@@ -62,6 +63,12 @@ def patched_bridge(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 
         async def connect_with_retry(self, max_attempts: int = 10, **_kwargs: Any) -> None:
             captured.append({"connected": max_attempts})
+
+        async def reconcile_state(self) -> None:
+            # Step 3.5b: main.amain calls this after connect, before
+            # starting loops. Record the call so tests can assert the
+            # ordering invariant.
+            captured.append({"reconciled": True})
 
         async def disconnect(self) -> None:
             captured.append({"disconnected": True})
@@ -190,6 +197,100 @@ async def test_amain_returns_connect_failed_when_bridge_exhausts_retries(
 
     rc = await amain(_settings())
     assert rc == EXIT_CONNECT_FAILED
+
+
+@pytest.mark.asyncio
+async def test_amain_calls_reconcile_state_after_connect_before_tasks(
+    patched_redis: fakeredis.aioredis.FakeRedis,
+    patched_bridge: list[dict[str, Any]],
+) -> None:
+    """Step 3.5b ordering invariant: ``bridge.reconcile_state`` must
+    be invoked AFTER ``connect_with_retry`` succeeds and BEFORE any of
+    the heartbeat / command / account_info tasks start. Otherwise the
+    server's event_handler can see an inconsistent snapshot (e.g. a
+    live unsolicited close event ordered ahead of the reconcile
+    snapshot in event_stream)."""
+    token = TokenResponse(
+        access_token="acc",
+        refresh_token="ref",
+        expires_in=3600,
+        token_type="Bearer",
+    )
+    await save_token(patched_redis, "ftmo_001", token, ctid_trader_account_id=42)
+
+    amain_task = asyncio.create_task(amain(_settings()))
+    # Wait until the bridge has been reconciled (or amain exited).
+    for _ in range(40):
+        if any("reconciled" in c for c in patched_bridge):
+            break
+        await asyncio.sleep(0.02)
+
+    amain_task.cancel()
+    try:
+        await amain_task
+    except asyncio.CancelledError:
+        pass
+
+    # Sequence check: init → connected → reconciled → disconnected.
+    keys_in_order = [next(iter(c.keys())) for c in patched_bridge]
+    assert "init" in keys_in_order
+    assert "connected" in keys_in_order
+    assert "reconciled" in keys_in_order
+    assert keys_in_order.index("connected") < keys_in_order.index("reconciled"), (
+        "reconcile_state must run AFTER connect_with_retry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_amain_continues_when_reconcile_state_raises(
+    patched_redis: fakeredis.aioredis.FakeRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Step 3.5b failure-tolerance: ``reconcile_state`` raising must
+    not crash amain. The try/except in main.amain swallows it; tasks
+    still spin up; shutdown still cleans up."""
+    token = TokenResponse(
+        access_token="acc",
+        refresh_token="ref",
+        expires_in=3600,
+        token_type="Bearer",
+    )
+    await save_token(patched_redis, "ftmo_001", token, ctid_trader_account_id=42)
+
+    captured: list[str] = []
+
+    class _RaisingReconcileBridge:
+        def __init__(self, **_kwargs: Any) -> None: ...
+
+        async def connect_with_retry(self, max_attempts: int = 10, **_kwargs: Any) -> None:
+            captured.append("connected")
+
+        async def reconcile_state(self) -> None:
+            captured.append("reconcile_raised")
+            raise RuntimeError("simulated reconcile bug")
+
+        async def disconnect(self) -> None:
+            captured.append("disconnected")
+
+    monkeypatch.setattr(main_module, "CtraderBridge", _RaisingReconcileBridge)
+
+    amain_task = asyncio.create_task(amain(_settings()))
+    # Wait for reconcile to attempt + raise + amain to proceed past it.
+    for _ in range(40):
+        if "reconcile_raised" in captured:
+            break
+        await asyncio.sleep(0.02)
+    # Then give shutdown loops a moment, then cancel.
+    await asyncio.sleep(0.05)
+    amain_task.cancel()
+    try:
+        await amain_task
+    except asyncio.CancelledError:
+        pass
+
+    # Reconcile raised, but disconnect still ran (proves amain didn't crash).
+    assert "reconcile_raised" in captured
+    assert "disconnected" in captured
 
 
 def test_exit_codes_are_distinct() -> None:

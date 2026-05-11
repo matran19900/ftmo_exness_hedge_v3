@@ -39,9 +39,12 @@ mapped to error fields via ``retcode_mapping.map_ctrader_error``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
+import time
 from typing import Any, Literal, TypedDict
+from uuid import uuid4
 
 import redis.asyncio as redis_asyncio
 from ctrader_open_api import Client, Protobuf, TcpProtocol
@@ -50,6 +53,8 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAmendPositionSLTPReq,
     ProtoOAApplicationAuthReq,
     ProtoOAClosePositionReq,
+    ProtoOADealListByPositionIdReq,
+    ProtoOADealListByPositionIdRes,
     ProtoOAErrorRes,
     ProtoOAExecutionEvent,
     ProtoOANewOrderReq,
@@ -90,6 +95,30 @@ _TRADING_TIMEOUT_SECONDS = 30.0
 # ``POSITION_NOT_FOUND`` for a position the cTrader UI shows as open.
 # 100ms is a conservative default — adjust if CEO smoke surfaces a need.
 _AMEND_SETTLING_DELAY_SECONDS = 0.1
+
+
+def _order_type_name(order_type: int) -> str:
+    """Map a ``ProtoOAOrderType`` enum int to the lowercase protocol
+    string used in ``reconcile_snapshot.pending_orders[].order_type``.
+
+    Step 3.5b. Numeric values verified via DESCRIPTOR inspection in
+    step 3.5a (``STOP_LOSS_TAKE_PROFIT=4``, NOT 6 as some external docs
+    suggest). Unknown values fall back to ``"unknown"`` so a future
+    cTrader build adding a new enum doesn't crash the snapshot.
+    """
+    if order_type == ProtoOAOrderType.MARKET:
+        return "market"
+    if order_type == ProtoOAOrderType.LIMIT:
+        return "limit"
+    if order_type == ProtoOAOrderType.STOP:
+        return "stop"
+    if order_type == ProtoOAOrderType.STOP_LIMIT:
+        return "stop_limit"
+    if order_type == ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT:
+        return "stop_loss_take_profit"
+    if order_type == ProtoOAOrderType.MARKET_RANGE:
+        return "market_range"
+    return "unknown"
 
 
 class OrderPlacementResult(TypedDict, total=False):
@@ -739,6 +768,231 @@ class CtraderBridge:
             currency="USD",
             money_digits=money_digits,
         )
+
+    # ---------- reconciliation (step 3.5b) ----------
+
+    async def reconcile_state(self) -> None:
+        """Snapshot cTrader's view of open positions + pending orders.
+
+        Called once per client lifecycle (``main.amain``) right after
+        ``connect_with_retry`` succeeds and BEFORE the heartbeat /
+        command / event-info loops start. Publishes a single
+        ``reconcile_snapshot`` event to ``event_stream:ftmo:{acc}``.
+        Server's event_handler (step 3.7) diffs the snapshot against
+        Redis state and dispatches ``fetch_close_history`` commands
+        for positions that closed during the offline window.
+
+        Retry: 3 attempts with exponential backoff (1s, 2s, 4s
+        between). If all 3 fail, log and return — startup continues
+        without reconciliation. The downside is documented drift; the
+        upside is the client never blocks startup on a flaky broker.
+
+        Empty bridge: when ``self._redis`` is ``None`` (tests
+        instantiating the bridge without a Redis fixture), the
+        snapshot is built but not published, and a warning is
+        emitted.
+        """
+        logger.info("reconcile_state: querying cTrader for open positions + pending orders")
+
+        req = ProtoOAReconcileReq()
+        req.ctidTraderAccountId = self._ctid_trader_account_id
+
+        response: Any = None
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                response = await self._send_and_wait(req, timeout=10.0, client_msg_id=uuid4().hex)
+                break
+            except Exception as exc:  # broad: cTrader / transport / timeout
+                last_exc = exc
+                logger.warning("reconcile_state attempt %d/3 failed: %s", attempt, exc)
+                if attempt < 3:
+                    await asyncio.sleep(2 ** (attempt - 1))
+
+        if not isinstance(response, ProtoOAReconcileRes):
+            logger.error(
+                "reconcile_state: all 3 attempts failed; skipping reconcile "
+                "(state may drift). last_exc=%s",
+                last_exc,
+            )
+            return
+
+        positions_list = [
+            {
+                "position_id": str(int(p.positionId)),
+                "symbol_id": str(int(p.tradeData.symbolId)),
+                "side": "buy" if int(p.tradeData.tradeSide) == ProtoOATradeSide.BUY else "sell",
+                "volume": str(int(p.tradeData.volume)),
+                "entry_price": str(float(p.price)) if p.HasField("price") else "",
+                "stop_loss": str(float(p.stopLoss)) if p.HasField("stopLoss") else "",
+                "take_profit": str(float(p.takeProfit)) if p.HasField("takeProfit") else "",
+                "open_timestamp": str(int(p.tradeData.openTimestamp))
+                if p.tradeData.HasField("openTimestamp")
+                else "",
+                "used_margin": str(int(p.usedMargin)) if p.HasField("usedMargin") else "",
+            }
+            for p in response.position
+        ]
+        orders_list = [
+            {
+                "order_id": str(int(o.orderId)),
+                "order_type": _order_type_name(int(o.orderType)),
+                "symbol_id": str(int(o.tradeData.symbolId)),
+                "side": "buy" if int(o.tradeData.tradeSide) == ProtoOATradeSide.BUY else "sell",
+                "volume": str(int(o.tradeData.volume)),
+                "limit_price": str(float(o.limitPrice)) if o.HasField("limitPrice") else "",
+                "stop_price": str(float(o.stopPrice)) if o.HasField("stopPrice") else "",
+                "stop_loss": str(float(o.stopLoss)) if o.HasField("stopLoss") else "",
+                "take_profit": str(float(o.takeProfit)) if o.HasField("takeProfit") else "",
+                "open_timestamp": str(int(o.tradeData.openTimestamp))
+                if o.tradeData.HasField("openTimestamp")
+                else "",
+            }
+            for o in response.order
+        ]
+
+        payload = {
+            "event_type": "reconcile_snapshot",
+            "positions": json.dumps(positions_list),
+            "pending_orders": json.dumps(orders_list),
+            "position_count": str(len(positions_list)),
+            "order_count": str(len(orders_list)),
+            "ts_published": str(int(time.time() * 1000)),
+        }
+
+        if self._redis is None:
+            logger.warning(
+                "reconcile_state: bridge has no redis instance; skipping publish "
+                "(positions=%d orders=%d)",
+                len(positions_list),
+                len(orders_list),
+            )
+            return
+
+        stream = f"event_stream:ftmo:{self._account_id}"
+        try:
+            await self._redis.xadd(
+                stream,
+                payload,  # type: ignore[arg-type]
+                maxlen=10000,
+                approximate=True,
+            )
+        except RedisError:
+            logger.exception("reconcile_state: XADD failed for %s; snapshot lost", stream)
+            return
+
+        logger.info(
+            "reconcile_state: published snapshot — %d positions, %d pending orders",
+            len(positions_list),
+            len(orders_list),
+        )
+
+    async def fetch_position_close_history(
+        self,
+        position_id: int,
+        client_msg_id: str,
+    ) -> dict[str, str] | None:
+        """Query cTrader for the deal history of ``position_id`` and
+        return a reconstructed ``position_closed`` payload.
+
+        Called by ``handle_fetch_close_history`` in response to a
+        server-issued ``fetch_close_history`` command. The server
+        dispatches this after diffing a ``reconcile_snapshot`` against
+        Redis state and finding positions that closed during the
+        offline window.
+
+        Returns ``None`` when no deal with ``closePositionDetail`` is
+        found — position still open on cTrader, doesn't exist, or has
+        deals but no close leg yet. Caller publishes a
+        ``not_found`` error response to ``resp_stream`` in that case.
+
+        Time range: ``fromTimestamp=0`` (epoch start) and
+        ``toTimestamp = now_ms`` covers all history. Both fields are
+        REQUIRED on ``ProtoOADealListByPositionIdReq`` per DESCRIPTOR
+        inspection (label=2).
+
+        Partial-close caveat: Phase 3 doesn't support partial closes,
+        so we assume a single close deal per position and pick the
+        first one we find with ``closePositionDetail`` set. If the
+        broker ever returns multiple close deals (partial close
+        sequence), we'd publish only the first; future work to wire
+        partial-close support would need to aggregate them.
+
+        ``close_reason`` is set to ``"unknown"`` because the deal
+        history does NOT include the source order's ``orderType`` /
+        ``closingOrder`` metadata — only the deal itself. The server
+        consumer can either accept ``"unknown"`` or re-infer from
+        ``grossProfit`` sign + the position's last-known SL/TP.
+        """
+        logger.info(
+            "fetch_position_close_history: querying deals for position_id=%d",
+            position_id,
+        )
+
+        req = ProtoOADealListByPositionIdReq()
+        req.ctidTraderAccountId = self._ctid_trader_account_id
+        req.positionId = position_id
+        req.fromTimestamp = 0
+        req.toTimestamp = int(time.time() * 1000)
+
+        try:
+            response = await self._send_and_wait(req, timeout=10.0, client_msg_id=client_msg_id)
+        except Exception:
+            logger.exception(
+                "fetch_position_close_history failed for position_id=%d",
+                position_id,
+            )
+            return None
+
+        if not isinstance(response, ProtoOADealListByPositionIdRes):
+            logger.warning(
+                "fetch_position_close_history: unexpected response type %s for position_id=%d",
+                type(response).__name__,
+                position_id,
+            )
+            return None
+
+        close_deal = None
+        for deal in response.deal:
+            if deal.HasField("closePositionDetail"):
+                close_deal = deal
+                break
+
+        if close_deal is None:
+            logger.warning(
+                "fetch_position_close_history: no close deal found for "
+                "position_id=%d (still open?)",
+                position_id,
+            )
+            return None
+
+        cd = close_deal.closePositionDetail
+        payload: dict[str, str] = {
+            "event_type": "position_closed",
+            "broker_order_id": str(position_id),
+            "position_id": str(position_id),
+            "close_price": str(float(close_deal.executionPrice)),
+            "close_time": str(int(close_deal.executionTimestamp)),
+            "realized_pnl": str(int(cd.grossProfit)),
+            "commission": str(int(cd.commission)),
+            "swap": str(int(cd.swap)),
+            "balance_after_close": str(int(cd.balance)),
+            "money_digits": str(int(cd.moneyDigits)) if cd.HasField("moneyDigits") else "",
+            "closed_volume": str(int(cd.closedVolume)) if cd.HasField("closedVolume") else "",
+            # Deal history doesn't carry the source order's orderType
+            # or closingOrder bit, so the structured close_reason
+            # inference path can't run here. Server consumer may
+            # re-infer from grossProfit sign + last-known SL/TP if
+            # higher fidelity is needed.
+            "close_reason": "unknown",
+            # Distinguishes reconciled events from live unsolicited
+            # ones — server's event_handler can suppress "Closed just
+            # now" toasts when this is set, and audit logs can mark
+            # the event as backfilled.
+            "reconstructed": "true",
+            "ts_published": str(int(time.time() * 1000)),
+        }
+        return payload
 
     # ---------- protobuf builders + response parsers ----------
 

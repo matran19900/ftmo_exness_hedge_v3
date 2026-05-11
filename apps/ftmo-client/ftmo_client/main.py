@@ -97,6 +97,16 @@ async def amain(settings: FtmoClientSettings | None = None) -> int:
     except Exception:
         logger.exception("initial heartbeat write failed; loop will retry")
 
+    # Step 3.5b: snapshot cTrader's view of open positions + pending
+    # orders so the server's event_handler can detect drift accumulated
+    # during any offline window. Wrapped in try/except so reconcile
+    # failure (cTrader hiccup, bridge bug) cannot block startup — the
+    # client carries on with whatever state Redis has.
+    try:
+        await bridge.reconcile_state()
+    except Exception:
+        logger.exception("reconcile_state raised unexpectedly; continuing startup")
+
     shutdown = ShutdownController()
     install_signal_handlers(shutdown)
 

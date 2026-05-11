@@ -452,6 +452,124 @@ async def handle_modify_sl_tp(
     await _publish_response(redis, account_id, order_id, request_id, action, result)
 
 
+async def handle_fetch_close_history(
+    redis: redis_asyncio.Redis,
+    bridge: CtraderBridge,
+    account_id: str,
+    fields: dict[str, str],
+) -> None:
+    """Server-issued reconciliation command (step 3.5b).
+
+    When the server's event_handler (step 3.7) diffs a
+    ``reconcile_snapshot`` against Redis state and finds a position
+    that exists in Redis but is missing from cTrader's open list, it
+    publishes ``fetch_close_history`` to ``cmd_stream:ftmo:{acc}``.
+    This handler asks the bridge to pull the position's deal history
+    from cTrader, builds a reconstructed ``position_closed`` event
+    (with ``reconstructed=true``), and publishes it to
+    ``event_stream:ftmo:{acc}``. A regular ACK goes to
+    ``resp_stream:ftmo:{acc}`` so the server knows the command
+    completed (or knows why it failed).
+
+    Error paths surface as ``status=error`` on the resp_stream:
+      - missing/non-numeric ``broker_order_id`` → ``invalid_request``
+      - bridge returns ``None`` (no close deal on cTrader) →
+        ``not_found`` (consumer can decide whether to leave the order
+        row open or mark it manually)
+      - any other unexpected exception → ``broker_error``
+    """
+    request_id = fields.get("request_id", "")
+    order_id = fields.get("order_id", "")
+    action = "fetch_close_history"
+
+    broker_order_id_str = fields.get("broker_order_id", "")
+    if not broker_order_id_str:
+        await _publish_error(
+            redis,
+            account_id,
+            order_id,
+            request_id,
+            action,
+            "invalid_request",
+            "broker_order_id missing",
+        )
+        return
+
+    try:
+        position_id = int(broker_order_id_str)
+    except ValueError:
+        await _publish_error(
+            redis,
+            account_id,
+            order_id,
+            request_id,
+            action,
+            "invalid_request",
+            f"broker_order_id not an int: {broker_order_id_str!r}",
+        )
+        return
+
+    try:
+        payload = await bridge.fetch_position_close_history(
+            position_id=position_id,
+            client_msg_id=request_id,
+        )
+    except Exception as exc:
+        logger.exception("fetch_close_history bridge call failed")
+        await _publish_error(
+            redis,
+            account_id,
+            order_id,
+            request_id,
+            action,
+            "broker_error",
+            str(exc),
+        )
+        return
+
+    if payload is None:
+        # No close deal found on cTrader. Position may still be open
+        # (Redis is stale in the *other* direction), or doesn't exist
+        # at all. Either way the consumer needs an explicit signal.
+        await _publish_error(
+            redis,
+            account_id,
+            order_id,
+            request_id,
+            action,
+            "not_found",
+            f"no close deal found for position_id={position_id}",
+        )
+        return
+
+    # Republish the reconstructed close event to event_stream so the
+    # server's event_handler can drive the same close-flow logic it
+    # uses for live unsolicited closes. The ``reconstructed=true``
+    # field distinguishes the two paths for auditing.
+    event_stream = f"event_stream:ftmo:{account_id}"
+    await redis.xadd(
+        event_stream,
+        payload,  # type: ignore[arg-type]
+        maxlen=_RESP_STREAM_MAXLEN,
+        approximate=True,
+    )
+
+    # Then ACK on resp_stream so the server's response_handler closes
+    # out the request_id tracking (same flow as the other actions).
+    await _publish_response(
+        redis,
+        account_id,
+        order_id,
+        request_id,
+        action,
+        {"success": True, "position_id": str(position_id)},
+    )
+    logger.info(
+        "handle_fetch_close_history: published reconstructed position_closed for position_id=%d",
+        position_id,
+    )
+
+
 # Action-name → handler dispatch table. ``command_loop`` looks up by
 # ``action`` field on each command; unknown actions are warned + XACKed
 # without re-delivery (per docs/05-redis-protocol.md the action vocab is
@@ -460,6 +578,7 @@ ACTION_HANDLERS: dict[str, ActionHandler] = {
     "open": handle_open,
     "close": handle_close,
     "modify_sl_tp": handle_modify_sl_tp,
+    "fetch_close_history": handle_fetch_close_history,
 }
 
 

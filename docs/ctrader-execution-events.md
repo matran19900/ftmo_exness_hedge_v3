@@ -507,6 +507,171 @@ ProtoOATrader (full field list):
 error, Redis flap) is logged and the loop continues to the next
 interval — same shape as `heartbeat_loop`.
 
+## 11. Reconciliation on client restart (step 3.5b)
+
+When the FTMO client reconnects after an offline window, broker state
+may have advanced (SL/TP hits, manual closes, pending fills, margin
+calls) without us seeing the corresponding execution events. The
+bridge queries cTrader for current truth once, before any of the
+heartbeat / command / account_info loops start, and publishes a
+snapshot for the server's event_handler to diff against Redis.
+
+### 11.1 ReconcileReq → reconcile_snapshot event
+
+```
+[client] ProtoOAReconcileReq(ctidTraderAccountId=X)
+   ↓
+[broker] ProtoOAReconcileRes
+   position[]: list of currently OPEN positions
+   order[]:    list of currently PENDING orders (limit/stop awaiting fill)
+
+[bridge] event_stream:ftmo:{account_id} XADD:
+   event_type        = "reconcile_snapshot"
+   positions         = JSON array (see §11.3)
+   pending_orders    = JSON array (see §11.4)
+   position_count    = "N"
+   order_count       = "M"
+   ts_published      = "<epoch ms>"
+```
+
+### 11.2 Retry + failure semantics
+
+- **3 attempts** with exponential backoff (sleep 1s after attempt 1
+  failure, 2s after attempt 2). Default `_send_and_wait` timeout per
+  attempt: 10s.
+- **All 3 fail** → log error, skip publish, continue startup. The
+  server's event_handler tolerates a missing snapshot (treats Redis
+  state as source of truth in that case, accepting the drift risk).
+- **Unexpected response type** (e.g. `ProtoOAErrorRes` from a stale
+  auth) → no publish, log warning. The bridge does NOT retry on
+  unexpected-type because the cTrader library has already burned the
+  Deferred; a retry would just re-fail.
+- **`self._redis is None`** (test fixtures) → warn + skip publish;
+  the snapshot is still constructed in memory but discarded.
+- **`main.amain` wraps the call in `try/except`** so any unexpected
+  exception in `reconcile_state` does NOT block client startup; the
+  loops still spin up.
+
+### 11.3 Positions list schema
+
+Each element of the `positions` JSON array:
+
+| Field | Type | Source | Notes |
+|---|---|---|---|
+| `position_id` | str | `p.positionId` | int64 cast to string |
+| `symbol_id` | str | `p.tradeData.symbolId` | int64 |
+| `side` | str | `p.tradeData.tradeSide` | `"buy"` / `"sell"` |
+| `volume` | str | `p.tradeData.volume` | cTrader wire units (consumer scales by lot_size) |
+| `entry_price` | str | `p.price` if `HasField` else `""` | DOUBLE |
+| `stop_loss` | str | `p.stopLoss` if `HasField` else `""` | DOUBLE |
+| `take_profit` | str | `p.takeProfit` if `HasField` else `""` | DOUBLE |
+| `open_timestamp` | str | `p.tradeData.openTimestamp` if set | epoch ms |
+| `used_margin` | str | `p.usedMargin` if `HasField` else `""` | raw int (D-053) |
+
+### 11.4 Pending orders list schema
+
+Each element of the `pending_orders` JSON array:
+
+| Field | Type | Source |
+|---|---|---|
+| `order_id` | str | `o.orderId` (request-side ID) |
+| `order_type` | str | `_order_type_name(o.orderType)` — one of `market` / `limit` / `stop` / `stop_limit` / `stop_loss_take_profit` / `market_range` / `unknown` |
+| `symbol_id` | str | `o.tradeData.symbolId` |
+| `side` | str | `"buy"` / `"sell"` |
+| `volume` | str | `o.tradeData.volume` |
+| `limit_price` | str | `o.limitPrice` if `HasField` else `""` |
+| `stop_price` | str | `o.stopPrice` if `HasField` else `""` |
+| `stop_loss` | str | `o.stopLoss` if `HasField` else `""` |
+| `take_profit` | str | `o.takeProfit` if `HasField` else `""` |
+| `open_timestamp` | str | `o.tradeData.openTimestamp` if set |
+
+## 12. Deal history query — fetch_close_history (step 3.5b)
+
+After receiving a `reconcile_snapshot`, the server's event_handler
+(step 3.7) diffs against Redis state. For each position that was OPEN
+in Redis but is MISSING from the snapshot, the server publishes a
+`fetch_close_history` command to the FTMO client; the client queries
+cTrader's deal history for that position and publishes a
+reconstructed `position_closed` event so the server can drive the
+same close-flow logic it uses for live unsolicited closes.
+
+### 12.1 Command shape
+
+```
+cmd_stream:ftmo:{account_id} XADD:
+  action            = "fetch_close_history"
+  order_id          = "<server-side order id>"
+  broker_order_id   = "<cTrader positionId>"
+  symbol            = "<symbol name>" (optional; informational)
+  request_id        = "<uuid>"
+  created_at        = "<epoch ms>"
+```
+
+### 12.2 Bridge query
+
+```
+[client] ProtoOADealListByPositionIdReq(
+            ctidTraderAccountId = X,
+            positionId          = Y,
+            fromTimestamp       = 0,
+            toTimestamp         = now_ms,
+         )
+   ↓
+[broker] ProtoOADealListByPositionIdRes
+   deal[]: full deal history for position Y, oldest first
+
+[bridge] iterate deals → pick first deal with closePositionDetail set
+   build position_closed payload (same shape as §3.2 live close
+   event) PLUS reconstructed=true field + close_reason="unknown"
+   (deal history lacks the source order's orderType / closingOrder
+   metadata that §3.6 needs for live classification)
+```
+
+**Critical DESCRIPTOR finding** (step 3.5b): both `fromTimestamp` and
+`toTimestamp` are REQUIRED (label=2) on
+`ProtoOADealListByPositionIdReq`, NOT optional. Bridge always sets
+them — `fromTimestamp=0` (epoch start) and `toTimestamp=now_ms`
+covers all of position's history.
+
+### 12.3 Reconstructed event publish
+
+Bridge publishes to `event_stream:ftmo:{account_id}` with
+`event_type=position_closed` and the extra `reconstructed=true`
+field. The server's event_handler treats reconstructed events
+identically to live close events for state-update purposes, except:
+
+- Audit logs mark the event as backfilled (provenance).
+- WS broadcast distinguishes "Closed during offline window" toast
+  from "Closed just now" toast.
+- `close_reason` is `"unknown"` because the deal history doesn't
+  include the source order's `orderType` / `closingOrder` metadata.
+  The server consumer may re-infer from `grossProfit` sign +
+  last-known SL/TP if higher fidelity is needed; the bridge stays
+  agnostic.
+
+The handler also publishes a regular ACK to
+`resp_stream:ftmo:{account_id}` so the server's response_handler
+closes out the `request_id` tracking on the
+`fetch_close_history` command.
+
+### 12.4 Error paths
+
+| Bridge result | resp_stream `status` / `error_code` | event_stream |
+|---|---|---|
+| Payload returned (close deal found) | `success` | XADD reconstructed position_closed |
+| `None` (no close deal — position still open or doesn't exist) | `error` / `not_found` | (no publish) |
+| Bridge raised unexpectedly | `error` / `broker_error` | (no publish) |
+| `broker_order_id` missing or non-numeric | `error` / `invalid_request` | (no publish) — bridge not called |
+
+### 12.5 Partial-close caveat
+
+Phase 3 doesn't support partial closes, so the bridge picks the FIRST
+deal with `closePositionDetail` set and ignores any subsequent
+close-side deals. If a future phase introduces partial-close support,
+this method would need to aggregate `grossProfit` / `commission` /
+`closedVolume` across all close deals rather than returning just the
+first.
+
 ## 9. Update log
 
 | Date | Step | Update |
@@ -514,3 +679,4 @@ interval — same shape as `heartbeat_loop`.
 | 2026-05-11 | 3.4c | Initial creation. Sections 1, 2.1-2.4, 3.1, 4.1-4.2, 5, 6, 7, 8 verified empirically through smoke step 3.4 + protobuf DESCRIPTOR inspection. Sections 3.2-3.5, 4.3 placeholder for step 3.5+ (unsolicited events). |
 | 2026-05-11 | 3.5 | Sections 3.2 (manual close), 3.3 (SL hit), 3.4 (TP hit), 4.3 (manual modify) populated with bridge handling. Section 3.6 added documenting the close-reason inference heuristic (no protobuf close_reason field exists — verified by DESCRIPTOR inspection). Section 10 added for account info polling (balance via ProtoOATraderReq, margin via ProtoOAReconcileReq sum). Section 3.5 (margin call / stop-out) remains a placeholder pending margin-call event correlation in Phase 4+. |
 | 2026-05-11 | 3.5a | Rewrite close_reason via structured order metadata (`order.orderType` + `order.closingOrder` + `closePositionDetail.grossProfit` sign); replace the 1-pip price-tolerance heuristic. Add extended `closePositionDetail` field publishing on `position_closed` payloads (`commission`, `swap`, `balance_after_close`, `money_digits`, `closed_volume`). §3.2-3.4 rewritten to show the structured signals. §3.6 replaced with the new mapping table + CEO sample. §8 ProtoOAOrder full field list (including `closingOrder`, `isStopOut`) + ProtoOAOrderType enum verified (STOP_LOSS_TAKE_PROFIT=4, NOT 6). |
+| 2026-05-11 | 3.5b | §11 added — reconciliation flow on client restart (`ProtoOAReconcileReq` → `reconcile_snapshot` event_stream entry; 3-attempt exponential backoff retry; failure-tolerant). §12 added — `fetch_close_history` command flow that pulls deal history via `ProtoOADealListByPositionIdReq` and publishes reconstructed `position_closed` events with `reconstructed=true`. DESCRIPTOR inspection: `ProtoOADealListByPositionIdReq.fromTimestamp`/`toTimestamp` are REQUIRED (label=2), not optional — bridge sets `fromTimestamp=0` / `toTimestamp=now_ms` for full history. |
