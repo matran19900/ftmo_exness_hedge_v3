@@ -335,3 +335,416 @@ class OrderService:
             request_id,
         )
         return order_id, request_id
+
+    # ---------- Step 3.9 read endpoints ----------
+
+    # Status sets maintained by ``RedisService.create_order`` +
+    # ``update_order`` Lua. ``"all"`` is a synthetic alias the API
+    # exposes for convenience; we union the underlying sets.
+    _ALL_STATUSES: tuple[str, ...] = (
+        "pending",
+        "filled",
+        "closed",
+        "rejected",
+        "cancelled",
+        "unknown",
+    )
+
+    async def list_orders(
+        self,
+        *,
+        status: str = "all",
+        symbol: str | None = None,
+        account_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, str]], int]:
+        """List orders with status / symbol / account_id filters.
+
+        Returns ``(page, total)`` where ``page`` is the slice
+        ``[offset:offset+limit]`` and ``total`` is the count BEFORE
+        slicing (so the frontend can render pagination correctly).
+
+        Status branches:
+          - ``"all"`` → union of every status set.
+          - any status NOT in ``_ALL_STATUSES`` → empty list (no
+            error; the API surface allows clients to query
+            speculative filters).
+          - otherwise → just the matching set.
+
+        Sort: ``created_at`` DESC so the newest orders surface first.
+        """
+        if status == "all":
+            collected: dict[str, dict[str, str]] = {}
+            for st in self._ALL_STATUSES:
+                for order in await self.redis.list_orders_by_status(st):
+                    oid = order.get("order_id", "")
+                    if oid and oid not in collected:
+                        collected[oid] = dict(order)  # type: ignore[arg-type]
+            orders: list[dict[str, str]] = list(collected.values())
+        elif status in self._ALL_STATUSES:
+            orders = [
+                dict(o)  # type: ignore[arg-type]
+                for o in await self.redis.list_orders_by_status(status)
+            ]
+        else:
+            return [], 0
+
+        sym_upper = symbol.upper() if symbol else None
+        filtered: list[dict[str, str]] = []
+        for o in orders:
+            if sym_upper and o.get("symbol", "") != sym_upper:
+                continue
+            if account_id and o.get("ftmo_account_id", "") != account_id:
+                continue
+            filtered.append(o)
+
+        filtered.sort(
+            key=lambda o: int(o.get("created_at", "0") or "0"),
+            reverse=True,
+        )
+        total = len(filtered)
+        return filtered[offset : offset + limit], total
+
+    async def get_order_by_id(self, order_id: str) -> dict[str, str]:
+        """Return one order's HASH. Raises 404 ``order_not_found``."""
+        order = await self.redis.get_order(order_id)
+        if order is None:
+            raise OrderValidationError(
+                f"order not found: {order_id}",
+                http_status=404,
+                error_code="order_not_found",
+            )
+        return dict(order)  # type: ignore[arg-type]
+
+    async def list_positions(
+        self,
+        *,
+        account_id: str | None = None,
+        symbol: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Filled orders enriched with ``position_cache:{id}``.
+
+        Each entry merges the live-P&L snapshot from step 3.8 with the
+        static order fields (sl_price, tp_price, fill_time) so the
+        frontend can render the open-positions table from a single
+        payload.
+
+        Race tolerance: ``position_cache`` is written 1 Hz by
+        ``position_tracker``. Orders that flipped to ``filled`` within
+        the last second may not have a cache entry yet — we include
+        them with empty live fields + ``is_stale="true"`` so the row
+        still appears (the next list_positions call will pick up the
+        real values).
+        """
+        sym_upper = symbol.upper() if symbol else None
+        filled = await self.redis.list_orders_by_status("filled")
+        positions: list[dict[str, str]] = []
+
+        for order in filled:
+            if sym_upper and order.get("symbol", "") != sym_upper:
+                continue
+            if account_id and order.get("ftmo_account_id", "") != account_id:
+                continue
+            oid = order.get("order_id", "")
+            if not oid:
+                continue
+
+            cache = await self.redis.get_position_cache(oid)
+            static_overlay = {
+                "sl_price": order.get("sl_price", ""),
+                "tp_price": order.get("tp_price", ""),
+                "p_executed_at": order.get("p_executed_at", ""),
+            }
+            if cache is None:
+                # Just-filled race: no live snapshot yet. Surface the
+                # order's static state with a stale flag so the row
+                # renders, just without live P&L.
+                position: dict[str, str] = {
+                    "order_id": oid,
+                    "symbol": order.get("symbol", ""),
+                    "side": order.get("side", ""),
+                    "volume_lots": order.get("p_volume_lots", ""),
+                    "entry_price": order.get("p_fill_price", ""),
+                    "current_price": "",
+                    "unrealized_pnl": "",
+                    "money_digits": order.get("p_money_digits", "2"),
+                    "is_stale": "true",
+                    "tick_age_ms": "",
+                    "computed_at": "",
+                    **static_overlay,
+                }
+            else:
+                position = {**cache, **static_overlay}
+            positions.append(position)
+
+        positions.sort(
+            key=lambda p: int(p.get("p_executed_at", "0") or "0"),
+            reverse=True,
+        )
+        return positions
+
+    async def list_history(
+        self,
+        *,
+        from_ts: int,
+        to_ts: int,
+        symbol: str | None = None,
+        account_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, str]], int]:
+        """Closed orders in ``[from_ts, to_ts]`` by ``p_closed_at``.
+
+        Filter is INCLUSIVE on both ends. Orders without a
+        ``p_closed_at`` field (shouldn't happen post step-3.7's
+        response_handler) are skipped silently.
+        """
+        sym_upper = symbol.upper() if symbol else None
+        closed = await self.redis.list_orders_by_status("closed")
+        history: list[dict[str, str]] = []
+
+        for order in closed:
+            close_time_str = order.get("p_closed_at", "")
+            if not close_time_str:
+                continue
+            try:
+                close_time = int(close_time_str)
+            except (TypeError, ValueError):
+                continue
+            if close_time < from_ts or close_time > to_ts:
+                continue
+            if sym_upper and order.get("symbol", "") != sym_upper:
+                continue
+            if account_id and order.get("ftmo_account_id", "") != account_id:
+                continue
+            history.append(dict(order))  # type: ignore[arg-type]
+
+        history.sort(
+            key=lambda o: int(o.get("p_closed_at", "0") or "0"),
+            reverse=True,
+        )
+        total = len(history)
+        return history[offset : offset + limit], total
+
+    # ---------- Step 3.9 mutation endpoints ----------
+
+    async def close_order(
+        self,
+        order_id: str,
+        *,
+        volume_lots: float | None = None,
+    ) -> tuple[str, str]:
+        """Dispatch a ``close`` command for one filled order.
+
+        Phase 3 supports full close only (D-057). If ``volume_lots`` is
+        provided, it MUST equal the order's open volume; partial close
+        raises ``partial_close_unsupported``.
+
+        Returns ``(order_id, request_id)`` on success — same shape as
+        ``create_order`` so the frontend can correlate the eventual
+        resp_stream entry.
+        """
+        order = await self.redis.get_order(order_id)
+        if order is None:
+            raise OrderValidationError(
+                f"order not found: {order_id}",
+                http_status=404,
+                error_code="order_not_found",
+            )
+
+        p_status = order.get("p_status", "")
+        if p_status != "filled":
+            raise OrderValidationError(
+                f"cannot close order with p_status={p_status}: must be filled",
+                http_status=400,
+                error_code="invalid_state",
+            )
+
+        current_volume = float(order.get("p_volume_lots", "0") or "0")
+        if volume_lots is not None and abs(volume_lots - current_volume) > 1e-9:
+            raise OrderValidationError(
+                f"partial close not supported in Phase 3; volume must be "
+                f"{current_volume}, got {volume_lots}",
+                http_status=400,
+                error_code="partial_close_unsupported",
+            )
+
+        ftmo_account_id = order.get("ftmo_account_id", "")
+        if not ftmo_account_id:
+            raise OrderValidationError(
+                "order missing ftmo_account_id",
+                http_status=500,
+                error_code="order_corrupt",
+            )
+
+        broker_order_id = order.get("p_broker_order_id", "")
+        if not broker_order_id:
+            raise OrderValidationError(
+                "order has no p_broker_order_id; cannot dispatch close",
+                http_status=500,
+                error_code="order_corrupt",
+            )
+
+        client_status = await self.redis.get_client_status("ftmo", ftmo_account_id)
+        if client_status != "online":
+            raise OrderValidationError(
+                f"ftmo client offline for account {ftmo_account_id}",
+                http_status=409,
+                error_code="client_offline",
+            )
+
+        cmd_fields: dict[str, str] = {
+            "order_id": order_id,
+            "action": "close",
+            "broker_order_id": broker_order_id,
+            "symbol": order.get("symbol", ""),
+            "volume_lots": str(current_volume),
+        }
+        request_id = await self.redis.push_command("ftmo", ftmo_account_id, cmd_fields)
+        await self.redis.link_request_to_order(request_id, order_id)
+
+        logger.info(
+            "close_order: order_id=%s broker_order_id=%s request_id=%s",
+            order_id,
+            broker_order_id,
+            request_id,
+        )
+        return order_id, request_id
+
+    async def modify_order(
+        self,
+        order_id: str,
+        *,
+        sl: float | None,
+        tp: float | None,
+    ) -> tuple[str, str]:
+        """Dispatch a ``modify_sl_tp`` command for one filled order.
+
+        Field semantics (matching the REST schema):
+          - ``None``  → keep the order's existing value.
+          - ``0``     → remove that side (BUY SL set to 0 means
+            "no stop loss"; same for TP).
+          - positive → set to that price; direction validated against
+            the latest tick.
+
+        Direction validation runs ONLY when a side is being set to a
+        positive price. Removing (``0``) or keeping (``None``) skips
+        the tick check.
+        """
+        if sl is None and tp is None:
+            raise OrderValidationError(
+                "at least one of sl or tp must be provided",
+                http_status=400,
+                error_code="missing_field",
+            )
+
+        order = await self.redis.get_order(order_id)
+        if order is None:
+            raise OrderValidationError(
+                f"order not found: {order_id}",
+                http_status=404,
+                error_code="order_not_found",
+            )
+
+        p_status = order.get("p_status", "")
+        if p_status != "filled":
+            raise OrderValidationError(
+                f"cannot modify order with p_status={p_status}: must be filled",
+                http_status=400,
+                error_code="invalid_state",
+            )
+
+        symbol = order.get("symbol", "")
+        side = order.get("side", "")
+
+        needs_tick_check = (sl is not None and sl > 0) or (tp is not None and tp > 0)
+        if needs_tick_check:
+            tick_raw = await self.redis.get_tick_cache(symbol)
+            if tick_raw is None:
+                raise OrderValidationError(
+                    f"no recent tick for {symbol}; cannot validate SL/TP",
+                    http_status=409,
+                    error_code="no_tick_data",
+                )
+            try:
+                tick = json.loads(tick_raw)
+                bid = float(tick["bid"])
+                ask = float(tick["ask"])
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+                raise OrderValidationError(
+                    f"malformed tick cache for {symbol}: {exc}",
+                    http_status=409,
+                    error_code="no_tick_data",
+                ) from exc
+            if side == "buy":
+                if sl is not None and sl > 0 and sl >= bid:
+                    raise OrderValidationError(
+                        f"SL {sl} must be < {bid} for BUY",
+                        http_status=400,
+                        error_code="invalid_sl_direction",
+                    )
+                if tp is not None and tp > 0 and tp <= ask:
+                    raise OrderValidationError(
+                        f"TP {tp} must be > {ask} for BUY",
+                        http_status=400,
+                        error_code="invalid_tp_direction",
+                    )
+            elif side == "sell":
+                if sl is not None and sl > 0 and sl <= ask:
+                    raise OrderValidationError(
+                        f"SL {sl} must be > {ask} for SELL",
+                        http_status=400,
+                        error_code="invalid_sl_direction",
+                    )
+                if tp is not None and tp > 0 and tp >= bid:
+                    raise OrderValidationError(
+                        f"TP {tp} must be < {bid} for SELL",
+                        http_status=400,
+                        error_code="invalid_tp_direction",
+                    )
+
+        ftmo_account_id = order.get("ftmo_account_id", "")
+        if not ftmo_account_id:
+            raise OrderValidationError(
+                "order missing ftmo_account_id",
+                http_status=500,
+                error_code="order_corrupt",
+            )
+        broker_order_id = order.get("p_broker_order_id", "")
+        if not broker_order_id:
+            raise OrderValidationError(
+                "order has no p_broker_order_id",
+                http_status=500,
+                error_code="order_corrupt",
+            )
+
+        client_status = await self.redis.get_client_status("ftmo", ftmo_account_id)
+        if client_status != "online":
+            raise OrderValidationError(
+                f"ftmo client offline for account {ftmo_account_id}",
+                http_status=409,
+                error_code="client_offline",
+            )
+
+        new_sl = sl if sl is not None else float(order.get("sl_price", "0") or "0")
+        new_tp = tp if tp is not None else float(order.get("tp_price", "0") or "0")
+
+        cmd_fields: dict[str, str] = {
+            "order_id": order_id,
+            "action": "modify_sl_tp",
+            "broker_order_id": broker_order_id,
+            "sl": str(new_sl),
+            "tp": str(new_tp),
+        }
+        request_id = await self.redis.push_command("ftmo", ftmo_account_id, cmd_fields)
+        await self.redis.link_request_to_order(request_id, order_id)
+
+        logger.info(
+            "modify_order: order_id=%s sl=%s tp=%s request_id=%s",
+            order_id,
+            new_sl,
+            new_tp,
+            request_id,
+        )
+        return order_id, request_id

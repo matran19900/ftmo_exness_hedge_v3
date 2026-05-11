@@ -21,8 +21,8 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.dependencies.auth import get_current_user_rest
 from app.services.order_service import OrderService, OrderValidationError
@@ -120,4 +120,218 @@ async def create_order(
         order_id=order_id,
         request_id=request_id,
         status="accepted",
+    )
+
+
+# ---------- Step 3.9: list / detail / close / modify schemas ----------
+
+
+class OrderListResponse(BaseModel):
+    """Paginated order list. ``total`` is the unpaged count so the
+    frontend renders pagination correctly without re-issuing
+    queries."""
+
+    orders: list[dict[str, str]]
+    total: int
+    limit: int
+    offset: int
+
+
+class OrderDetailResponse(BaseModel):
+    """Single-order detail. ``order`` is the raw HASH; consumers
+    cast fields they care about (most are stored as strings in Redis)."""
+
+    order: dict[str, str]
+
+
+class OrderCloseRequest(BaseModel):
+    """``POST /api/orders/{order_id}/close`` body.
+
+    Phase 3 supports full close only (D-057). ``volume_lots`` is
+    optional — when omitted, the service closes the order's full open
+    volume. When provided, it MUST equal the open volume; partial
+    close raises 400 ``partial_close_unsupported``.
+    """
+
+    volume_lots: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Optional explicit volume. Must equal the order's open "
+            "volume if set (Phase 3 supports full close only)."
+        ),
+    )
+
+
+class OrderModifyRequest(BaseModel):
+    """``POST /api/orders/{order_id}/modify`` body.
+
+    Each side is independently:
+      - ``None``     → keep the order's existing value (frontend
+        omits the field).
+      - ``0``        → remove that side (BUY SL=0 means no stop loss).
+      - positive    → set to that price. Direction validated against
+        the latest tick.
+
+    ``model_validator`` rejects a body with both fields ``None`` so
+    the operator can't accidentally issue a no-op modify.
+    """
+
+    sl: float | None = Field(
+        default=None,
+        ge=0,
+        description="New SL price; 0 = remove SL; null/missing = unchanged.",
+    )
+    tp: float | None = Field(
+        default=None,
+        ge=0,
+        description="New TP price; 0 = remove TP; null/missing = unchanged.",
+    )
+
+    @model_validator(mode="after")
+    def _at_least_one_side(self) -> OrderModifyRequest:
+        if self.sl is None and self.tp is None:
+            raise ValueError("at least one of sl or tp must be provided")
+        return self
+
+
+class OrderActionResponse(BaseModel):
+    """Response shape for close + modify (mirror of the open response
+    so the frontend can use a single ``OrderActionResponse`` type for
+    all three mutation paths)."""
+
+    order_id: str
+    request_id: str
+    status: Literal["accepted"]
+    message: str
+
+
+# ---------- Step 3.9: endpoints ----------
+
+
+@router.get(
+    "",
+    response_model=OrderListResponse,
+    summary="List orders with status / symbol / account filter + pagination",
+)
+async def list_orders(
+    _user: Annotated[str, Depends(get_current_user_rest)],
+    redis_svc: Annotated[RedisService, Depends(get_redis_service)],
+    status_filter: Annotated[
+        str,
+        Query(
+            alias="status",
+            description=(
+                "Filter by status; one of pending/filled/closed/"
+                "rejected/cancelled/unknown, or 'all' (default)."
+            ),
+        ),
+    ] = "all",
+    symbol: Annotated[str | None, Query()] = None,
+    account_id: Annotated[
+        str | None,
+        Query(description="Filter by ftmo_account_id."),
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> OrderListResponse:
+    """List orders matching the filters, newest-first.
+
+    ``status`` is aliased as a query param so the URL stays
+    ``?status=...`` while the Python identifier doesn't clash with
+    ``fastapi.status`` (imported above for the 202 constant).
+    """
+    service = OrderService(redis_svc)
+    orders, total = await service.list_orders(
+        status=status_filter,
+        symbol=symbol,
+        account_id=account_id,
+        limit=limit,
+        offset=offset,
+    )
+    return OrderListResponse(orders=orders, total=total, limit=limit, offset=offset)
+
+
+@router.get(
+    "/{order_id}",
+    response_model=OrderDetailResponse,
+    summary="Get single order detail",
+)
+async def get_order_detail(
+    order_id: str,
+    _user: Annotated[str, Depends(get_current_user_rest)],
+    redis_svc: Annotated[RedisService, Depends(get_redis_service)],
+) -> OrderDetailResponse:
+    service = OrderService(redis_svc)
+    try:
+        order = await service.get_order_by_id(order_id)
+    except OrderValidationError as exc:
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={"error_code": exc.error_code, "message": str(exc)},
+        ) from exc
+    return OrderDetailResponse(order=order)
+
+
+@router.post(
+    "/{order_id}/close",
+    response_model=OrderActionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Close a filled order (dispatch close command)",
+)
+async def close_order(
+    order_id: str,
+    _user: Annotated[str, Depends(get_current_user_rest)],
+    redis_svc: Annotated[RedisService, Depends(get_redis_service)],
+    req: Annotated[OrderCloseRequest | None, Body()] = None,
+) -> OrderActionResponse:
+    """Dispatch a ``close`` command for one filled order.
+
+    The mutation is async like ``POST /api/orders``: 202 means the
+    command was pushed to ``cmd_stream:ftmo:{acc}`` + the side index
+    is linked. The actual broker close flows back on resp_stream
+    (consumed by step 3.7's response_handler).
+    """
+    service = OrderService(redis_svc)
+    requested_volume = req.volume_lots if req is not None else None
+    try:
+        oid, rid = await service.close_order(order_id, volume_lots=requested_volume)
+    except OrderValidationError as exc:
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={"error_code": exc.error_code, "message": str(exc)},
+        ) from exc
+    return OrderActionResponse(
+        order_id=oid,
+        request_id=rid,
+        status="accepted",
+        message="Close command dispatched",
+    )
+
+
+@router.post(
+    "/{order_id}/modify",
+    response_model=OrderActionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Modify SL/TP on a filled order",
+)
+async def modify_order(
+    order_id: str,
+    req: OrderModifyRequest,
+    _user: Annotated[str, Depends(get_current_user_rest)],
+    redis_svc: Annotated[RedisService, Depends(get_redis_service)],
+) -> OrderActionResponse:
+    service = OrderService(redis_svc)
+    try:
+        oid, rid = await service.modify_order(order_id, sl=req.sl, tp=req.tp)
+    except OrderValidationError as exc:
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={"error_code": exc.error_code, "message": str(exc)},
+        ) from exc
+    return OrderActionResponse(
+        order_id=oid,
+        request_id=rid,
+        status="accepted",
+        message="Modify command dispatched",
     )
