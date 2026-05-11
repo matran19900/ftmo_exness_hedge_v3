@@ -720,6 +720,39 @@ class RedisService:
         decoded = json.loads(raw)
         return decoded if isinstance(decoded, dict) else None
 
+    async def set_position_cache(
+        self,
+        order_id: str,
+        fields: dict[str, str],
+        ttl_seconds: int = _POSITION_PNL_TTL_SECONDS,
+    ) -> None:
+        """Step 3.8 unrealized-P&L snapshot.
+
+        Stored as a HASH under ``position_cache:{order_id}`` so the
+        frontend (and the future positions API in step 3.9) can do a
+        single HGETALL without a JSON decode. Sits alongside the
+        step-3.1 JSON ``position:{order_id}`` cache which is reserved
+        for the realized-history per-order snapshot model.
+
+        TTL defaults to 600s — same as ``set_position_pnl`` per docs
+        §11. A position last polled >10 minutes ago is considered
+        stale and the next position_tracker cycle refreshes it.
+        """
+        key = f"position_cache:{order_id}"
+        # HSET dict-arg type is invariant; cast to satisfy strict mypy.
+        await self._redis.hset(  # type: ignore[misc]
+            key,
+            mapping={k: str(v) for k, v in fields.items()},
+        )
+        await self._redis.expire(key, ttl_seconds)
+
+    async def get_position_cache(self, order_id: str) -> dict[str, str] | None:
+        """HGETALL ``position_cache:{order_id}`` or None on miss/expired."""
+        data = await self._redis.hgetall(f"position_cache:{order_id}")  # type: ignore[misc]
+        if not data:
+            return None
+        return dict(data)
+
     async def add_snapshot(self, order_id: str, ts_ms: int, pnl: float) -> None:
         """Append a P&L data point to the order's history ZSET.
 

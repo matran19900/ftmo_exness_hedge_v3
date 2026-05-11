@@ -27,6 +27,7 @@ from app.services import symbol_whitelist
 from app.services.broadcast import BroadcastService
 from app.services.event_handler import event_handler_loop
 from app.services.market_data import MarketDataService
+from app.services.position_tracker import position_tracker_loop
 from app.services.redis_service import RedisService
 from app.services.response_handler import response_handler_loop
 
@@ -125,6 +126,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     ftmo_accounts = await redis_svc.get_all_account_ids("ftmo")
     response_tasks: list[asyncio.Task[None]] = []
     event_tasks: list[asyncio.Task[None]] = []
+    position_tracker_tasks: list[asyncio.Task[None]] = []
     for acc in ftmo_accounts:
         response_tasks.append(
             asyncio.create_task(
@@ -138,23 +140,39 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 name=f"event_handler_{acc}",
             )
         )
+        # Step 3.8: per-account unrealized P&L loop.
+        position_tracker_tasks.append(
+            asyncio.create_task(
+                position_tracker_loop(redis_svc, broadcast, acc),
+                name=f"position_tracker_{acc}",
+            )
+        )
     app.state.response_tasks = response_tasks
     app.state.event_tasks = event_tasks
+    app.state.position_tracker_tasks = position_tracker_tasks
     logger.info(
-        "Started %d response_handler + %d event_handler tasks for FTMO accounts",
+        "Started %d response_handler + %d event_handler + %d position_tracker "
+        "tasks for FTMO accounts",
         len(response_tasks),
         len(event_tasks),
+        len(position_tracker_tasks),
     )
 
     try:
         yield
     finally:
-        # Cancel response/event handlers first so they don't try to
-        # talk to a closing Redis connection mid-flight.
-        for task in response_tasks + event_tasks:
+        # Cancel response/event/position_tracker handlers first so
+        # they don't try to talk to a closing Redis connection
+        # mid-flight.
+        for task in response_tasks + event_tasks + position_tracker_tasks:
             task.cancel()
-        if response_tasks or event_tasks:
-            await asyncio.gather(*response_tasks, *event_tasks, return_exceptions=True)
+        if response_tasks or event_tasks or position_tracker_tasks:
+            await asyncio.gather(
+                *response_tasks,
+                *event_tasks,
+                *position_tracker_tasks,
+                return_exceptions=True,
+            )
         md = app.state.market_data
         if md is not None:
             try:
