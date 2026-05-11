@@ -3,13 +3,23 @@
 Pure-function tests: each constructs a ProtoOAExecutionEvent stub and
 asserts the resulting payload dict has the right shape + values. No
 Redis or bridge needed.
+
+Step 3.5a — close_reason inference rewritten to use structured order
+metadata (``order.orderType`` + ``order.closingOrder`` +
+``deal.closePositionDetail.grossProfit``) rather than the 1-pip
+price-tolerance heuristic from step 3.5. The 8 tolerance-based tests
+from step 3.5 are deleted; replacement tests below pin the new
+structured-logic branches.
 """
 
 from __future__ import annotations
 
 import pytest
 from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAExecutionEvent
-from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
+from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+    ProtoOAExecutionType,
+    ProtoOAOrderType,
+)
 
 from ftmo_client.event_publisher import (
     _infer_close_reason,
@@ -22,13 +32,34 @@ def _exec_event(
     *,
     position_id: int | None = None,
     order_id: int | None = None,
+    order_type: int | None = None,
+    closing_order: bool | None = None,
     deal_price: float = 0.0,
     deal_ts: int = 0,
     deal_commission: int | None = None,
     position_sl: float | None = None,
     position_tp: float | None = None,
     close_gross_profit: int | None = None,
+    close_commission: int | None = None,
+    close_swap: int | None = None,
+    close_balance: int | None = None,
+    close_money_digits: int | None = None,
+    close_volume: int | None = None,
 ) -> ProtoOAExecutionEvent:
+    """Build a ProtoOAExecutionEvent stub.
+
+    Step 3.5a adds:
+      - ``order_type`` / ``closing_order``: drive the new structured
+        close_reason inference path.
+      - ``close_commission`` / ``close_swap`` / ``close_balance`` /
+        ``close_money_digits`` / ``close_volume``: populate the
+        extended fields in ``closePositionDetail`` that the new
+        ``_build_position_closed`` lifts into the event_stream payload.
+
+    Setting any close_* field implies a close-side fill — the helper
+    auto-populates ``closePositionDetail`` so the builder routes to
+    ``position_closed`` (vs ``pending_filled``).
+    """
     evt = ProtoOAExecutionEvent()
     evt.executionType = exec_type
     if position_id is not None or position_sl is not None or position_tp is not None:
@@ -38,8 +69,13 @@ def _exec_event(
             evt.position.stopLoss = position_sl
         if position_tp is not None:
             evt.position.takeProfit = position_tp
-    if order_id is not None:
-        evt.order.orderId = order_id
+    if order_id is not None or order_type is not None or closing_order is not None:
+        if order_id is not None:
+            evt.order.orderId = order_id
+        if order_type is not None:
+            evt.order.orderType = order_type
+        if closing_order is not None:
+            evt.order.closingOrder = closing_order
     if deal_price > 0:
         evt.deal.executionPrice = deal_price
         evt.deal.executionTimestamp = deal_ts
@@ -47,8 +83,31 @@ def _exec_event(
             evt.deal.commission = deal_commission
         if position_id is not None:
             evt.deal.positionId = position_id
-        if close_gross_profit is not None:
-            evt.deal.closePositionDetail.grossProfit = close_gross_profit
+        # Trigger closePositionDetail population if any close_* arg was passed.
+        close_args_set = any(
+            v is not None
+            for v in (
+                close_gross_profit,
+                close_commission,
+                close_swap,
+                close_balance,
+                close_money_digits,
+                close_volume,
+            )
+        )
+        if close_args_set:
+            cd = evt.deal.closePositionDetail
+            # closePositionDetail.grossProfit/commission/swap/balance are REQUIRED —
+            # default any unset value to 0 so the proto stays valid.
+            cd.grossProfit = close_gross_profit if close_gross_profit is not None else 0
+            cd.commission = close_commission if close_commission is not None else 0
+            cd.swap = close_swap if close_swap is not None else 0
+            cd.balance = close_balance if close_balance is not None else 0
+            cd.entryPrice = 0.0  # required field; value irrelevant to tests
+            if close_money_digits is not None:
+                cd.moneyDigits = close_money_digits
+            if close_volume is not None:
+                cd.closedVolume = close_volume
     return evt
 
 
@@ -56,13 +115,24 @@ def _exec_event(
 
 
 def test_build_event_payload_order_filled_with_close_detail_returns_position_closed() -> None:
+    """Step 3.5a builder pulls all five extended fields from
+    ``closePositionDetail`` and infers ``close_reason`` via structured
+    metadata. This test uses a STOP_LOSS_TAKE_PROFIT closing order
+    with positive grossProfit → TP hit."""
     evt = _exec_event(
         ProtoOAExecutionType.ORDER_FILLED,
         position_id=5451198,
+        order_type=ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+        closing_order=True,
         deal_price=1.08600,
         deal_ts=1735000000456,
         deal_commission=5,
         close_gross_profit=1840,
+        close_commission=-766,
+        close_swap=0,
+        close_balance=942589,
+        close_money_digits=2,
+        close_volume=13,
     )
     payload = build_event_payload(evt)
     assert payload is not None
@@ -72,7 +142,13 @@ def test_build_event_payload_order_filled_with_close_detail_returns_position_clo
     assert payload["close_price"] == "1.086"
     assert payload["close_time"] == "1735000000456"
     assert payload["realized_pnl"] == "1840"
-    assert payload["commission"] == "5"
+    # Step 3.5a: commission comes from closePositionDetail, NOT deal.commission.
+    assert payload["commission"] == "-766"
+    assert payload["swap"] == "0"
+    assert payload["balance_after_close"] == "942589"
+    assert payload["money_digits"] == "2"
+    assert payload["closed_volume"] == "13"
+    assert payload["close_reason"] == "tp"
     assert "ts_published" in payload
 
 
@@ -154,136 +230,298 @@ def test_build_event_payload_unrelated_execution_type_returns_none() -> None:
     assert build_event_payload(evt) is None
 
 
-def test_build_event_payload_commission_omitted_when_deal_missing_commission() -> None:
-    """deal.commission is OPTIONAL on the protobuf — payload tolerates absence."""
+# ---------- Step 3.5a: extended position_closed payload fields ----------
+
+
+def test_build_position_closed_includes_extended_fields() -> None:
+    """All five new fields (commission, swap, balance_after_close,
+    money_digits, closed_volume) appear in the payload as stringified
+    values pulled from closePositionDetail."""
     evt = _exec_event(
         ProtoOAExecutionType.ORDER_FILLED,
-        position_id=5451198,
+        position_id=1,
+        order_type=ProtoOAOrderType.MARKET,
+        closing_order=True,
+        deal_price=1.08,
+        deal_ts=1,
+        close_gross_profit=500,
+        close_commission=-50,
+        close_swap=-2,
+        close_balance=1_000_500,
+        close_money_digits=2,
+        close_volume=100_000,
+    )
+    payload = build_event_payload(evt)
+    assert payload is not None
+    assert payload["commission"] == "-50"
+    assert payload["swap"] == "-2"
+    assert payload["balance_after_close"] == "1000500"
+    assert payload["money_digits"] == "2"
+    assert payload["closed_volume"] == "100000"
+
+
+def test_build_position_closed_realized_pnl_equals_gross_profit() -> None:
+    """``realized_pnl`` carries ``closePositionDetail.grossProfit``
+    verbatim as a string (raw int per D-053)."""
+    evt = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=1,
+        order_type=ProtoOAOrderType.MARKET,
+        closing_order=True,
+        deal_price=1.08,
+        deal_ts=1,
+        close_gross_profit=12345,
+    )
+    payload = build_event_payload(evt)
+    assert payload is not None
+    assert payload["realized_pnl"] == "12345"
+
+
+def test_build_position_closed_uses_close_detail_commission_not_deal_commission() -> None:
+    """Per CEO direction (step 3.5a): for close events, the canonical
+    commission is ``closePositionDetail.commission`` (close-side fee),
+    NOT ``deal.commission`` (deal-level fee — separate ledger line).
+    Tests that the two values diverge AND that the payload picks the
+    closePositionDetail one."""
+    evt = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=1,
+        order_type=ProtoOAOrderType.MARKET,
+        closing_order=True,
+        deal_price=1.08,
+        deal_ts=1,
+        deal_commission=-100,  # deal-level
+        close_gross_profit=0,
+        close_commission=-766,  # close-side — should win
+    )
+    payload = build_event_payload(evt)
+    assert payload is not None
+    assert payload["commission"] == "-766"
+
+
+def test_build_position_closed_money_digits_empty_when_proto_unset() -> None:
+    """``moneyDigits`` is OPTIONAL in the protobuf. When the broker
+    omits it, payload carries empty string rather than "0" (which
+    would imply scale=1 — different semantically)."""
+    evt = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=1,
+        order_type=ProtoOAOrderType.MARKET,
+        closing_order=True,
+        deal_price=1.08,
+        deal_ts=1,
+        close_gross_profit=0,
+        # close_money_digits intentionally not passed
+    )
+    payload = build_event_payload(evt)
+    assert payload is not None
+    assert payload["money_digits"] == ""
+
+
+def test_build_position_closed_closed_volume_empty_when_proto_unset() -> None:
+    """``closedVolume`` is OPTIONAL. Empty string on absence."""
+    evt = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=1,
+        order_type=ProtoOAOrderType.MARKET,
+        closing_order=True,
+        deal_price=1.08,
+        deal_ts=1,
+        close_gross_profit=0,
+    )
+    payload = build_event_payload(evt)
+    assert payload is not None
+    assert payload["closed_volume"] == ""
+
+
+# ---------- Step 3.5a: structured close_reason inference ----------
+
+
+def test_infer_close_reason_market_closing_order_returns_manual() -> None:
+    """``orderType=MARKET`` + ``closingOrder=true`` → ``"manual"``.
+    Covers user UI close AND broker forced closes (both use MARKET
+    internally)."""
+    evt = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=1,
+        order_type=ProtoOAOrderType.MARKET,
+        closing_order=True,
         deal_price=1.08,
         deal_ts=1,
         close_gross_profit=100,
     )
-    # Don't set commission. (HasField returns False.)
-    assert not evt.deal.HasField("commission")
-    payload = build_event_payload(evt)
-    assert payload is not None
-    assert payload["commission"] == ""
+    assert _infer_close_reason(evt) == "manual"
 
 
-# ---------- close_reason inference ----------
-
-
-def test_close_reason_matches_stop_loss_within_tolerance() -> None:
-    """Close price within 1 pip of stopLoss → 'sl'."""
+def test_infer_close_reason_stop_loss_take_profit_with_positive_pnl_returns_tp() -> None:
+    """STOP_LOSS_TAKE_PROFIT + grossProfit > 0 → TP hit. CEO's sample
+    event has grossProfit=98 (positive) for a TP hit; we use the same
+    shape here."""
     evt = _exec_event(
         ProtoOAExecutionType.ORDER_FILLED,
         position_id=1,
-        position_sl=1.07000,
-        position_tp=1.09000,
-        deal_price=1.07005,  # 5 points = 0.5 pip below SL — within tolerance
+        order_type=ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+        closing_order=True,
+        deal_price=90640.27,
         deal_ts=1,
-        close_gross_profit=-100,
+        close_gross_profit=98,
     )
-    payload = build_event_payload(evt)
-    assert payload is not None
-    assert payload["close_reason"] == "sl"
+    assert _infer_close_reason(evt) == "tp"
 
 
-def test_close_reason_matches_take_profit_within_tolerance() -> None:
+def test_infer_close_reason_stop_loss_take_profit_with_negative_pnl_returns_sl() -> None:
+    """STOP_LOSS_TAKE_PROFIT + grossProfit < 0 → SL hit."""
     evt = _exec_event(
         ProtoOAExecutionType.ORDER_FILLED,
         position_id=1,
-        position_sl=1.07000,
-        position_tp=1.09000,
-        deal_price=1.08998,  # just under TP — within tolerance
+        order_type=ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+        closing_order=True,
+        deal_price=1.07,
         deal_ts=1,
-        close_gross_profit=100,
+        close_gross_profit=-150,
     )
-    payload = build_event_payload(evt)
-    assert payload is not None
-    assert payload["close_reason"] == "tp"
+    assert _infer_close_reason(evt) == "sl"
 
 
-def test_close_reason_manual_when_no_sl_no_tp_set() -> None:
-    """Position had neither SL nor TP — close must be manual or external."""
+def test_infer_close_reason_stop_loss_take_profit_with_zero_pnl_returns_unknown() -> None:
+    """SL/TP triggered at exact entry price (rare edge) → ``"unknown"``.
+    Avoids false-classifying a degenerate zero-PnL close as TP or SL."""
     evt = _exec_event(
         ProtoOAExecutionType.ORDER_FILLED,
         position_id=1,
-        deal_price=1.08000,
+        order_type=ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+        closing_order=True,
+        deal_price=1.08,
         deal_ts=1,
         close_gross_profit=0,
     )
-    payload = build_event_payload(evt)
-    assert payload is not None
-    assert payload["close_reason"] == "manual"
+    assert _infer_close_reason(evt) == "unknown"
 
 
-def test_close_reason_manual_when_close_doesnt_match_sl_or_tp() -> None:
-    """Position had SL and TP, but close price matches NEITHER → manual."""
+def test_infer_close_reason_no_closing_order_returns_unknown() -> None:
+    """``closingOrder=false`` (or unset) → event isn't a position close →
+    ``"unknown"`` regardless of orderType."""
     evt = _exec_event(
         ProtoOAExecutionType.ORDER_FILLED,
         position_id=1,
-        position_sl=1.07000,
-        position_tp=1.09000,
-        deal_price=1.08500,  # in the middle — manual close
-        deal_ts=1,
-        close_gross_profit=50,
-    )
-    payload = build_event_payload(evt)
-    assert payload is not None
-    assert payload["close_reason"] == "manual"
-
-
-def test_close_reason_sl_priority_over_tp_when_equal() -> None:
-    """Edge case: SL and TP both set to the same price (degenerate
-    operator config). SL is checked first; result is 'sl'. Just pinning
-    the order so a refactor doesn't silently change behavior."""
-    evt = _exec_event(
-        ProtoOAExecutionType.ORDER_FILLED,
-        position_id=1,
-        position_sl=1.08000,
-        position_tp=1.08000,
-        deal_price=1.08000,
-        deal_ts=1,
-        close_gross_profit=0,
-    )
-    payload = build_event_payload(evt)
-    assert payload is not None
-    assert payload["close_reason"] == "sl"
-
-
-def test_close_reason_only_sl_set_close_far_from_sl() -> None:
-    evt = _exec_event(
-        ProtoOAExecutionType.ORDER_FILLED,
-        position_id=1,
-        position_sl=1.07000,  # only SL
-        deal_price=1.08500,  # far from SL
+        order_type=ProtoOAOrderType.MARKET,
+        closing_order=False,
+        deal_price=1.08,
         deal_ts=1,
         close_gross_profit=100,
     )
+    assert _infer_close_reason(evt) == "unknown"
+
+
+def test_infer_close_reason_no_order_field_returns_unknown() -> None:
+    """Event with no ``order`` sub-message → ``"unknown"``."""
+    evt = ProtoOAExecutionEvent()
+    evt.executionType = ProtoOAExecutionType.ORDER_FILLED
+    # Don't set evt.order at all.
+    assert not evt.HasField("order")
+    assert _infer_close_reason(evt) == "unknown"
+
+
+def test_infer_close_reason_unknown_order_type_returns_unknown() -> None:
+    """LIMIT (or any non-MARKET / non-STOP_LOSS_TAKE_PROFIT) +
+    closingOrder=true → ``"unknown"``. Not observed in smoke; the
+    conservative default catches future broker behavior the parser
+    hasn't been taught."""
+    evt = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=1,
+        order_type=ProtoOAOrderType.LIMIT,
+        closing_order=True,
+        deal_price=1.08,
+        deal_ts=1,
+        close_gross_profit=100,
+    )
+    assert _infer_close_reason(evt) == "unknown"
+
+
+def test_infer_close_reason_stop_loss_take_profit_no_close_detail_returns_unknown() -> None:
+    """STOP_LOSS_TAKE_PROFIT + closingOrder=true but no
+    ``closePositionDetail`` sub-message → ``"unknown"``. Defensive
+    guard for malformed events."""
+    evt = ProtoOAExecutionEvent()
+    evt.executionType = ProtoOAExecutionType.ORDER_FILLED
+    evt.order.orderId = 1
+    evt.order.orderType = ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT
+    evt.order.closingOrder = True
+    evt.deal.executionPrice = 1.08
+    evt.deal.executionTimestamp = 1
+    # Don't touch evt.deal.closePositionDetail.
+    assert not evt.deal.HasField("closePositionDetail")
+    assert _infer_close_reason(evt) == "unknown"
+
+
+# ---------- Parameterized matrix per docs §3.6 ----------
+
+
+@pytest.mark.parametrize(
+    ("order_type", "closing", "gross_profit", "expected"),
+    [
+        (ProtoOAOrderType.MARKET, True, 100, "manual"),
+        (ProtoOAOrderType.MARKET, True, -100, "manual"),
+        (ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, True, 98, "tp"),
+        (ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, True, -150, "sl"),
+        (ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, True, 0, "unknown"),
+        (ProtoOAOrderType.LIMIT, True, 0, "unknown"),
+        (ProtoOAOrderType.STOP, True, 0, "unknown"),
+        (ProtoOAOrderType.STOP_LIMIT, True, 0, "unknown"),
+        (ProtoOAOrderType.MARKET_RANGE, True, 0, "unknown"),
+        (ProtoOAOrderType.MARKET, False, 100, "unknown"),  # closingOrder=false
+    ],
+    ids=[
+        "market-closing-profit",
+        "market-closing-loss",
+        "sltp-closing-tp",
+        "sltp-closing-sl",
+        "sltp-closing-zero",
+        "limit-closing",
+        "stop-closing",
+        "stop-limit-closing",
+        "market-range-closing",
+        "market-non-closing",
+    ],
+)
+def test_close_reason_matrix(
+    order_type: int, closing: bool, gross_profit: int, expected: str
+) -> None:
+    """Tabulated coverage of every row in
+    ``docs/ctrader-execution-events.md §3.6`` mapping table."""
+    evt = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=1,
+        order_type=order_type,
+        closing_order=closing,
+        deal_price=1.08,
+        deal_ts=1,
+        close_gross_profit=gross_profit,
+    )
+    assert _infer_close_reason(evt) == expected
+
+
+# ---------- Integration: build_event_payload routes close_reason ----------
+
+
+def test_build_event_payload_position_closed_carries_inferred_close_reason() -> None:
+    """End-to-end: build_event_payload on a STOP_LOSS_TAKE_PROFIT close
+    with negative grossProfit emits a ``position_closed`` payload with
+    ``close_reason="sl"``. This is the production call path."""
+    evt = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=5451198,
+        order_type=ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+        closing_order=True,
+        deal_price=1.07,
+        deal_ts=1,
+        close_gross_profit=-150,
+    )
     payload = build_event_payload(evt)
     assert payload is not None
-    # has_sl=True, has_tp=False, no SL match → default "manual" branch.
-    assert payload["close_reason"] == "manual"
-
-
-def test_infer_close_reason_returns_unknown_branch_inaccessible() -> None:
-    """Document that the 'unknown' value in the protocol doc is reserved
-    for cases the heuristic *can't* classify. With the current branches
-    (sl / tp / manual), no code path returns 'unknown' — every close
-    either matches SL/TP or falls into 'manual'. Test pins the
-    contract: if you later add a stricter branch (e.g. requires
-    HasField close_reason proto), make sure the 'unknown' default is
-    reachable + emitted as the protocol value."""
-    # Build a position stub manually.
-
-    class _PosStub:
-        def HasField(self, name: str) -> bool:
-            return False
-
-    # The function with no SL or no TP returns "manual" (NOT "unknown").
-    result = _infer_close_reason(_PosStub(), close_price=1.08)
-    assert result == "manual"
+    assert payload["event_type"] == "position_closed"
+    assert payload["close_reason"] == "sl"
 
 
 # ---------- ts_published presence ----------
@@ -322,6 +560,8 @@ def test_event_type_routing_parametrized(exec_type: int, expected_event_type: st
         exec_type,
         position_id=1,
         order_id=8324918,
+        order_type=ProtoOAOrderType.MARKET,
+        closing_order=True,
         deal_price=1.08,
         deal_ts=1,
         close_gross_profit=0,

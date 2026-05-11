@@ -1,7 +1,7 @@
 """Build event_stream payloads from cTrader unsolicited execution events.
 
-Step 3.5. A "solicited" execution event is one whose ``clientMsgId``
-matches a pending request the bridge sent (handled by
+Step 3.5 / 3.5a. A "solicited" execution event is one whose
+``clientMsgId`` matches a pending request the bridge sent (handled by
 ``_pending_executions`` since step 3.4b/3.4c). An "unsolicited" event
 is one that arrives without correlation — user action on the cTrader
 UI, SL/TP hit, margin call, pending order fill. These events are
@@ -14,49 +14,78 @@ This module owns only the **shape** of the payload: given a
 bridge does the I/O. Splitting the two keeps the parser logic
 synchronous and easy to test without Redis fixtures.
 
-Close-reason heuristic
-----------------------
-cTrader's protobuf does NOT expose a structured close-reason field —
-verified empirically via DESCRIPTOR inspection of
-``ProtoOADeal`` and ``ProtoOAClosePositionDetail`` (step 3.5). We
-infer the reason from the close price vs the position's stopLoss /
-takeProfit echoed in the event:
+Close-reason inference (step 3.5a)
+----------------------------------
+cTrader does NOT expose a dedicated ``closeReason`` enum field —
+verified empirically via DESCRIPTOR inspection of ``ProtoOADeal`` /
+``ProtoOAClosePositionDetail`` in step 3.5 and re-confirmed in 3.5a.
+Step 3.5 first attempted a price-tolerance heuristic (``close_price ≈
+stopLoss/takeProfit`` within one pip) which CEO flagged as brittle:
 
-  - close ≈ stopLoss  → ``"sl"``
-  - close ≈ takeProfit → ``"tp"``
-  - clientMsgId empty (always true for unsolicited) → ``"manual"``
-    (operator likely closed via the cTrader UI; could also be stop-out
-    or expiry, both of which we treat as ``"manual"`` until a future
-    smoke surfaces a distinct signature).
-  - all else (no SL/TP set + no match) → ``"unknown"``
+  - A single pip-sized absolute tolerance worked for 5-digit EURUSD.
+  - It was much narrower than one pip on 3-digit USDJPY pairs, so
+    SL/TP hits there misclassified as "manual".
+  - For non-forex (BTC, indices, commodities) an absolute tolerance
+    has no consistent meaning across the price scale.
 
-Values match the protocol enum in ``docs/05-redis-protocol.md §5``:
-``sl | tp | manual | stopout | unknown``. We do NOT emit ``stopout``
-here — distinguishing stop-out from manual close requires a separate
-signal (``ProtoOAMarginCallTriggerEvent`` or a follow-up balance
-change), out of scope for step 3.5.
+Step 3.5a replaces the heuristic with **structured order metadata**
+that cTrader DOES expose:
+
+  - ``order.orderType``      — enum: MARKET / LIMIT / STOP /
+                               STOP_LOSS_TAKE_PROFIT / MARKET_RANGE /
+                               STOP_LIMIT.
+  - ``order.closingOrder``   — bool: true when this order is closing
+                               a position (vs opening a new one).
+  - ``deal.closePositionDetail.grossProfit`` — sign distinguishes SL
+    vs TP for STOP_LOSS_TAKE_PROFIT closes (negative = SL, positive
+    = TP).
+
+Mapping table (see ``docs/ctrader-execution-events.md §3.6``):
+
+  | orderType              | closingOrder | grossProfit | reason  |
+  | ---------------------- | ------------ | ----------- | ------- |
+  | MARKET                 | true         | (any)       | manual  |
+  | STOP_LOSS_TAKE_PROFIT  | true         | > 0         | tp      |
+  | STOP_LOSS_TAKE_PROFIT  | true         | < 0         | sl      |
+  | STOP_LOSS_TAKE_PROFIT  | true         | == 0        | unknown |
+  | any                    | false        | n/a         | unknown |
+  | LIMIT / STOP / other   | true         | n/a         | unknown |
+
+CEO's canonical sample (TP hit on a BUY position, BTC-style symbol):
+
+  order.orderType      = STOP_LOSS_TAKE_PROFIT (=4)
+  order.closingOrder   = true
+  order.executionPrice = 90640.27 (slippage 1.56 vs limitPrice 90638.71)
+  deal.closePositionDetail.grossProfit = 98  → POSITIVE → "tp"
+
+The 1.56-point gap between ``executionPrice`` and ``limitPrice`` is
+broker slippage at the trigger moment; the price-tolerance heuristic
+would have missed this match. The grossProfit-sign method is robust.
+
+Limitations:
+
+  - "stopout" reason (margin call / forced close) is currently lumped
+    into "manual". cTrader uses ``orderType=MARKET`` + an additional
+    ``order.isStopOut=true`` bool for margin-call closes. Step 3.5a
+    leaves ``isStopOut`` for a future step to wire (would refine
+    "manual" → "stopout" when the flag is set).
+  - "unknown" reserved for: (a) non-classifiable orderType,
+    (b) grossProfit=0 edge case (SL/TP exactly at entry), (c) missing
+    required protobuf fields.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Any
 
 from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAExecutionEvent
-from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
+from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+    ProtoOAExecutionType,
+    ProtoOAOrderType,
+)
 
 logger = logging.getLogger(__name__)
-
-# Tolerance for matching close_price against stopLoss / takeProfit.
-# cTrader fills can drift from the requested SL/TP by a few points due
-# to spread + slippage at the trigger moment. 0.00010 (1 pip on a
-# 5-digit forex pair) is roomy enough to catch the common case
-# without false-matching genuine manual closes that happen to land
-# near the SL/TP price. For non-forex symbols (indices, metals), the
-# absolute tolerance is still meaningful relative to the price scale
-# we'd see at the broker.
-_SL_TP_PRICE_TOLERANCE = 1e-4
 
 
 def build_event_payload(event: ProtoOAExecutionEvent) -> dict[str, str] | None:
@@ -96,19 +125,55 @@ def _now_ms() -> str:
 
 
 def _build_position_closed(event: ProtoOAExecutionEvent) -> dict[str, str]:
+    """Build the ``position_closed`` event_stream payload.
+
+    Step 3.5a — extended payload. Five new fields lifted out of
+    ``deal.closePositionDetail`` so the server's response_handler /
+    consumer doesn't have to re-query cTrader for the close
+    accounting:
+
+      - ``commission``         : close-side fee (from
+                                 ``closePositionDetail.commission``,
+                                 NOT ``deal.commission`` — they're
+                                 separate ledger lines per CEO).
+      - ``swap``               : accumulated swap charges on the
+                                 position over its lifetime.
+      - ``balance_after_close``: account balance after this close
+                                 settles (raw int per D-053).
+      - ``money_digits``       : exponent for grossProfit / swap /
+                                 commission / balance_after_close
+                                 (per-account, typically 2).
+      - ``closed_volume``      : volume that actually closed (cTrader
+                                 wire units; consumer scales by
+                                 ``lot_size`` for the symbol).
+
+    All money fields are raw cTrader integers — the consumer scales
+    by ``money_digits``. Volume is raw cTrader wire units.
+    """
     pos = event.position
     deal = event.deal
-    close_price = float(deal.executionPrice)
-    close_reason = _infer_close_reason(pos, close_price)
+    close_detail = deal.closePositionDetail
     return {
         "event_type": "position_closed",
         "broker_order_id": str(int(pos.positionId)),
         "position_id": str(int(pos.positionId)),
-        "close_price": str(close_price),
+        "close_price": str(float(deal.executionPrice)),
         "close_time": str(int(deal.executionTimestamp)),
-        "realized_pnl": str(int(deal.closePositionDetail.grossProfit)),
-        "commission": str(int(deal.commission)) if deal.HasField("commission") else "",
-        "close_reason": close_reason,
+        # realized_pnl == closePositionDetail.grossProfit (raw int, D-053)
+        "realized_pnl": str(int(close_detail.grossProfit)),
+        # Step 3.5a: prefer closePositionDetail.commission over
+        # deal.commission for close events — they're distinct ledger
+        # lines (deal-level vs position-close-level). CEO direction.
+        "commission": str(int(close_detail.commission)),
+        "swap": str(int(close_detail.swap)),
+        "balance_after_close": str(int(close_detail.balance)),
+        "money_digits": str(int(close_detail.moneyDigits))
+        if close_detail.HasField("moneyDigits")
+        else "",
+        "closed_volume": str(int(close_detail.closedVolume))
+        if close_detail.HasField("closedVolume")
+        else "",
+        "close_reason": _infer_close_reason(event),
         "ts_published": _now_ms(),
     }
 
@@ -168,31 +233,48 @@ def _build_order_cancelled(event: ProtoOAExecutionEvent) -> dict[str, str]:
     }
 
 
-def _infer_close_reason(position: Any, close_price: float) -> str:
-    """Heuristic for unsolicited closes. See module docstring for the
-    reasoning. Returns one of the protocol enum values from
-    ``docs/05-redis-protocol.md §5``: ``sl | tp | manual | unknown``
-    (``stopout`` is not emitted by this path — needs a separate
-    signal).
+def _infer_close_reason(event: ProtoOAExecutionEvent) -> str:
+    """Classify a close via cTrader's structured order metadata.
 
-    ``position`` is a ProtoOAPosition proto; we accept ``Any`` so this
-    helper can be exercised with stubs.
+    Returns one of the protocol enum values per
+    ``docs/05-redis-protocol.md §5``: ``sl | tp | manual | unknown``.
+    ``stopout`` is not emitted here — see module docstring for the
+    ``isStopOut`` follow-up path.
+
+    Step 3.5a contract:
+      1. ``event.order`` must be present AND ``order.closingOrder ==
+         true``. Otherwise the event isn't a position close (open-side
+         fill, modify, etc.) → ``"unknown"``.
+      2. ``order.orderType == MARKET`` → ``"manual"`` (user UI close
+         OR broker forced close; both use MARKET internally).
+      3. ``order.orderType == STOP_LOSS_TAKE_PROFIT`` →
+         ``deal.closePositionDetail.grossProfit`` sign decides:
+            > 0 → ``"tp"``, < 0 → ``"sl"``, == 0 → ``"unknown"``.
+         The grossProfit method is preferred over comparing
+         ``order.executionPrice`` to ``order.stopPrice`` /
+         ``order.limitPrice`` because (a) cTrader fills can slip
+         several points off the SL/TP trigger price, (b) grossProfit
+         comes from cTrader's own bookkeeping (single source of truth).
+      4. Other orderType (LIMIT, STOP, MARKET_RANGE, STOP_LIMIT) with
+         ``closingOrder=true`` → ``"unknown"``. Not observed in
+         smoke; conservative default.
     """
-    has_sl = position.HasField("stopLoss")
-    has_tp = position.HasField("takeProfit")
+    if not event.HasField("order"):
+        return "unknown"
+    order = event.order
+    if not (order.HasField("closingOrder") and order.closingOrder):
+        return "unknown"
 
-    if has_sl and abs(close_price - float(position.stopLoss)) <= _SL_TP_PRICE_TOLERANCE:
-        return "sl"
-    if has_tp and abs(close_price - float(position.takeProfit)) <= _SL_TP_PRICE_TOLERANCE:
-        return "tp"
-    if not has_sl and not has_tp:
-        # Position had no SL/TP set at all; close must be manual or
-        # external. Distinguishable from "unknown" because we *know*
-        # the trigger wasn't an SL/TP hit.
+    order_type = int(order.orderType)
+    if order_type == ProtoOAOrderType.MARKET:
         return "manual"
-    # Has SL or TP, but close_price didn't match either within
-    # tolerance → operator closed manually (cTrader UI), or a margin
-    # call closed the position at market. We default to "manual"; a
-    # future step can layer on ProtoOAMarginCallTriggerEvent
-    # correlation to upgrade specific closes to "stopout".
-    return "manual"
+    if order_type == ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT:
+        if not event.deal.HasField("closePositionDetail"):
+            return "unknown"
+        gross_profit = int(event.deal.closePositionDetail.grossProfit)
+        if gross_profit > 0:
+            return "tp"
+        if gross_profit < 0:
+            return "sl"
+        return "unknown"
+    return "unknown"

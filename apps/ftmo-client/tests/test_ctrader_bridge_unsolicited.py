@@ -42,13 +42,23 @@ def _exec_event(
     *,
     position_id: int | None = None,
     order_id: int | None = None,
+    order_type: int | None = None,
+    closing_order: bool | None = None,
     deal_price: float = 0.0,
     deal_ts: int = 0,
     deal_commission: int | None = None,
     position_sl: float | None = None,
     position_tp: float | None = None,
     close_gross_profit: int | None = None,
+    close_commission: int | None = None,
+    close_swap: int | None = None,
+    close_balance: int | None = None,
+    close_money_digits: int | None = None,
+    close_volume: int | None = None,
 ) -> ProtoOAExecutionEvent:
+    """Step 3.5a: order_type + closing_order drive the new structured
+    close_reason inference. closePositionDetail required-field
+    defaults are auto-populated so the proto stays valid."""
     evt = ProtoOAExecutionEvent()
     evt.executionType = exec_type
     if position_id is not None or position_sl is not None or position_tp is not None:
@@ -58,8 +68,13 @@ def _exec_event(
             evt.position.stopLoss = position_sl
         if position_tp is not None:
             evt.position.takeProfit = position_tp
-    if order_id is not None:
-        evt.order.orderId = order_id
+    if order_id is not None or order_type is not None or closing_order is not None:
+        if order_id is not None:
+            evt.order.orderId = order_id
+        if order_type is not None:
+            evt.order.orderType = order_type
+        if closing_order is not None:
+            evt.order.closingOrder = closing_order
     if deal_price > 0:
         evt.deal.executionPrice = deal_price
         evt.deal.executionTimestamp = deal_ts
@@ -67,8 +82,28 @@ def _exec_event(
             evt.deal.commission = deal_commission
         if position_id is not None:
             evt.deal.positionId = position_id
-        if close_gross_profit is not None:
-            evt.deal.closePositionDetail.grossProfit = close_gross_profit
+        close_args_set = any(
+            v is not None
+            for v in (
+                close_gross_profit,
+                close_commission,
+                close_swap,
+                close_balance,
+                close_money_digits,
+                close_volume,
+            )
+        )
+        if close_args_set:
+            cd = evt.deal.closePositionDetail
+            cd.grossProfit = close_gross_profit if close_gross_profit is not None else 0
+            cd.commission = close_commission if close_commission is not None else 0
+            cd.swap = close_swap if close_swap is not None else 0
+            cd.balance = close_balance if close_balance is not None else 0
+            cd.entryPrice = 0.0
+            if close_money_digits is not None:
+                cd.moneyDigits = close_money_digits
+            if close_volume is not None:
+                cd.closedVolume = close_volume
     return evt
 
 
@@ -141,8 +176,15 @@ async def test_on_message_publishes_position_closed_for_unsolicited_close(
     patch_extract: None,
 ) -> None:
     """User closed on cTrader UI: no clientMsgId, ORDER_FILLED with
-    closePositionDetail. Bridge publishes position_closed to
-    event_stream:ftmo:{acc}."""
+    ``order.orderType=MARKET`` + ``closingOrder=true`` +
+    ``closePositionDetail``. Bridge publishes position_closed to
+    event_stream:ftmo:{acc} with ``close_reason="manual"`` per the
+    step-3.5a structured-logic inference.
+    """
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (  # noqa: PLC0415
+        ProtoOAOrderType,
+    )
+
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     bridge = _make_bridge(redis)
     bridge._loop = asyncio.get_running_loop()
@@ -150,9 +192,11 @@ async def test_on_message_publishes_position_closed_for_unsolicited_close(
     closed = _exec_event(
         ProtoOAExecutionType.ORDER_FILLED,
         position_id=5451198,
+        order_type=ProtoOAOrderType.MARKET,  # MARKET + closing → "manual"
+        closing_order=True,
         position_sl=1.07000,
         position_tp=1.09000,
-        deal_price=1.08000,  # between SL and TP → manual close
+        deal_price=1.08000,
         deal_ts=1735000000456,
         deal_commission=5,
         close_gross_profit=1840,
