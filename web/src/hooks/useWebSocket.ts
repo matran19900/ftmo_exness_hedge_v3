@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef } from 'react'
 import type {
   WsCandleMessage,
   WsClientMessage,
+  WsOrderUpdatedMessage,
+  WsPositionEventMessage,
+  WsPositionsTickMessage,
   WsServerMessage,
   WsTickMessage,
 } from '../api/client'
@@ -76,6 +79,49 @@ export function useWebSocket(): UseWebSocketResult {
 
     explicitCloseRef.current = false
 
+    // Step 3.10: positions channel handlers. Pulled into local
+    // functions so the onmessage switch stays readable.
+    const handlePositionsChannel = (msg: WsPositionsTickMessage | WsPositionEventMessage) => {
+      const store = useAppStore.getState()
+      if (msg.data.type === 'positions_tick') {
+        // The batched envelope carries N position updates. The store
+        // merges each into the existing positions array; rows for
+        // order_ids not in the array are dropped (next REST refresh
+        // will pull them).
+        for (const p of msg.data.positions) {
+          store.upsertPositionTick({
+            order_id: p.order_id,
+            symbol: p.symbol,
+            current_price: String(p.current_price),
+            unrealized_pnl: p.unrealized_pnl,
+            is_stale: p.is_stale ? 'true' : 'false',
+            tick_age_ms: String(p.tick_age_ms),
+          })
+        }
+      } else if (msg.data.type === 'position_event') {
+        // ``closed`` removes the position from the live list;
+        // ``modified`` / ``pending_filled`` will be reflected via
+        // the next REST refresh of the orders table (no immediate
+        // store mutation here to keep the contract narrow).
+        if (msg.data.event_type === 'closed') {
+          store.removePosition(msg.data.order_id)
+        }
+      }
+    }
+
+    const handleOrdersChannel = (msg: WsOrderUpdatedMessage) => {
+      const store = useAppStore.getState()
+      if (msg.data.type === 'order_updated') {
+        store.upsertOrder(msg.data)
+        // If the broadcast says the order went to closed, drop it
+        // from the live-positions list — the next history REST
+        // refresh will pull the close-detail fields.
+        if (msg.data.p_status === 'closed' || msg.data.status === 'closed') {
+          store.removePosition(msg.data.order_id)
+        }
+      }
+    }
+
     const connect = () => {
       if (reconnectTimerRef.current !== null) {
         clearTimeout(reconnectTimerRef.current)
@@ -108,6 +154,23 @@ export function useWebSocket(): UseWebSocketResult {
             } satisfies WsClientMessage)
           )
         }
+        // Step 3.10: subscribe to the live-positions broadcast
+        // channel emitted by step-3.8's position_tracker_loop. The
+        // server-side BroadcastService.VALID_CHANNEL_PREFIXES allows
+        // exact-match ``"positions"``. We also speculatively
+        // subscribe to ``"orders"`` — at the time of writing the
+        // server WS handler hadn't whitelisted that channel, so the
+        // subscribe will be acknowledged with an error message
+        // (logged + ignored). The redundant subscribe is harmless
+        // and keeps the client future-proof if step 3.14 opens the
+        // channel; for now we rely on the next REST refresh to
+        // pick up ``order_updated`` events.
+        ws.send(
+          JSON.stringify({
+            type: 'subscribe',
+            channels: ['positions', 'orders'],
+          } satisfies WsClientMessage)
+        )
       }
 
       ws.onmessage = (event) => {
@@ -128,6 +191,10 @@ export function useWebSocket(): UseWebSocketResult {
               }
             } else if (msg.channel.startsWith('candles:')) {
               candleHandlerRef.current?.(msg as WsCandleMessage)
+            } else if (msg.channel === 'positions') {
+              handlePositionsChannel(msg as WsPositionsTickMessage | WsPositionEventMessage)
+            } else if (msg.channel === 'orders') {
+              handleOrdersChannel(msg as WsOrderUpdatedMessage)
             }
             return
           }

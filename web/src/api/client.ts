@@ -162,6 +162,169 @@ export async function calculateVolume(
   return response.data
 }
 
+// ----- Orders (step 3.6 + 3.9) -----
+
+export interface Order {
+  order_id: string
+  pair_id: string
+  ftmo_account_id: string
+  exness_account_id: string
+  symbol: string
+  side: 'buy' | 'sell'
+  order_type: 'market' | 'limit' | 'stop'
+  // Volume on the order row is stored per leg (p_volume_lots is the
+  // authoritative server side from step 3.6 onward). Both fields
+  // optional in the type because various step writers populate
+  // different subsets — components prefer p_volume_lots when set.
+  volume_lots?: string
+  p_volume_lots?: string
+  sl_price?: string
+  tp_price?: string
+  entry_price?: string
+  status: string
+  p_status: string
+  s_status?: string
+  p_broker_order_id?: string
+  p_fill_price?: string
+  // Step 3.7 writes p_executed_at on fill (NOT p_fill_time per
+  // OrderHash schema in server/app/services/redis_service.py).
+  p_executed_at?: string
+  p_commission?: string
+  p_close_price?: string
+  // Step 3.7 writes p_closed_at (NOT p_close_time).
+  p_closed_at?: string
+  p_realized_pnl?: string
+  p_close_reason?: string
+  // Step 3.4a + 3.7 SL/TP-attach warning fields.
+  p_sl_tp_warning?: string
+  p_sl_tp_warning_msg?: string
+  // Step 3.7 error reporting.
+  p_error_code?: string
+  p_error_msg?: string
+  // Step 3.5b reconstructed-from-deal-history marker.
+  p_reconstructed?: string
+  // Step 3.5a extended close-detail fields.
+  p_swap?: string
+  p_balance_after_close?: string
+  p_money_digits?: string
+  p_closed_volume?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface OrderListResponse {
+  orders: Order[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface OrderDetailResponse {
+  order: Order
+}
+
+export interface OrderActionResponse {
+  order_id: string
+  request_id: string
+  status: 'accepted'
+  message: string
+}
+
+export interface ListOrdersParams {
+  status?: string
+  symbol?: string
+  account_id?: string
+  limit?: number
+  offset?: number
+}
+
+export async function listOrders(params?: ListOrdersParams): Promise<OrderListResponse> {
+  const response = await apiClient.get<OrderListResponse>('/orders', { params })
+  return response.data
+}
+
+export async function getOrder(orderId: string): Promise<OrderDetailResponse> {
+  const response = await apiClient.get<OrderDetailResponse>(`/orders/${orderId}`)
+  return response.data
+}
+
+export async function closeOrder(
+  orderId: string,
+  volumeLots?: number
+): Promise<OrderActionResponse> {
+  const body: { volume_lots?: number } = volumeLots !== undefined ? { volume_lots: volumeLots } : {}
+  const response = await apiClient.post<OrderActionResponse>(`/orders/${orderId}/close`, body)
+  return response.data
+}
+
+export async function modifyOrder(
+  orderId: string,
+  sl?: number | null,
+  tp?: number | null
+): Promise<OrderActionResponse> {
+  const body: { sl?: number | null; tp?: number | null } = {}
+  if (sl !== undefined) body.sl = sl
+  if (tp !== undefined) body.tp = tp
+  const response = await apiClient.post<OrderActionResponse>(`/orders/${orderId}/modify`, body)
+  return response.data
+}
+
+// ----- Positions (step 3.9) -----
+
+export interface Position {
+  order_id: string
+  symbol: string
+  side: 'buy' | 'sell' | string
+  volume_lots: string
+  entry_price: string
+  current_price: string
+  unrealized_pnl: string
+  money_digits: string
+  is_stale: string
+  tick_age_ms: string
+  computed_at: string
+  // Static overlay from order row.
+  sl_price?: string
+  tp_price?: string
+  p_executed_at?: string
+}
+
+export interface PositionListResponse {
+  positions: Position[]
+  total: number
+}
+
+export interface ListPositionsParams {
+  account_id?: string
+  symbol?: string
+}
+
+export async function listPositions(params?: ListPositionsParams): Promise<PositionListResponse> {
+  const response = await apiClient.get<PositionListResponse>('/positions', { params })
+  return response.data
+}
+
+// ----- History (step 3.9) -----
+
+export interface HistoryListResponse {
+  history: Order[]
+  total: number
+}
+
+export interface ListHistoryParams {
+  from_ts?: number
+  to_ts?: number
+  symbol?: string
+  account_id?: string
+  limit?: number
+  offset?: number
+}
+
+export async function listHistory(params?: ListHistoryParams): Promise<HistoryListResponse> {
+  const response = await apiClient.get<HistoryListResponse>('/history', { params })
+  return response.data
+}
+
 // ----- WebSocket messages (server protocol from docs/08-server-api.md §9) -----
 
 export interface WsTickMessage {
@@ -196,7 +359,54 @@ export interface WsErrorMessage {
   detail: string
 }
 
-export type WsServerMessage = WsTickMessage | WsCandleMessage | WsPingMessage | WsErrorMessage
+// Step 3.7/3.8: order_updated + position_event + positions_tick broadcasts
+// over the `orders` / `positions` channels. Channel names are literals
+// (not prefix-stripped like ticks:/candles:) per BroadcastService's
+// docstring.
+
+export interface WsOrderUpdatedMessage {
+  channel: 'orders'
+  data: {
+    type: 'order_updated'
+    order_id: string
+  } & Partial<Order>
+}
+
+export interface WsPositionsTickMessage {
+  channel: 'positions'
+  data: {
+    type: 'positions_tick'
+    account_id: string
+    ts: number
+    positions: {
+      order_id: string
+      symbol: string
+      current_price: string | number
+      unrealized_pnl: string
+      is_stale: boolean
+      tick_age_ms: number
+    }[]
+  }
+}
+
+export interface WsPositionEventMessage {
+  channel: 'positions'
+  data: {
+    type: 'position_event'
+    event_type: 'closed' | 'modified' | 'pending_filled' | string
+    order_id: string
+    [k: string]: unknown
+  }
+}
+
+export type WsServerMessage =
+  | WsTickMessage
+  | WsCandleMessage
+  | WsPingMessage
+  | WsErrorMessage
+  | WsOrderUpdatedMessage
+  | WsPositionsTickMessage
+  | WsPositionEventMessage
 
 export type WsClientMessage =
   | { type: 'subscribe'; channels: string[] }

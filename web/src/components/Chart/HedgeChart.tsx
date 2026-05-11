@@ -12,7 +12,6 @@ import {
 } from 'lightweight-charts'
 import { useEffect, useRef, useState } from 'react'
 import { getOhlc, type Candle, type Timeframe, type WsCandleMessage } from '../../api/client'
-import { useWebSocket } from '../../hooks/useWebSocket'
 import { useAppStore } from '../../store'
 import { ChartContextMenu } from './ChartContextMenu'
 import { SearchSymbolPicker } from './SearchSymbolPicker'
@@ -26,7 +25,20 @@ interface TrackedCandle {
   close: number
 }
 
-export function HedgeChart() {
+type CandleUpdateHandler = (msg: WsCandleMessage) => void
+
+export interface HedgeChartProps {
+  /**
+   * Step 3.10: the chart no longer owns its own WebSocket — the
+   * single shared connection lives in ``MainPage`` and passes the
+   * register/unregister handle down here. The chart wires its
+   * candle-patch reducer via this function on mount and clears it
+   * on unmount.
+   */
+  registerCandleHandler: (handler: CandleUpdateHandler | null) => void
+}
+
+export function HedgeChart({ registerCandleHandler }: HedgeChartProps) {
   const selectedSymbol = useAppStore((s) => s.selectedSymbol)
   const setSelectedSymbol = useAppStore((s) => s.setSelectedSymbol)
   const selectedTimeframe = useAppStore((s) => s.selectedTimeframe) as Timeframe
@@ -56,8 +68,6 @@ export function HedgeChart() {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; price: number } | null>(
     null
   )
-
-  const { registerCandleHandler } = useWebSocket()
 
   // Create the chart instance once on mount; updates flow through setData() so
   // the chart never has to be torn down on symbol/timeframe changes.

@@ -1,9 +1,18 @@
+import { useWebSocket } from '../hooks/useWebSocket'
 import { HedgeChart } from './Chart/HedgeChart'
 import { Header } from './Header/Header'
 import { HedgeOrderForm } from './OrderForm/HedgeOrderForm'
 import { PositionList } from './PositionList/PositionList'
 
 export function MainPage() {
+  // Step 3.10: own the single shared WebSocket at the layout level.
+  // Subscriptions (ticks/candles for the chart, positions for live
+  // P&L, orders for state changes) all flow through this one
+  // connection. ``registerCandleHandler`` is passed down to
+  // ``HedgeChart`` so the chart can wire its handle-candle reducer
+  // into the central onmessage dispatcher.
+  const { registerCandleHandler } = useWebSocket()
+
   return (
     <div className="h-screen flex flex-col bg-gray-50 min-w-[1280px]">
       <Header />
@@ -12,7 +21,7 @@ export function MainPage() {
         {/* Left 70%: chart on top, position list below. */}
         <div className="w-[70%] flex flex-col gap-2 p-2 pr-1 min-h-0 overflow-hidden">
           <div className="flex-1 min-h-0">
-            <HedgeChart />
+            <HedgeChart registerCandleHandler={registerCandleHandler} />
           </div>
           <div className="h-[35%] min-h-0">
             <PositionList />

@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
+import type { Order, Position } from '../api/client'
 
 export interface LatestTick {
   bid: number | null
@@ -10,6 +11,11 @@ export interface LatestTick {
 export type WsState = 'disconnected' | 'connecting' | 'connected'
 
 export type OrderSide = 'buy' | 'sell'
+
+// Cap the history list so a long-running session doesn't grow the
+// in-memory array unboundedly. 200 closed orders covers a typical
+// week; the History tab can paginate beyond that via REST refresh.
+const HISTORY_MAX = 200
 
 export interface AppState {
   token: string | null
@@ -65,6 +71,27 @@ export interface AppState {
   // persisted (runtime).
   volumeReady: boolean
   setVolumeReady: (ready: boolean) => void
+
+  // ----- Step 3.10: server-derived order/position state -----
+  //
+  // These slices are populated from initial REST loads (PositionList
+  // mount) and kept in sync by `useWebSocket` consuming the
+  // `positions` channel. Not persisted — Zustand's
+  // ``partialize`` whitelist deliberately excludes them so a stale
+  // localStorage snapshot can't shadow live server state on reload.
+
+  positions: Position[]
+  setPositions: (positions: Position[]) => void
+  upsertPositionTick: (update: Partial<Position> & { order_id: string }) => void
+  removePosition: (orderId: string) => void
+
+  orders: Order[]
+  setOrders: (orders: Order[]) => void
+  upsertOrder: (update: Partial<Order> & { order_id: string }) => void
+
+  history: Order[]
+  setHistory: (history: Order[]) => void
+  prependHistory: (order: Order) => void
 }
 
 export const useAppStore = create<AppState>()(
@@ -109,6 +136,61 @@ export const useAppStore = create<AppState>()(
 
       volumeReady: false,
       setVolumeReady: (volumeReady) => set({ volumeReady }),
+
+      // ----- Step 3.10 server-derived slices -----
+
+      positions: [],
+      setPositions: (positions) => set({ positions }),
+      // Merge a tick-level update into an existing position. If the
+      // order_id isn't in the current list, drop the update — the
+      // next REST refresh (or a future positions_tick that includes
+      // the order) will pull it in. This avoids broadcasting orphan
+      // rows from delayed events.
+      upsertPositionTick: (update) =>
+        set((state) => {
+          const idx = state.positions.findIndex((p) => p.order_id === update.order_id)
+          if (idx === -1) return state
+          const merged = { ...state.positions[idx], ...update } as Position
+          const next = state.positions.slice()
+          next[idx] = merged
+          return { positions: next }
+        }),
+      removePosition: (orderId) =>
+        set((state) => ({
+          positions: state.positions.filter((p) => p.order_id !== orderId),
+        })),
+
+      orders: [],
+      setOrders: (orders) => set({ orders }),
+      upsertOrder: (update) =>
+        set((state) => {
+          const idx = state.orders.findIndex((o) => o.order_id === update.order_id)
+          if (idx === -1) {
+            // Unknown order_id (e.g. a fill arriving for an order the
+            // current session never created). Prepend; missing
+            // required fields will read as `undefined` until the next
+            // REST refresh fills them.
+            const placeholder = {
+              ...update,
+              status: update.status ?? '',
+              p_status: update.p_status ?? '',
+              created_at: update.created_at ?? '',
+              updated_at: update.updated_at ?? '',
+            } as Order
+            return { orders: [placeholder, ...state.orders] }
+          }
+          const merged = { ...state.orders[idx], ...update } as Order
+          const next = state.orders.slice()
+          next[idx] = merged
+          return { orders: next }
+        }),
+
+      history: [],
+      setHistory: (history) => set({ history }),
+      prependHistory: (order) =>
+        set((state) => ({
+          history: [order, ...state.history].slice(0, HISTORY_MAX),
+        })),
     }),
     {
       name: 'ftmo-hedge-store',
