@@ -16,3 +16,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["hedger_shared*"]
+
+# Ship the PEP 561 marker so mypy treats hedger_shared as a typed
+# package downstream (server + ftmo-client + future Exness client).
+# Without this, an editable install drops py.typed and mypy reports
+# `Cannot find implementation or library stub for module …` on every
+# hedger_shared import.
+[tool.setuptools.package-data]
+hedger_shared = ["py.typed"]

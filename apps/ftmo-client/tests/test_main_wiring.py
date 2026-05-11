@@ -12,7 +12,7 @@ from typing import Any
 
 import fakeredis.aioredis
 import pytest
-from hedger_shared.ctrader_oauth import TokenResponse  # type: ignore[import-not-found]
+from hedger_shared.ctrader_oauth import TokenResponse
 
 from ftmo_client import main as main_module
 from ftmo_client.config import FtmoClientSettings

@@ -6,7 +6,7 @@ import time
 
 import fakeredis.aioredis
 import pytest
-from hedger_shared.ctrader_oauth import TokenResponse  # type: ignore[import-not-found]
+from hedger_shared.ctrader_oauth import TokenResponse
 
 from ftmo_client.oauth_storage import (
     TokenData,

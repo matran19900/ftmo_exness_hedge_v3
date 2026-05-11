@@ -17,7 +17,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
-from hedger_shared.ctrader_oauth import (  # type: ignore[import-not-found]
+from hedger_shared.ctrader_oauth import (
     build_authorization_url,
     exchange_code_for_token,
     fetch_trading_accounts,

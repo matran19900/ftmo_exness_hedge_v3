@@ -17,7 +17,7 @@ import time
 from typing import TypedDict
 
 import redis.asyncio as redis_asyncio
-from hedger_shared.ctrader_oauth import TokenResponse  # type: ignore[import-not-found]
+from hedger_shared.ctrader_oauth import TokenResponse
 
 
 class TokenData(TypedDict):
