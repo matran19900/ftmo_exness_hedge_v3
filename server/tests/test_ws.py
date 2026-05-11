@@ -134,6 +134,73 @@ def test_ws_unsubscribe_removes_from_broadcast(
         assert broadcast_svc.channel_subscriber_count("ticks:EURUSD") == 0
 
 
+# ---------- step 3.10a: "orders" channel whitelist ----------
+
+
+def test_ws_subscribe_orders_channel_accepted(
+    ws_test_client: TestClient, jwt_token: str, broadcast_svc: BroadcastService
+) -> None:
+    """step 3.10a: ``orders`` is the channel response_handler +
+    event_handler publish to. Must be in the whitelist so the
+    frontend can subscribe and receive ``order_updated`` broadcasts."""
+    with ws_test_client.websocket_connect(f"/ws?token={jwt_token}") as ws:
+        ws.send_json({"type": "subscribe", "channels": ["orders"]})
+        # Trigger a round-trip with an INVALID subscribe so we can
+        # confirm the prior valid subscribe was processed (TestClient
+        # send_json is fire-and-forget).
+        ws.send_json({"type": "subscribe", "channels": ["garbage:foo"]})
+        msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert "Invalid channels" in msg["detail"]
+        assert broadcast_svc.channel_subscriber_count("orders") == 1
+    assert broadcast_svc.channel_subscriber_count("orders") == 0
+
+
+def test_ws_subscribe_positions_channel_still_accepted(
+    ws_test_client: TestClient, jwt_token: str, broadcast_svc: BroadcastService
+) -> None:
+    """Regression: ``positions`` was already in the whitelist; the
+    step-3.10a addition of ``orders`` must not have shifted the
+    exact-match logic."""
+    with ws_test_client.websocket_connect(f"/ws?token={jwt_token}") as ws:
+        ws.send_json({"type": "subscribe", "channels": ["positions"]})
+        ws.send_json({"type": "subscribe", "channels": ["bogus:foo"]})
+        msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert broadcast_svc.channel_subscriber_count("positions") == 1
+    assert broadcast_svc.channel_subscriber_count("positions") == 0
+
+
+def test_ws_subscribe_orders_and_positions_mixed_both_accepted(
+    ws_test_client: TestClient, jwt_token: str, broadcast_svc: BroadcastService
+) -> None:
+    """step-3.10 frontend sends a single ``{channels: ["positions",
+    "orders"]}`` subscribe on each (re)connect. Both must land."""
+    with ws_test_client.websocket_connect(f"/ws?token={jwt_token}") as ws:
+        ws.send_json({"type": "subscribe", "channels": ["positions", "orders"]})
+        ws.send_json({"type": "subscribe", "channels": ["bogus:foo"]})
+        msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert broadcast_svc.channel_subscriber_count("orders") == 1
+        assert broadcast_svc.channel_subscriber_count("positions") == 1
+    assert broadcast_svc.channel_subscriber_count("orders") == 0
+    assert broadcast_svc.channel_subscriber_count("positions") == 0
+
+
+def test_ws_subscribe_ticks_prefix_still_accepted(
+    ws_test_client: TestClient, jwt_token: str, broadcast_svc: BroadcastService
+) -> None:
+    """Regression: the prefix-match branch (``ticks:EURUSD``
+    matches ``ticks:``) must still work after adding the exact-match
+    ``orders`` entry to the tuple."""
+    with ws_test_client.websocket_connect(f"/ws?token={jwt_token}") as ws:
+        ws.send_json({"type": "subscribe", "channels": ["ticks:EURUSD"]})
+        ws.send_json({"type": "subscribe", "channels": ["bogus:foo"]})
+        msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert broadcast_svc.channel_subscriber_count("ticks:EURUSD") == 1
+
+
 # ---------- set_symbol ----------
 
 
