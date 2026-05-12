@@ -3,6 +3,7 @@ import toast from 'react-hot-toast'
 import { createOrder, formatOrderError } from '../../api/client'
 import { validateSideDirection } from '../../lib/orderValidation'
 import { useAppStore } from '../../store'
+import { OrderTypeSelector } from './OrderTypeSelector'
 import { PairPicker } from './PairPicker'
 import { PriceInput } from './PriceInput'
 import { RiskAmountInput } from './RiskAmountInput'
@@ -12,20 +13,32 @@ import { VolumeCalculator } from './VolumeCalculator'
 /**
  * Hedge order form.
  *
- * Phase 3 / step 3.11: submit posts to ``POST /api/orders`` (FTMO
- * leg only — Phase 4 cascades the Exness leg). Order type is
- * fixed to ``"market"`` in the wire payload: the Entry input drives
- * volume-calculator math (SL distance + risk-based sizing) but
- * the broker is asked to fill at market, so ``entry_price`` ships
- * as ``0`` and the server uses bid/ask for direction validation.
+ * Phase 3 / step 3.11 wired POST /api/orders as market-only. Step
+ * 3.12b adds an Order Type segmented selector (Market / Limit /
+ * Stop) and rewires the Entry input to behave per type:
+ *
+ *  - Market: Entry input is hidden; ``entryPrice`` auto-populates
+ *    from the throttled tick (ask for BUY, bid for SELL) so the
+ *    volume calculator still has an entry value to size against.
+ *    Submit ships ``entry_price: 0`` so the server uses live
+ *    bid/ask for direction validation (D-110 unchanged for market).
+ *  - Limit: Entry input visible + required; operator-supplied
+ *    price ships through. Preflight: BUY entry must be < live ask,
+ *    SELL entry must be > live bid (else cTrader would fire it
+ *    immediately as market).
+ *  - Stop: Entry input visible + required. Preflight: BUY entry
+ *    must be > live ask, SELL entry must be < live bid (the
+ *    breakout entry direction).
+ *
+ * Manual volume override (Phase 2 ``manualVolumePrimary``) is
+ * preserved across all three types — once the operator pins a
+ * volume, throttled-tick entry refreshes don't bump it.
  *
  * After a successful 202 the server's ``response_handler`` (step
  * 3.7) consumes the eventual cTrader fill on resp_stream and
  * broadcasts an ``order_updated`` message on the ``orders`` WS
- * channel (step 3.10a unblocked the whitelist). The
- * ``useWebSocket`` hook calls ``upsertOrder`` and the Open tab
- * picks the row up reactively — no manual refresh needed in the
- * form.
+ * channel. The ``useWebSocket`` hook calls ``upsertOrder`` and the
+ * Open tab picks the row up reactively.
  */
 export function HedgeOrderForm() {
   const selectedPairId = useAppStore((s) => s.selectedPairId)
@@ -43,6 +56,8 @@ export function HedgeOrderForm() {
   const effectiveVolumeLots = useAppStore((s) => s.effectiveVolumeLots)
   const latestTick = useAppStore((s) => s.latestTick)
   const accountStatuses = useAppStore((s) => s.accountStatuses)
+  const orderType = useAppStore((s) => s.orderType)
+  const tickThrottled = useAppStore((s) => s.tickThrottled)
 
   // Step 3.12: block submit while no FTMO account is online. We can't
   // see Exness here (Phase 4) so we only gate on the FTMO side.
@@ -73,6 +88,37 @@ export function HedgeOrderForm() {
     prevSymbolRef.current = selectedSymbol
   }, [selectedSymbol, setEntryPrice, setSlPrice, setTpPrice, setManualVolumePrimary])
 
+  // Step 3.12b: market-mode auto-drive of entryPrice from the throttled
+  // tick. Effect fires when type/side/throttled tick/symbol change; the
+  // 1 Hz throttle means ``tickThrottled`` updates at most once per second,
+  // which the VolumeCalculator's 300 ms debounce then smooths further.
+  // entryPrice is deliberately NOT in the dep array — we are the writer
+  // here, and including it would create a no-op self-loop.
+  useEffect(() => {
+    if (orderType !== 'market') return
+    if (!tickThrottled) return
+    // Defensive race: if the user switched symbols faster than the
+    // throttle interval, the snapshot may still carry the old symbol.
+    // useTickThrottle clears to null on no-match, but the in-flight
+    // tickThrottled value might still be stale for one render. Skip
+    // until the next snapshot lines up.
+    if (selectedSymbol && tickThrottled.symbol !== selectedSymbol) return
+    const newEntry = side === 'buy' ? tickThrottled.ask : tickThrottled.bid
+    setEntryPrice(newEntry)
+  }, [orderType, side, tickThrottled, selectedSymbol, setEntryPrice])
+
+  // Step 3.12b: clear entryPrice when leaving market mode so the operator
+  // sees a fresh blank input rather than the last auto-driven tick value.
+  // No-op on mount when the persisted type is already non-market (entry
+  // is null after persist hydration anyway).
+  const prevOrderTypeRef = useRef<typeof orderType>(orderType)
+  useEffect(() => {
+    if (prevOrderTypeRef.current !== orderType && orderType !== 'market') {
+      setEntryPrice(null)
+    }
+    prevOrderTypeRef.current = orderType
+  }, [orderType, setEntryPrice])
+
   // entrySlError is also enforced as a hard block inside VolumeCalculator;
   // this displays the same message inline under the SL input. tpWarning
   // stays soft (TP is optional and a wrong-direction TP doesn't prevent a
@@ -94,7 +140,18 @@ export function HedgeOrderForm() {
     if (!volumeReady || effectiveVolumeLots === null || effectiveVolumeLots <= 0) {
       return 'Volume chưa sẵn sàng (kiểm tra Entry / SL / Risk)'
     }
-    // Market-direction check against latest tick (BUY: SL < bid, TP > ask;
+    // Step 3.12b: limit/stop need an explicit entry price (market
+    // auto-populates from the throttled tick). Block the submit
+    // before the SL/TP / entry-direction checks below so the toast
+    // names the actually-missing field instead of complaining about
+    // a derived comparison.
+    if (orderType !== 'market' && entryPrice === null) {
+      return orderType === 'limit'
+        ? 'Vui lòng nhập Entry Price cho lệnh Limit'
+        : 'Vui lòng nhập Entry Price cho lệnh Stop'
+    }
+
+    // SL/TP direction check against latest tick (BUY: SL < bid, TP > ask;
     // SELL: SL > ask, TP < bid). Skipped silently when no tick available
     // — server will reject with ``no_tick_data`` if it can't fetch one
     // server-side either.
@@ -114,6 +171,26 @@ export function HedgeOrderForm() {
         }
         if (tp > 0 && tp >= latestTick.bid) {
           return `TP ${tp} phải < bid hiện tại ${latestTick.bid} cho SELL`
+        }
+      }
+
+      // Step 3.12b: limit/stop entry direction. Mirrors the server's
+      // step-3.6 ``invalid_*`` rejections so the operator gets the
+      // toast before the round-trip. ``entryPrice`` is already
+      // non-null at this point (guarded above).
+      if (orderType === 'limit' && entryPrice !== null) {
+        if (side === 'buy' && entryPrice >= latestTick.ask) {
+          return `Limit BUY: entry ${entryPrice} phải < ask hiện tại ${latestTick.ask}`
+        }
+        if (side === 'sell' && entryPrice <= latestTick.bid) {
+          return `Limit SELL: entry ${entryPrice} phải > bid hiện tại ${latestTick.bid}`
+        }
+      } else if (orderType === 'stop' && entryPrice !== null) {
+        if (side === 'buy' && entryPrice <= latestTick.ask) {
+          return `Stop BUY: entry ${entryPrice} phải > ask hiện tại ${latestTick.ask}`
+        }
+        if (side === 'sell' && entryPrice >= latestTick.bid) {
+          return `Stop SELL: entry ${entryPrice} phải < bid hiện tại ${latestTick.bid}`
         }
       }
     }
@@ -136,23 +213,28 @@ export function HedgeOrderForm() {
         pair_id: selectedPairId,
         symbol: selectedSymbol,
         side,
-        // Phase 3 / step 3.11 ships market orders only — the Entry
-        // input drives volume sizing but the broker fills at
-        // market. See module docstring for the rationale.
-        order_type: 'market',
+        // Step 3.12b: ship the operator-chosen order_type. Server
+        // (step 3.6) accepts market/limit/stop with the same shape.
+        order_type: orderType,
         volume_lots: effectiveVolumeLots,
         sl: slPrice ?? 0,
         tp: tpPrice ?? 0,
-        entry_price: 0,
+        // Market mode: ``entry_price=0`` keeps D-110 — server uses
+        // live bid/ask for direction. Limit/Stop: ship the operator
+        // value; preflight already enforced direction.
+        entry_price: orderType === 'market' ? 0 : (entryPrice ?? 0),
       })
       toast.success(`Order tạo: ${res.order_id}`)
-      // Partial reset: clear Entry/SL/TP so the next order starts
-      // fresh, but keep pair / symbol / side / risk so a fast
-      // re-issue (e.g. add another leg on the same symbol) doesn't
-      // need re-typing everything.
-      setEntryPrice(null)
+      // Partial reset. Clear SL/TP always. Clear Entry only when not
+      // in market mode — the market-mode auto-driver would just
+      // re-populate it from the next throttled tick anyway, and
+      // briefly nulling it would flash the volume calc into the
+      // "Fill Entry, SL, Risk" placeholder for one render.
       setSlPrice(null)
       setTpPrice(null)
+      if (orderType !== 'market') {
+        setEntryPrice(null)
+      }
     } catch (err) {
       toast.error(formatOrderError(err))
       console.error('createOrder failed', err)
@@ -191,14 +273,33 @@ export function HedgeOrderForm() {
         </div>
       </div>
 
+      <OrderTypeSelector />
+
       <SideSelector />
 
-      <PriceInput
-        label="Entry Price"
-        value={entryPrice}
-        onChange={setEntryPrice}
-        digits={symbolDigits}
-      />
+      {/* Step 3.12b: limit/stop need an explicit entry input; market
+          auto-populates from the throttled tick and surfaces it as
+          a read-only preview line so the operator still sees the
+          number the volume calc is sizing against. */}
+      {orderType === 'market' ? (
+        <div className="text-xs text-gray-500">
+          Market entry (auto):{' '}
+          {tickThrottled ? (
+            <span className="font-mono text-gray-700">
+              {side === 'buy' ? tickThrottled.ask : tickThrottled.bid}
+            </span>
+          ) : (
+            <span className="italic">đang chờ tick...</span>
+          )}
+        </div>
+      ) : (
+        <PriceInput
+          label={`Entry Price (${orderType === 'limit' ? 'Limit' : 'Stop'})`}
+          value={entryPrice}
+          onChange={setEntryPrice}
+          digits={symbolDigits}
+        />
+      )}
       <PriceInput
         label="Stop Loss"
         value={slPrice}

@@ -1,5 +1,6 @@
 import { useEffect } from 'react'
 import { listPairs } from '../api/client'
+import { useTickThrottle } from '../hooks/useTickThrottle'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useAppStore } from '../store'
 import { HedgeChart } from './Chart/HedgeChart'
@@ -15,6 +16,11 @@ export function MainPage() {
   // ``HedgeChart`` so the chart can wire its handle-candle reducer
   // into the central onmessage dispatcher.
   const { registerCandleHandler } = useWebSocket()
+
+  // Step 3.12b: 1 Hz throttle of latestTick → tickThrottled. Drives the
+  // market-mode entry auto-population and VolumeCalculator's preview
+  // without re-rendering at the raw WS tick rate (~10 Hz).
+  useTickThrottle()
 
   // Step 3.12a: hoist the pairs fetch up here so PairPicker (order
   // form) AND PositionRow + OrderRow (positions / history tables) all

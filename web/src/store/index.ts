@@ -12,6 +12,26 @@ export type WsState = 'disconnected' | 'connecting' | 'connected'
 
 export type OrderSide = 'buy' | 'sell'
 
+// Step 3.12b: Market = fill-at-bid/ask, Limit = pending below market (BUY) /
+// above (SELL), Stop = pending above market (BUY) / below (SELL). The server
+// (step 3.6) accepts all three with the same request shape; only the
+// ``entry_price`` semantics differ.
+export type OrderType = 'market' | 'limit' | 'stop'
+
+// Step 3.12b: 1 Hz snapshot of ``latestTick`` carried separately so the
+// VolumeCalculator + market-mode entry-preview don't re-render at the WS
+// tick rate (~10 Hz on liquid FX), which would jitter the displayed volume
+// number every fraction of a second. ``symbol`` is captured at copy time
+// (``latestTick`` itself doesn't carry it; the WS handler filters by symbol
+// before writing the store) so a stale-symbol race after a symbol switch
+// can be defended against without trusting timestamp ordering.
+export interface TickThrottled {
+  bid: number
+  ask: number
+  ts: number
+  symbol: string
+}
+
 // Cap the history list so a long-running session doesn't grow the
 // in-memory array unboundedly. 200 closed orders covers a typical
 // week; the History tab can paginate beyond that via REST refresh.
@@ -117,6 +137,17 @@ export interface AppState {
   // refetches anyway.
   pairs: PairResponse[]
   setPairs: (pairs: PairResponse[]) => void
+
+  // Step 3.12b: order-type segmented selector. Persisted so the operator's
+  // last-used type sticks across reloads — a Limit-mostly trader doesn't
+  // want to re-click Limit every session.
+  orderType: OrderType
+  setOrderType: (orderType: OrderType) => void
+
+  // Step 3.12b: 1 Hz throttle of latestTick (see TickThrottled docstring).
+  // NOT persisted — session-only, driven by useTickThrottle at MainPage.
+  tickThrottled: TickThrottled | null
+  setTickThrottled: (tick: TickThrottled | null) => void
 }
 
 export const useAppStore = create<AppState>()(
@@ -239,6 +270,12 @@ export const useAppStore = create<AppState>()(
 
       pairs: [],
       setPairs: (pairs) => set({ pairs }),
+
+      orderType: 'market',
+      setOrderType: (orderType) => set({ orderType }),
+
+      tickThrottled: null,
+      setTickThrottled: (tickThrottled) => set({ tickThrottled }),
     }),
     {
       name: 'ftmo-hedge-store',
@@ -249,6 +286,7 @@ export const useAppStore = create<AppState>()(
         selectedTimeframe: state.selectedTimeframe,
         selectedPairId: state.selectedPairId,
         riskAmount: state.riskAmount,
+        orderType: state.orderType,
       }),
     }
   )
