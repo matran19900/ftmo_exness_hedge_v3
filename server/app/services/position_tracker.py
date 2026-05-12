@@ -205,12 +205,30 @@ async def _run_one_cycle(
 
         batch.append(
             {
+                # Dynamic fields (live tick-derived):
                 "order_id": order_id,
                 "symbol": symbol,
-                "current_price": current_price,
+                "current_price": str(current_price),
                 "unrealized_pnl": str(pnl_raw),
                 "is_stale": is_stale,
                 "tick_age_ms": tick_age_ms,
+                # Static metadata (step 3.11c — sourced from the
+                # already-fetched ``order`` HASH, no extra Redis read).
+                # Included so the frontend can render a brand-new row
+                # for an order_id it hasn't seen yet (the upsert path
+                # in ``useAppStore.upsertPositionTick`` no longer drops
+                # unknown order_ids). Empty-string fallbacks mirror
+                # ``position_fields`` above and the Redis HASH-string
+                # convention; ``money_digits`` defaults to ``"2"``
+                # because every downstream consumer (REST, frontend
+                # formatting) treats it as required-with-default.
+                "side": order.get("side", ""),
+                "volume_lots": order.get("p_volume_lots", ""),
+                "entry_price": order.get("p_fill_price", ""),
+                "money_digits": order.get("p_money_digits", "2") or "2",
+                "sl_price": order.get("sl_price", ""),
+                "tp_price": order.get("tp_price", ""),
+                "p_executed_at": order.get("p_executed_at", ""),
             }
         )
 

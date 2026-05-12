@@ -154,15 +154,29 @@ export const useAppStore = create<AppState>()(
 
       positions: [],
       setPositions: (positions) => set({ positions }),
-      // Merge a tick-level update into an existing position. If the
-      // order_id isn't in the current list, drop the update — the
-      // next REST refresh (or a future positions_tick that includes
-      // the order) will pull it in. This avoids broadcasting orphan
-      // rows from delayed events.
+      // Upsert a tick-level update (step 3.11c). If the order_id
+      // matches an existing entry, merge fields over it. If the
+      // order_id is unknown, INSERT as a new entry at the top of the
+      // list (newest-first, matching the REST sort by
+      // ``p_executed_at DESC``).
+      //
+      // Pre-3.11c this dropped unknown order_ids on the floor, relying
+      // on the next REST refresh to pull them in — but Phase 3 has no
+      // automatic refresh trigger after a positions_tick lands, so
+      // newly-filled orders never surfaced until the user manually
+      // refreshed. The 3.11c server change enriches the broadcast
+      // payload with the static order metadata (side, volume_lots,
+      // entry_price, money_digits, sl_price, tp_price, p_executed_at)
+      // so an insert here carries enough to render the row from
+      // scratch. Fields missing from ``update`` read as ``undefined``;
+      // the Position type's strings render as empty cells until the
+      // next REST refresh or positions_tick fills them.
       upsertPositionTick: (update) =>
         set((state) => {
           const idx = state.positions.findIndex((p) => p.order_id === update.order_id)
-          if (idx === -1) return state
+          if (idx === -1) {
+            return { positions: [{ ...update } as Position, ...state.positions] }
+          }
           const merged = { ...state.positions[idx], ...update } as Position
           const next = state.positions.slice()
           next[idx] = merged

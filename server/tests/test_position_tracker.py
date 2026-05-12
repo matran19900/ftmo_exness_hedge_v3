@@ -117,6 +117,7 @@ async def _seed_filled_order(
     p_volume_lots: str = "0.01",
     p_money_digits: str = "2",
     ftmo_account_id: str = "ftmo_001",
+    extras: dict[str, str] | None = None,
 ) -> None:
     fields: dict[str, str] = {
         "order_id": order_id,
@@ -134,6 +135,8 @@ async def _seed_filled_order(
         "created_at": "1735000000000",
         "updated_at": "1735000000000",
     }
+    if extras:
+        fields.update(extras)
     await redis_svc.create_order(order_id, fields)
 
 
@@ -976,3 +979,153 @@ async def test_convert_to_usd_jpy_with_none_bid_returns_stale(
     val, stale = await _convert_to_usd(redis_svc, pnl_quote=300.0, quote_currency="JPY")
     assert val == 300.0
     assert stale is True
+
+
+# ---------- step 3.11c: positions_tick batch carries static metadata ----------
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_broadcast_includes_static_order_metadata(
+    redis_svc: RedisService,
+    broadcast: _CapturingBroadcast,
+) -> None:
+    """Step 3.11c: the positions_tick payload includes the static
+    order metadata (side, volume_lots, entry_price, money_digits,
+    sl_price, tp_price, p_executed_at) so the frontend can render a
+    brand-new row from a single broadcast — no REST roundtrip
+    required for an order that just transitioned to ``filled``.
+
+    Values must be string-typed (Redis HASH convention) and match
+    whatever was written to the order HASH by step-3.6/3.7."""
+    await _seed_filled_order(
+        redis_svc,
+        side="buy",
+        p_fill_price="1.17500",
+        p_volume_lots="0.01",
+        p_money_digits="2",
+        extras={
+            "sl_price": "1.17000",
+            "tp_price": "1.18000",
+            "p_executed_at": "1735000000000",
+        },
+    )
+    await _seed_symbol_config(redis_svc)
+    await _seed_tick(redis_svc, "EURUSD", 1.17600, 1.17602)
+
+    await _run_one_cycle(redis_svc, broadcast, "ftmo_001")
+
+    assert len(broadcast.published) == 1
+    channel, data = broadcast.published[0]
+    assert channel == POSITIONS_CHANNEL
+    pos = data["positions"][0]
+    # Dynamic fields preserved.
+    assert pos["order_id"] == "ord_a"
+    assert pos["symbol"] == "EURUSD"
+    assert pos["unrealized_pnl"] == "100"
+    assert pos["is_stale"] is False
+    # Step 3.11c: current_price is now str (was float pre-3.11c) to
+    # align with Position interface + persistence-cache convention.
+    assert pos["current_price"] == "1.176"
+    # Step 3.11c new static metadata.
+    assert pos["side"] == "buy"
+    assert pos["volume_lots"] == "0.01"
+    assert pos["entry_price"] == "1.17500"
+    assert pos["money_digits"] == "2"
+    assert pos["sl_price"] == "1.17000"
+    assert pos["tp_price"] == "1.18000"
+    assert pos["p_executed_at"] == "1735000000000"
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_metadata_defaults_when_missing(
+    redis_svc: RedisService,
+    broadcast: _CapturingBroadcast,
+) -> None:
+    """Step 3.11c defaults: when the order HASH is missing
+    ``p_money_digits`` (empty string) and lacks ``sl_price`` /
+    ``tp_price`` / ``p_executed_at`` entirely, the broadcast falls
+    back to ``money_digits="2"`` (matches OrderHash schema default)
+    and empty-string for the absent fields — the Position TS type
+    treats those as optional strings, the UI renders as empty cells
+    until the next REST refresh fills them."""
+    # No ``extras`` → sl_price / tp_price / p_executed_at not seeded.
+    # Empty-string p_money_digits exercises the ``or "2"`` fallback
+    # branch in the runtime code.
+    await _seed_filled_order(redis_svc, p_money_digits="")
+    await _seed_symbol_config(redis_svc)
+    await _seed_tick(redis_svc, "EURUSD", 1.17600, 1.17602)
+
+    await _run_one_cycle(redis_svc, broadcast, "ftmo_001")
+
+    pos = broadcast.published[0][1]["positions"][0]
+    # Fallback to "2" (OrderHash schema default — frontend formats
+    # P&L as ``pnl_raw / 10**money_digits``).
+    assert pos["money_digits"] == "2"
+    # Absent fields → "".
+    assert pos["sl_price"] == ""
+    assert pos["tp_price"] == ""
+    assert pos["p_executed_at"] == ""
+    # Dynamic fields and the seeded statics (side, etc.) still present.
+    assert pos["side"] == "buy"
+    assert pos["volume_lots"] == "0.01"
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_multiple_positions_each_has_full_metadata(
+    redis_svc: RedisService,
+    broadcast: _CapturingBroadcast,
+) -> None:
+    """Two filled orders on the same account → batch has 2 entries,
+    each carrying its own per-order static metadata. Pins that the
+    enrichment reads from each iteration's ``order`` dict rather
+    than leaking values across the loop."""
+    await _seed_filled_order(
+        redis_svc,
+        order_id="ord_buy",
+        side="buy",
+        p_fill_price="1.17500",
+        p_volume_lots="0.01",
+        extras={
+            "sl_price": "1.17000",
+            "tp_price": "1.18000",
+            "p_executed_at": "1735000000000",
+        },
+    )
+    await _seed_filled_order(
+        redis_svc,
+        order_id="ord_sell",
+        side="sell",
+        p_fill_price="1.17800",
+        p_volume_lots="0.02",
+        extras={
+            "sl_price": "1.18200",
+            "tp_price": "1.17400",
+            "p_executed_at": "1735000050000",
+        },
+    )
+    await _seed_symbol_config(redis_svc)
+    # Same bid/ask works for both positions (BUY closes at bid, SELL at ask).
+    await _seed_tick(redis_svc, "EURUSD", 1.17600, 1.17602)
+
+    await _run_one_cycle(redis_svc, broadcast, "ftmo_001")
+
+    assert len(broadcast.published) == 1
+    batch = broadcast.published[0][1]["positions"]
+    assert len(batch) == 2
+    by_id = {p["order_id"]: p for p in batch}
+
+    buy = by_id["ord_buy"]
+    assert buy["side"] == "buy"
+    assert buy["volume_lots"] == "0.01"
+    assert buy["entry_price"] == "1.17500"
+    assert buy["sl_price"] == "1.17000"
+    assert buy["tp_price"] == "1.18000"
+    assert buy["p_executed_at"] == "1735000000000"
+
+    sell = by_id["ord_sell"]
+    assert sell["side"] == "sell"
+    assert sell["volume_lots"] == "0.02"
+    assert sell["entry_price"] == "1.17800"
+    assert sell["sl_price"] == "1.18200"
+    assert sell["tp_price"] == "1.17400"
+    assert sell["p_executed_at"] == "1735000050000"
