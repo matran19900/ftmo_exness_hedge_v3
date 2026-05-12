@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import toast from 'react-hot-toast'
 import { closeOrder, type Position } from '../../api/client'
+import { lookupPairName } from '../../lib/pairHelpers'
+import { useAppStore } from '../../store'
 import { ModifyModal } from './ModifyModal'
 
 /**
@@ -66,6 +68,16 @@ export function PositionRow({ position, onActionDone }: Props) {
   const [closing, setClosing] = useState(false)
   const [modifyOpen, setModifyOpen] = useState(false)
 
+  // Step 3.12a: Position type doesn't carry pair_id (positions_tick
+  // payload is keyed on order_id), so we join via the orders slice
+  // to recover the pair. When the order row hasn't loaded yet —
+  // e.g. a positions_tick arrived before the initial GET /api/orders
+  // completed — we fall back to ``—`` so the cell is never blank.
+  const pairs = useAppStore((s) => s.pairs)
+  const orders = useAppStore((s) => s.orders)
+  const order = orders.find((o) => o.order_id === position.order_id)
+  const pairName = order ? lookupPairName(pairs, order.pair_id) : '—'
+
   const pnlDisplay = scaleMoney(position.unrealized_pnl, position.money_digits)
   const pnlRaw = parseInt(position.unrealized_pnl, 10) || 0
   const pnlColor = pnlRaw > 0 ? 'text-green-600' : pnlRaw < 0 ? 'text-red-600' : 'text-gray-600'
@@ -94,6 +106,7 @@ export function PositionRow({ position, onActionDone }: Props) {
   return (
     <>
       <tr className={`border-b hover:bg-gray-50 ${isStale ? 'opacity-60' : ''}`}>
+        <td className="px-4 py-2 text-xs font-medium text-gray-700">{pairName}</td>
         <td className="px-4 py-2 font-mono">{position.symbol}</td>
         <td className="px-4 py-2">
           <span className={position.side === 'buy' ? 'text-green-700' : 'text-red-700'}>

@@ -52,6 +52,7 @@ export function HistoryTab() {
     <table className="w-full text-sm">
       <thead className="bg-gray-50 border-b text-xs uppercase tracking-wide text-gray-600 sticky top-0">
         <tr>
+          <th className="px-4 py-2 text-left">Pair</th>
           <th className="px-4 py-2 text-left">Symbol</th>
           <th className="px-4 py-2 text-left">Side</th>
           <th className="px-4 py-2 text-right">Volume</th>

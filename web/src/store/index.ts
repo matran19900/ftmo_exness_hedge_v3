@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
-import type { AccountStatusEntry, Order, Position } from '../api/client'
+import type { AccountStatusEntry, Order, PairResponse, Position } from '../api/client'
 
 export interface LatestTick {
   bid: number | null
@@ -109,6 +109,14 @@ export interface AppState {
   // whether the FTMO client is actually reachable right now.
   accountStatuses: AccountStatusEntry[]
   setAccountStatuses: (statuses: AccountStatusEntry[]) => void
+
+  // Step 3.12a: configured pairs (ftmo/exness id + ratio + name) hoisted
+  // from PairPicker so PositionRow + OrderRow can render the pair name
+  // alongside the symbol. Single mount-once fetch in MainPage. NOT
+  // persisted — pair config can change server-side and the page reload
+  // refetches anyway.
+  pairs: PairResponse[]
+  setPairs: (pairs: PairResponse[]) => void
 }
 
 export const useAppStore = create<AppState>()(
@@ -228,6 +236,9 @@ export const useAppStore = create<AppState>()(
 
       accountStatuses: [],
       setAccountStatuses: (accountStatuses) => set({ accountStatuses }),
+
+      pairs: [],
+      setPairs: (pairs) => set({ pairs }),
     }),
     {
       name: 'ftmo-hedge-store',

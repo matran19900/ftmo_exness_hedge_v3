@@ -1,64 +1,33 @@
-import { useEffect, useState } from 'react'
-import { listPairs, type PairResponse } from '../../api/client'
+import { useEffect } from 'react'
 import { useAppStore } from '../../store'
 
 export function PairPicker() {
   const selectedPairId = useAppStore((s) => s.selectedPairId)
   const setSelectedPairId = useAppStore((s) => s.setSelectedPairId)
+  // Step 3.12a: pairs are owned by the store; MainPage performs the
+  // one-shot fetch on mount. PairPicker no longer self-fetches — it
+  // just reads the cached list. While the fetch is in flight the
+  // dropdown is in its "no pairs configured" placeholder state below.
+  const pairs = useAppStore((s) => s.pairs)
 
-  const [pairs, setPairs] = useState<PairResponse[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
+  // D-114 / step 3.11a stale-pair validation: when the persisted
+  // ``selectedPairId`` from a previous session is no longer in the
+  // freshly-fetched ``pairs`` list (pair removed server-side, or
+  // first-ever load), auto-select the first pair so the form's
+  // ``value`` attribute always matches a visible <option> — otherwise
+  // the form silently sends the wrong pair_id and the server returns
+  // 404 ``pair_not_found``. Reading via getState() avoids re-firing
+  // on every selectedPairId change.
   useEffect(() => {
-    let cancelled = false
-
-    async function load() {
-      setLoading(true)
-      setError(null)
-      try {
-        const data = await listPairs()
-        if (cancelled) return
-        setPairs(data)
-        // Auto-select the first pair when nothing is selected yet OR when
-        // the persisted ``selectedPairId`` from a previous session no longer
-        // exists in the freshly-fetched list. Reading via getState() keeps
-        // this effect a mount-once load (avoids reloading on every store
-        // update). The membership check (step 3.11a) prevents a stale
-        // localStorage UUID from sitting silently as the form's value
-        // attribute while the <option> list shows different IDs — that
-        // mismatch was sending the wrong pair_id to POST /api/orders and
-        // surfacing as a 404 ``pair_not_found``.
-        const currentSelected = useAppStore.getState().selectedPairId
-        const isSelectedValid =
-          currentSelected !== null && data.some((p) => p.pair_id === currentSelected)
-        if (data.length > 0 && !isSelectedValid) {
-          const first = data[0]
-          if (first) setSelectedPairId(first.pair_id)
-        }
-      } catch (err) {
-        if (cancelled) return
-        const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail
-        setError(detail ?? (err as Error)?.message ?? 'Failed to load pairs')
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
+    if (pairs.length === 0) return
+    const currentSelected = useAppStore.getState().selectedPairId
+    const isSelectedValid =
+      currentSelected !== null && pairs.some((p) => p.pair_id === currentSelected)
+    if (!isSelectedValid) {
+      const first = pairs[0]
+      if (first) setSelectedPairId(first.pair_id)
     }
-
-    void load()
-    return () => {
-      cancelled = true
-    }
-  }, [setSelectedPairId])
-
-  if (loading) {
-    return <div className="text-xs text-gray-500">Loading pairs...</div>
-  }
-
-  if (error) {
-    return <div className="text-xs text-red-600">{error}</div>
-  }
+  }, [pairs, setSelectedPairId])
 
   if (pairs.length === 0) {
     return (

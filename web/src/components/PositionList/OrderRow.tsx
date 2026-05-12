@@ -1,4 +1,6 @@
 import type { Order } from '../../api/client'
+import { lookupPairName } from '../../lib/pairHelpers'
+import { useAppStore } from '../../store'
 
 function scaleMoney(rawStr: string | undefined, moneyDigitsStr?: string): string {
   if (!rawStr) return '—'
@@ -27,6 +29,13 @@ function formatTime(epochMs: string | undefined): string {
  * live).
  */
 export function OrderRow({ order }: { order: Order }) {
+  // Step 3.12a: Order has pair_id directly (no orders-slice join
+  // needed here). Falls through to truncated UUID when the pairs
+  // cache hasn't populated yet or the pair was removed since the
+  // order closed.
+  const pairs = useAppStore((s) => s.pairs)
+  const pairName = lookupPairName(pairs, order.pair_id)
+
   const pnlDisplay = scaleMoney(order.p_realized_pnl, order.p_money_digits)
   const pnlRaw = parseInt(order.p_realized_pnl ?? '0', 10) || 0
   const pnlColor = pnlRaw > 0 ? 'text-green-600' : pnlRaw < 0 ? 'text-red-600' : 'text-gray-600'
@@ -34,6 +43,7 @@ export function OrderRow({ order }: { order: Order }) {
 
   return (
     <tr className="border-b hover:bg-gray-50">
+      <td className="px-4 py-2 text-xs font-medium text-gray-700">{pairName}</td>
       <td className="px-4 py-2 font-mono">{order.symbol}</td>
       <td className="px-4 py-2">
         <span className={order.side === 'buy' ? 'text-green-700' : 'text-red-700'}>
