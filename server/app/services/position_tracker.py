@@ -286,10 +286,26 @@ async def _compute_pnl(
     contract_size = lot_size / 100.0
 
     # Close-side price: BUY exits at bid, SELL exits at ask.
+    #
+    # Step 3.11a defensive: Phase 2's ``market_data`` currently
+    # forwards cTrader delta ticks verbatim — a partial update may
+    # carry only one side (``bid=None`` or ``ask=None``). The root
+    # cause (last-known-good coalescing) is scoped to sub-fix 3.11b;
+    # here we raise ``ValueError`` so the caller's existing
+    # ``(KeyError, ValueError, ZeroDivisionError)`` handler logs a
+    # WARNING and continues to the next position instead of
+    # cascading a TypeError into a per-cycle ERROR traceback.
+    bid_val = tick.get("bid")
+    ask_val = tick.get("ask")
+    symbol_label = order.get("symbol", "?")
     if side == "buy":
-        current_price = float(tick["bid"])
+        if bid_val is None:
+            raise ValueError(f"tick missing bid for {symbol_label}")
+        current_price = float(bid_val)
     else:
-        current_price = float(tick["ask"])
+        if ask_val is None:
+            raise ValueError(f"tick missing ask for {symbol_label}")
+        current_price = float(ask_val)
 
     price_diff = (current_price - entry_price) * side_mult
     volume_base = volume_lots * contract_size
@@ -331,9 +347,12 @@ async def _convert_to_usd(
 
     if quote_currency == "JPY":
         usd_jpy = await _read_tick(redis_svc, "USDJPY")
-        if usd_jpy is None:
+        if usd_jpy is None or usd_jpy.get("bid") is None:
+            # Step 3.11a: ``bid is None`` mirrors the partial-delta
+            # tick case in ``_compute_pnl``; treat as "no rate
+            # available" rather than crashing on float(None).
             logger.warning(
-                "position_tracker: no USDJPY tick for JPY-quote conversion; "
+                "position_tracker: no USDJPY bid for JPY-quote conversion; "
                 "emitting raw quote value with is_stale=true"
             )
             return pnl_quote, True
@@ -344,7 +363,7 @@ async def _convert_to_usd(
 
     cross_symbol = f"USD{quote_currency}"
     cross_tick = await _read_tick(redis_svc, cross_symbol)
-    if cross_tick is not None:
+    if cross_tick is not None and cross_tick.get("bid") is not None:
         rate = float(cross_tick["bid"])
         if rate == 0:
             return pnl_quote, True
@@ -352,7 +371,7 @@ async def _convert_to_usd(
 
     inv_symbol = f"{quote_currency}USD"
     inv_tick = await _read_tick(redis_svc, inv_symbol)
-    if inv_tick is not None:
+    if inv_tick is not None and inv_tick.get("bid") is not None:
         rate = float(inv_tick["bid"])
         return pnl_quote * rate, False
 

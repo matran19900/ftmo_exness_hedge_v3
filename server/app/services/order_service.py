@@ -276,6 +276,27 @@ class OrderService:
         order_id = f"ord_{uuid.uuid4().hex[:8]}"
         now_ms = int(time.time() * 1000)
 
+        # Step 3.11a: normalize SL/TP/entry_price to the symbol's
+        # display digits before persistence + cmd_stream dispatch.
+        # cTrader rejects orders whose price strings carry more
+        # decimals than the symbol allows (e.g. ``"Order price =
+        # 1.170440454222853 has more digits than allowed"``). The
+        # frontend computes SL from float arithmetic and can emit
+        # 15+ digits; trimming here is silent so the operator
+        # doesn't see a spurious validation error.
+        # NOTE: this happens AFTER direction validation runs against
+        # the raw values — those compares are float-precise enough
+        # that rounding wouldn't change the outcome, and we want to
+        # keep the error messages reporting the user's exact input.
+        digits_raw = symbol_config.get("digits", "5") or "5"
+        try:
+            symbol_digits = int(digits_raw)
+        except (TypeError, ValueError):
+            symbol_digits = 5
+        normalized_sl = round(sl, symbol_digits) if sl > 0 else 0.0
+        normalized_tp = round(tp, symbol_digits) if tp > 0 else 0.0
+        normalized_entry_price = round(entry_price, symbol_digits) if entry_price > 0 else 0.0
+
         # Order hash. Field names + leg-prefix convention follow
         # ``RedisService.OrderHash`` (docs/06-data-models.md §7).
         # ``p_volume_lots`` mirrors the per-leg pattern even though
@@ -290,9 +311,9 @@ class OrderService:
             "symbol": symbol,
             "side": side,
             "order_type": order_type,
-            "sl_price": str(sl),
-            "tp_price": str(tp),
-            "entry_price": str(entry_price),
+            "sl_price": str(normalized_sl),
+            "tp_price": str(normalized_tp),
+            "entry_price": str(normalized_entry_price),
             "status": "pending",
             "p_status": "pending",
             "p_volume_lots": str(volume_lots),
@@ -313,9 +334,9 @@ class OrderService:
             "side": side,
             "order_type": order_type,
             "volume_lots": str(volume_lots),
-            "sl": str(sl),
-            "tp": str(tp),
-            "entry_price": str(entry_price),
+            "sl": str(normalized_sl),
+            "tp": str(normalized_tp),
+            "entry_price": str(normalized_entry_price),
         }
         request_id = await self.redis.push_command("ftmo", ftmo_account_id, cmd_fields)
 

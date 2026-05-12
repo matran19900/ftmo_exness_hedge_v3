@@ -852,3 +852,127 @@ async def test_get_position_cache_missing_returns_none(
     redis_svc: RedisService,
 ) -> None:
     assert await redis_svc.get_position_cache("nope") is None
+
+
+# ---------- step 3.11a: None-tick defensive ----------
+
+
+@pytest.mark.asyncio
+async def test_compute_pnl_buy_with_none_bid_raises_value_error(
+    redis_svc: RedisService,
+) -> None:
+    """Partial cTrader delta ticks carry only the changed side
+    (``bid=None`` with just ``ask`` set, or vice versa). Step 3.11a:
+    if a BUY position's bid is ``None``, ``_compute_pnl`` must raise
+    ``ValueError`` rather than crashing in ``float(None)`` → the
+    caller's ``except (KeyError, ValueError, ZeroDivisionError)``
+    swallows it as a WARNING and the loop continues."""
+    await _seed_symbol_config(redis_svc)
+    order = {
+        "symbol": "EURUSD",
+        "side": "buy",
+        "p_fill_price": "1.17500",
+        "p_volume_lots": "0.01",
+        "p_money_digits": "2",
+    }
+    sym = (await redis_svc.get_symbol_config("EURUSD")) or {}
+    tick: dict[str, Any] = {"bid": None, "ask": 1.18}
+    with pytest.raises(ValueError, match="missing bid"):
+        await _compute_pnl(redis_svc, order, sym, tick)
+
+
+@pytest.mark.asyncio
+async def test_compute_pnl_sell_with_none_ask_raises_value_error(
+    redis_svc: RedisService,
+) -> None:
+    """Symmetric: SELL positions close at ask. ``ask=None`` → raise
+    ValueError (not crash)."""
+    await _seed_symbol_config(redis_svc)
+    order = {
+        "symbol": "EURUSD",
+        "side": "sell",
+        "p_fill_price": "1.17500",
+        "p_volume_lots": "0.01",
+        "p_money_digits": "2",
+    }
+    sym = (await redis_svc.get_symbol_config("EURUSD")) or {}
+    tick: dict[str, Any] = {"bid": 1.18, "ask": None}
+    with pytest.raises(ValueError, match="missing ask"):
+        await _compute_pnl(redis_svc, order, sym, tick)
+
+
+@pytest.mark.asyncio
+async def test_compute_pnl_buy_with_none_ask_succeeds_uses_bid(
+    redis_svc: RedisService,
+) -> None:
+    """A BUY position only needs the bid (close-at-bid). A delta
+    tick with ``ask=None`` but a valid ``bid`` should compute P&L
+    successfully — the unused ask doesn't matter."""
+    await _seed_symbol_config(redis_svc)
+    order = {
+        "symbol": "EURUSD",
+        "side": "buy",
+        "p_fill_price": "1.17500",
+        "p_volume_lots": "0.01",
+        "p_money_digits": "2",
+    }
+    sym = (await redis_svc.get_symbol_config("EURUSD")) or {}
+    tick: dict[str, Any] = {"bid": 1.17600, "ask": None}
+    pnl_raw, stale, cur = await _compute_pnl(redis_svc, order, sym, tick)
+    assert pnl_raw == 100  # same as the EURUSD happy-path test
+    assert stale is False
+    assert cur == pytest.approx(1.17600)
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_swallows_value_error_and_continues(
+    redis_svc: RedisService,
+    broadcast: _CapturingBroadcast,
+    redis_client: fakeredis.aioredis.FakeRedis,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """End-to-end resilience: a filled order whose latest tick has
+    ``bid=None`` must NOT crash the cycle. The loop logs a WARNING +
+    moves on, and a follow-up tick with a real bid lets the next
+    cycle compute P&L normally."""
+    await _seed_filled_order(redis_svc)
+    await _seed_symbol_config(redis_svc)
+    # First cycle: bid is None → compute should raise ValueError →
+    # caller logs WARNING + skips this position.
+    await redis_client.set(
+        "tick:EURUSD",
+        json.dumps({"bid": None, "ask": 1.17602, "ts": int(time.time() * 1000)}),
+    )
+    with caplog.at_level("WARNING"):
+        await _run_one_cycle(redis_svc, broadcast, "ftmo_001")
+    assert "P&L compute failed" in caplog.text
+    # No broadcast emitted (batch empty after the single position
+    # was skipped).
+    assert broadcast.published == []
+
+    # Second cycle: real bid arrives → cycle completes + broadcasts.
+    await redis_client.set(
+        "tick:EURUSD",
+        json.dumps({"bid": 1.17600, "ask": 1.17602, "ts": int(time.time() * 1000)}),
+    )
+    await _run_one_cycle(redis_svc, broadcast, "ftmo_001")
+    assert len(broadcast.published) == 1
+    assert broadcast.published[0][0] == POSITIONS_CHANNEL
+
+
+@pytest.mark.asyncio
+async def test_convert_to_usd_jpy_with_none_bid_returns_stale(
+    redis_svc: RedisService,
+    redis_client: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """A USDJPY tick with ``bid=None`` should be treated as
+    "no conversion rate available" — the convert helper returns the
+    raw pnl_quote + ``is_stale=True`` instead of crashing on
+    ``float(None)``."""
+    await redis_client.set(
+        "tick:USDJPY",
+        json.dumps({"bid": None, "ask": 150.5, "ts": int(time.time() * 1000)}),
+    )
+    val, stale = await _convert_to_usd(redis_svc, pnl_quote=300.0, quote_currency="JPY")
+    assert val == 300.0
+    assert stale is True

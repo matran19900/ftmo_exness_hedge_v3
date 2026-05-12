@@ -20,11 +20,19 @@ export function PairPicker() {
         const data = await listPairs()
         if (cancelled) return
         setPairs(data)
-        // Auto-select the first pair only if nothing is selected yet — read
-        // selectedPairId fresh from getState() to keep this effect a
-        // mount-once load (avoids reloading the list on every store update).
+        // Auto-select the first pair when nothing is selected yet OR when
+        // the persisted ``selectedPairId`` from a previous session no longer
+        // exists in the freshly-fetched list. Reading via getState() keeps
+        // this effect a mount-once load (avoids reloading on every store
+        // update). The membership check (step 3.11a) prevents a stale
+        // localStorage UUID from sitting silently as the form's value
+        // attribute while the <option> list shows different IDs — that
+        // mismatch was sending the wrong pair_id to POST /api/orders and
+        // surfacing as a 404 ``pair_not_found``.
         const currentSelected = useAppStore.getState().selectedPairId
-        if (data.length > 0 && !currentSelected) {
+        const isSelectedValid =
+          currentSelected !== null && data.some((p) => p.pair_id === currentSelected)
+        if (data.length > 0 && !isSelectedValid) {
           const first = data[0]
           if (first) setSelectedPairId(first.pair_id)
         }

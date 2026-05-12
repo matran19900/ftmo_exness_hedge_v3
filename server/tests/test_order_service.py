@@ -866,3 +866,175 @@ async def test_validation_order_is_account_before_client_status(
             entry_price=0,
         )
     assert exc_info.value.error_code == "account_not_found"
+
+
+# ---------- step 3.11a: SL/TP/entry_price precision normalize ----------
+
+
+async def _seed_symbol_with_digits(
+    rc: fakeredis.aioredis.FakeRedis,
+    *,
+    symbol: str = "EURUSD",
+    digits: int = 5,
+) -> None:
+    """Seed an EURUSD symbol_config with an explicit ``digits`` value
+    for the precision-normalize tests. ``_seed_symbol`` doesn't set
+    digits; we add it here so the rounding path has something to
+    work with."""
+    await rc.sadd("symbols:active", symbol)  # type: ignore[misc]
+    await rc.hset(  # type: ignore[misc]
+        f"symbol_config:{symbol}",
+        mapping={
+            "lot_size": "100000",
+            "min_volume": "1000",
+            "max_volume": "1000000000",
+            "step_volume": "1",
+            "ctrader_symbol_id": "1",
+            "digits": str(digits),
+        },
+    )
+
+
+async def _seed_happy_with_digits(
+    rc: fakeredis.aioredis.FakeRedis,
+    *,
+    symbol: str = "EURUSD",
+    digits: int = 5,
+    bid: float = 1.08400,
+    ask: float = 1.08420,
+) -> None:
+    await _seed_pair(rc)
+    await _seed_account(rc)
+    await _seed_heartbeat(rc)
+    await _seed_symbol_with_digits(rc, symbol=symbol, digits=digits)
+    await _seed_tick(rc, symbol=symbol, bid=bid, ask=ask)
+
+
+@pytest.mark.asyncio
+async def test_create_order_normalizes_sl_to_symbol_digits(
+    svc: OrderService, redis_client: fakeredis.aioredis.FakeRedis
+) -> None:
+    """sl=1.170440454222853 (15+ digit float) for EURUSD (digits=5)
+    → stored + dispatched as 1.17044. cTrader's
+    ``"Order price = X has more digits than allowed"`` rejection is
+    silently avoided by trimming here. Bid is set high enough that
+    the SL passes direction validation for BUY (SL < bid)."""
+    await _seed_happy_with_digits(redis_client, bid=1.18000, ask=1.18020)
+    order_id, _ = await svc.create_order(
+        pair_id="pair_001",
+        symbol="EURUSD",
+        side="buy",
+        order_type="market",
+        volume_lots=0.01,
+        sl=1.170440454222853,
+        tp=0,
+        entry_price=0,
+    )
+    row = await redis_client.hgetall(f"order:{order_id}")  # type: ignore[misc]
+    assert row["sl_price"] == "1.17044"
+    entries = await redis_client.xrange("cmd_stream:ftmo:ftmo_001", "-", "+")
+    assert len(entries) == 1
+    assert entries[0][1]["sl"] == "1.17044"
+
+
+@pytest.mark.asyncio
+async def test_create_order_normalizes_tp_to_symbol_digits(
+    svc: OrderService, redis_client: fakeredis.aioredis.FakeRedis
+) -> None:
+    """Symmetric coverage of the TP rounding path. Tick is below
+    the TP so direction validation (BUY: TP > ask) passes."""
+    await _seed_happy_with_digits(redis_client, bid=1.08400, ask=1.08420)
+    order_id, _ = await svc.create_order(
+        pair_id="pair_001",
+        symbol="EURUSD",
+        side="buy",
+        order_type="market",
+        volume_lots=0.01,
+        sl=0,
+        tp=1.100123456789012,
+        entry_price=0,
+    )
+    row = await redis_client.hgetall(f"order:{order_id}")  # type: ignore[misc]
+    assert row["tp_price"] == "1.10012"
+    entries = await redis_client.xrange("cmd_stream:ftmo:ftmo_001", "-", "+")
+    assert entries[0][1]["tp"] == "1.10012"
+
+
+@pytest.mark.asyncio
+async def test_create_order_normalizes_entry_price_for_limit_order(
+    svc: OrderService, redis_client: fakeredis.aioredis.FakeRedis
+) -> None:
+    """LIMIT order's ``entry_price`` is also rounded — frontend may
+    have read the exact chart-click price from float arithmetic."""
+    await _seed_happy_with_digits(redis_client)
+    order_id, _ = await svc.create_order(
+        pair_id="pair_001",
+        symbol="EURUSD",
+        side="buy",
+        order_type="limit",
+        volume_lots=0.01,
+        sl=1.07000,
+        tp=1.09000,
+        entry_price=1.083333333333333,
+    )
+    row = await redis_client.hgetall(f"order:{order_id}")  # type: ignore[misc]
+    assert row["entry_price"] == "1.08333"
+    entries = await redis_client.xrange("cmd_stream:ftmo:ftmo_001", "-", "+")
+    assert entries[0][1]["entry_price"] == "1.08333"
+
+
+@pytest.mark.asyncio
+async def test_create_order_sl_zero_kept_as_zero(
+    svc: OrderService, redis_client: fakeredis.aioredis.FakeRedis
+) -> None:
+    """``sl=0`` carries semantic meaning ("no stop loss"; per
+    docs/05-redis-protocol.md §4.2) — must remain 0 through
+    normalization, NOT round to 0.0 with extra precision noise."""
+    await _seed_happy_with_digits(redis_client)
+    order_id, _ = await svc.create_order(
+        pair_id="pair_001",
+        symbol="EURUSD",
+        side="buy",
+        order_type="market",
+        volume_lots=0.01,
+        sl=0,
+        tp=0,
+        entry_price=0,
+    )
+    row = await redis_client.hgetall(f"order:{order_id}")  # type: ignore[misc]
+    assert row["sl_price"] == "0.0"
+    assert row["tp_price"] == "0.0"
+    assert row["entry_price"] == "0.0"
+    entries = await redis_client.xrange("cmd_stream:ftmo:ftmo_001", "-", "+")
+    assert entries[0][1]["sl"] == "0.0"
+    assert entries[0][1]["tp"] == "0.0"
+
+
+@pytest.mark.asyncio
+async def test_create_order_default_digits_5_when_symbol_config_missing(
+    svc: OrderService, redis_client: fakeredis.aioredis.FakeRedis
+) -> None:
+    """``digits`` is OPTIONAL in symbol_config; if absent the
+    normalizer defaults to 5 (cTrader major-FX convention). 0.1+0.2
+    style float → 0.3 (rounded to 5 digits, ``str()`` drops trailing
+    zeros) not the 0.30000000000000004 raw."""
+    # Reuse the existing _seed_symbol helper (which doesn't write
+    # ``digits``) so we exercise the missing-field path.
+    await _seed_pair(redis_client)
+    await _seed_account(redis_client)
+    await _seed_heartbeat(redis_client)
+    await _seed_symbol(redis_client)
+    await _seed_tick(redis_client)
+    order_id, _ = await svc.create_order(
+        pair_id="pair_001",
+        symbol="EURUSD",
+        side="buy",
+        order_type="market",
+        volume_lots=0.01,
+        sl=0.1 + 0.2,  # 0.30000000000000004 in IEEE 754
+        tp=0,
+        entry_price=0,
+    )
+    row = await redis_client.hgetall(f"order:{order_id}")  # type: ignore[misc]
+    # Rounded to 5 digits → 0.3 (Python str() drops trailing zeros).
+    assert row["sl_price"] == "0.3"
