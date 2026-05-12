@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections import defaultdict
 from typing import Any
 
@@ -97,15 +98,123 @@ class BroadcastService:
     # ---------- convenience ----------
 
     async def publish_tick(self, ftmo_symbol: str, tick: dict[str, Any]) -> None:
-        """Cache the tick (best-effort) and broadcast on ``ticks:{symbol}``."""
+        """Coalesce a (possibly partial) delta tick against the last
+        cached full tick, then cache + broadcast the merged result.
+
+        cTrader's ``ProtoOASpotEvent`` only carries fields that
+        changed in that update — Phase 2's ``_handle_spot_event``
+        translates ``HasField("bid")=False`` to ``bid=None`` (same
+        for ``ask``). Step 3.11b coalesces those partials here so
+        downstream consumers (``OrderService.create_order``,
+        ``position_tracker._compute_pnl``, frontend) always see a
+        full ``{bid, ask, ts}`` tick.
+
+        Initial-state edge: if a partial delta arrives BEFORE the
+        cache has ever held a full tick (e.g. very first
+        spot event after startup), the coalesced result is still
+        incomplete. In that case we DROP the publish + cache write
+        rather than poison the cache with a half-tick — the next
+        cTrader update will fill the other side and we'll publish
+        then. Defensive guards from step 3.11a in OrderService and
+        position_tracker stay in place as belt-and-suspenders.
+
+        Fast path: full deltas (both sides present) skip the cache
+        read entirely — no extra Redis round-trip for the common
+        case.
+        """
+        coalesced = await self._coalesce_tick(ftmo_symbol, tick)
+        if coalesced is None:
+            return
+
         if self._redis_svc is not None:
             try:
                 await self._redis_svc.set_tick_cache(
-                    ftmo_symbol, json.dumps(tick), ttl_seconds=_DEFAULT_TICK_TTL_SECONDS
+                    ftmo_symbol,
+                    json.dumps(coalesced),
+                    ttl_seconds=_DEFAULT_TICK_TTL_SECONDS,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("BroadcastService: tick cache write failed")
-        await self.publish(f"ticks:{ftmo_symbol}", tick)
+        await self.publish(f"ticks:{ftmo_symbol}", coalesced)
+
+    async def _coalesce_tick(
+        self, ftmo_symbol: str, delta: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Merge a delta tick with the last cached full tick.
+
+        Returns:
+          - The original ``delta`` dict when it's already full (both
+            ``bid`` and ``ask`` present and non-None) — fast path,
+            zero cache reads.
+          - A NEW dict combining the delta's present side(s) + the
+            previous cache's missing side(s) + the delta's
+            ``ts`` (or ``time.time()*1000`` if delta lacks ts).
+          - ``None`` when the delta is partial AND no usable previous
+            tick is available (missing cache, malformed JSON, cache
+            read raised, or prev tick itself partial).
+
+        Result is a fresh dict — does not mutate inputs.
+        """
+        delta_bid = delta.get("bid")
+        delta_ask = delta.get("ask")
+
+        # Fast path: full delta → no coalesce needed. Skip the cache
+        # read entirely so the common case stays a single Redis
+        # operation (the SETEX in publish_tick).
+        if delta_bid is not None and delta_ask is not None:
+            return delta
+
+        # Partial delta — try to fill the missing side from the
+        # cached previous tick. Defensive against every cache failure
+        # mode: missing key, malformed JSON, redis errors. All fall
+        # through to "no usable prev" so the publish gets dropped.
+        prev_full: dict[str, Any] | None = None
+        if self._redis_svc is not None:
+            try:
+                prev_raw = await self._redis_svc.get_tick_cache(ftmo_symbol)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "BroadcastService: tick cache read failed during coalesce for %s",
+                    ftmo_symbol,
+                )
+                prev_raw = None
+            if prev_raw:
+                try:
+                    decoded = json.loads(prev_raw)
+                    if isinstance(decoded, dict):
+                        prev_full = decoded
+                except json.JSONDecodeError:
+                    logger.debug(
+                        "BroadcastService: malformed prev tick cache for %s; "
+                        "treating as no previous state",
+                        ftmo_symbol,
+                    )
+
+        prev_bid = prev_full.get("bid") if prev_full else None
+        prev_ask = prev_full.get("ask") if prev_full else None
+
+        merged_bid = delta_bid if delta_bid is not None else prev_bid
+        merged_ask = delta_ask if delta_ask is not None else prev_ask
+
+        # Initial-state guard: still incomplete after merge → drop.
+        # ``publish_tick`` interprets ``None`` as "do not publish".
+        if merged_bid is None or merged_ask is None:
+            return None
+
+        # Use delta's ``ts`` (newer) when present; fall back to wall
+        # clock if the spot-event handler omitted it (shouldn't
+        # happen in production but cheap belt-and-suspenders).
+        ts = delta.get("ts")
+        if ts is None:
+            ts = int(time.time() * 1000)
+
+        return {
+            "type": "tick",
+            "symbol": ftmo_symbol,
+            "bid": merged_bid,
+            "ask": merged_ask,
+            "ts": ts,
+        }
 
     async def publish_candle(
         self, ftmo_symbol: str, timeframe: str, candle: dict[str, Any]
