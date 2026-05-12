@@ -664,3 +664,250 @@ def generate_order_id() -> str:
     """Format: ord_<8-char-base32>. Sortable by time roughly."""
     return f"ord_{secrets.token_urlsafe(6).replace('_', '').replace('-', '')[:8]}"
 ```
+
+---
+
+## 10. Phase 3 additions
+
+> Phase 3 implement spec từ §1-§9. Mục này ghi nhận **deltas thực tế** trong Phase 3 — chi tiết quyết định xem `DECISIONS.md` D-046 → D-149.
+
+### 10.1 `redis_service.py` — Phase 3 new methods
+
+Phase 3 mở rộng RedisService với CRUD đầy đủ cho orders + position cache + account meta toggle:
+
+**Order CRUD với Lua CAS** (D-046):
+```python
+async def create_order(self, order_id: str, fields: dict) -> None: ...
+async def get_order(self, order_id: str) -> dict | None: ...
+async def update_order(self, order_id: str, patch: dict, current_value: str | None = None) -> bool:
+    """Idempotent update with Lua CAS witness pattern.
+    
+    Update accepts current-value witness (e.g., current p_status). If mismatch
+    on Redis side → returns False → caller retries with fresh re-read.
+    Single-writer per order guarantees safe transitions across response_handler
+    + event_handler races.
+    """
+```
+
+**Order listing** (D-089 client-side filter acceptable Phase 3 <50 hedges):
+```python
+async def list_orders_by_status(self, status: str) -> list[dict]: ...
+async def list_orders_by_account(self, broker: str, account_id: str) -> list[dict]: ...
+async def list_open_orders_by_account(self, broker: str, account_id: str) -> list[dict]:
+    """Filter status in (pending, filled)."""
+async def list_closed_orders(self, ...) -> list[dict]:
+    """Time-range filter via orders:by_status:closed + per-order p_closed_at."""
+```
+
+**Position cache** (D-096):
+```python
+async def get_position_cache(self, order_id: str) -> dict | None: ...
+async def set_position_cache(self, order_id: str, data: dict, ttl_seconds: int = 600) -> None: ...
+```
+
+**Account meta + pair guard** (D-142, D-143, D-147):
+```python
+async def get_account_meta(self, broker: str, account_id: str) -> dict[str, str] | None: ...
+async def update_account_meta(self, broker: str, account_id: str, fields: dict[str, str]) -> None:
+    """HSET merge + auto-stamp updated_at."""
+async def get_all_accounts_with_status(self) -> list[dict[str, str]]:
+    """Returns raw rows ready for row_to_entry conversion (D-147 helper)."""
+async def count_orders_by_pair(self, pair_id: str) -> int:
+    """Count pending + filled orders referencing pair_id.
+    
+    Used to guard DELETE /api/pairs/{id} from orphan references (D-142).
+    Closed/cancelled orders NOT counted (frozen historical references).
+    Phase 3 budget O(N) acceptable; Phase 5 hardening: pair_orders:{pair_id}
+    SET index updated in create_order + status transitions.
+    """
+```
+
+**Side index helpers** (D-047):
+```python
+async def add_request_id_mapping(self, request_id: str, order_id: str) -> None: ...
+async def get_order_id_by_request(self, request_id: str) -> str | None: ...
+```
+
+### 10.2 `order_service.py` — validation pipeline (D-081)
+
+```python
+class OrderValidationError(Exception):
+    """Structured exception — maps 1:1 to HTTPException detail (D-082)."""
+    def __init__(self, error_code: str, message: str, http_status: int = 400):
+        ...
+
+class OrderService:
+    async def create_order(self, req: OrderCreateRequest) -> dict:
+        """Phase 3 validation pipeline (D-081):
+        
+        1. Pair existence + enabled.
+        2. Account existence + enabled (D-128 status precedence).
+        3. Client heartbeat (D-128: enabled=false → disabled overrides online).
+        4. Symbol active + symbol_config exists.
+        5. Volume within (min/max/step).
+        6. Entry validation (limit/stop: required; market: 0 OK).
+        7. Tick exists for direction validation.
+        8. SL/TP direction (raw values).
+        9. Normalize SL/TP/entry_price to symbol_config.digits (D-115 — after validation pass).
+        10. push_command → cmd_stream:ftmo:{acc} → 202 Accepted async.
+        """
+    
+    async def close_order(self, order_id: str) -> dict:
+        """Full close only Phase 3 (D-100). Partial volume_lots != current → 400 partial_close_unsupported."""
+    
+    async def modify_order(self, order_id: str, sl: float | None, tp: float | None) -> dict:
+        """sl/tp None = keep, 0 = remove (skip direction validation), positive = set with validation (D-101).
+        Pydantic root validator rejects both None case."""
+```
+
+**Error code vocab Phase 3** (D-057, D-111) — lowercase snake_case:
+- `client_offline`, `invalid_pair`, `invalid_volume`, `invalid_entry_direction`, `invalid_sl_direction`, `pair_in_use`, `account_not_found`, `partial_close_unsupported`, `sl_tp_attach_failed`, `invalid_time_range`, `invalid_request`, `missing_entry_price` (limit/stop).
+
+### 10.3 `response_handler.py` + `event_handler.py` Phase 3 (D-086)
+
+2 background tasks **per FTMO account** (Phase 3 single-leg):
+- `response_handler_loop(account_id)` — consume `resp_stream:ftmo:{acc}`.
+- `event_handler_loop(account_id)` — consume `event_stream:ftmo:{acc}`.
+
+Pattern (both):
+- Consumer group: `"server"`, consumer name: `f"server-{account_id}"`.
+- `XREADGROUP BLOCK 1000ms`, `count=10`.
+- ACK **only on successful handle**. Skip ACK on entry-level exception → message re-delivered next read.
+- Stream-level error → log + 1s backoff before retry.
+
+WS broadcast Phase 3 (D-087):
+- `orders` channel: `order_updated` messages từ response_handler (place/close/modify success/fail).
+- `positions` channel: `position_event` messages từ event_handler (unsolicited close, pending fill, modify, cancel). Plus `positions_tick` từ position_tracker_loop (1s batched).
+
+### 10.4 `position_tracker.py` — unrealized P&L (D-091, D-093, D-097)
+
+```python
+async def position_tracker_loop(account_id: str) -> None:
+    """1s poll cycle per FTMO account."""
+    while True:
+        orders = await redis.list_orders_by_account('ftmo', account_id)
+        filled = [o for o in orders if o['p_status'] == 'filled']
+        positions_batch = []
+        for order in filled:
+            entry = await _compute_pnl(order)
+            if entry:
+                positions_batch.append(entry)
+        if positions_batch:
+            # D-097: batched 1 message per cycle (empty batch → no broadcast).
+            await broadcast.publish('positions', {
+                'type': 'positions_tick',
+                'account_id': account_id,
+                'ts': int(time.time() * 1000),
+                'positions': positions_batch,
+            })
+        await asyncio.sleep(1.0)
+```
+
+**P&L formula** (D-091): `(current_price - entry_price) × side_mult × volume_base ÷ quote_to_usd_rate`. Close-side: BUY uses bid, SELL uses ask.
+
+**USD conversion routing** (D-092):
+- `USD` quote → passthrough.
+- `JPY` quote → divide by `USDJPY.bid`.
+- Other quote → `USD{quote}.bid` direct or `{quote}USD.bid` inverse fallback.
+- Conversion miss → `is_stale=true` flag, fallback raw value.
+
+**Stale tick threshold** (D-093): 5s. `is_stale=true` does **NOT** drop position — compute proceeds with last-known price, flag for frontend warning render.
+
+**Defensive guards** (D-116, D-117, D-119): `_compute_pnl` raises ValueError on None bid/ask → caller catches WARNING log + continue. `_convert_to_usd` returns raw + stale flag on None conversion bid. Retained as belt-and-suspenders post-D-118 coalescing root cause fix.
+
+**Auxiliary derivations Phase 3**:
+- `contract_size = lot_size / 100` for FX (D-094). Phase 5 hardening: persist explicit for non-FX (indices, crypto, commodities).
+- `quote_currency = symbol[-3:]` for 6-char FX (D-095). Phase 5 hardening: persist explicit for non-FX.
+
+**Just-filled race** (D-104): order in `orders:by_status:filled` SET nhưng `position_cache:{id}` chưa computed → REST `/api/positions` returns entry với `is_stale=true` + empty live fields. Tracker catches up next cycle.
+
+### 10.5 `broadcast.py` — coalescing root cause fix (D-118)
+
+`BroadcastService.publish_tick(symbol, tick_data)` được upgrade Phase 3.11b với coalesce logic:
+
+```python
+async def publish_tick(self, symbol: str, tick_data: dict) -> None:
+    """Coalesce partial cTrader delta ticks với prev cached state.
+    
+    3 paths:
+    1. Fast path: both bid+ask present → identity return, zero cache read.
+    2. Partial path: one missing → merge với cached prev → emit complete tick.
+    3. Initial state: no prev + partial → drop publish + write to cache.
+    """
+    cache_key = f'tick:{symbol}'
+    has_bid = tick_data.get('bid') is not None
+    has_ask = tick_data.get('ask') is not None
+    
+    if has_bid and has_ask:
+        # Fast path — zero cache read.
+        await self._cache_and_broadcast(symbol, tick_data)
+        return
+    
+    # Partial — merge with prev.
+    prev = await self._read_tick_cache(symbol)
+    if prev is None:
+        # Initial state — drop.
+        await self._write_tick_cache_partial(symbol, tick_data)
+        return
+    
+    merged = {**prev, **{k: v for k, v in tick_data.items() if v is not None}}
+    await self._cache_and_broadcast(symbol, merged)
+```
+
+Pre-D-118 root cause: `position_tracker._compute_pnl` would receive `tick={'bid': None, 'ask': 1.085}` → crash spam `float(None)`. D-119 defensive guards retained (downstream belt-and-suspenders).
+
+### 10.6 `account_helpers.py` — typed conversion (D-147 step 3.13a)
+
+```python
+# server/app/services/account_helpers.py
+def row_to_entry(row: dict[str, str]) -> AccountStatusEntry:
+    """Single source of truth for REST + WS account payload conversion.
+    
+    Maps Redis HASH-string row → typed Pydantic AccountStatusEntry.
+    Pre-3.13a regression: WS shipped `enabled: "false"` string → JS
+    Boolean("false") === true → UI render ON cho disabled accounts.
+    Post-3.13a fix: both REST list_accounts AND account_status_loop
+    route through this helper → typed bool/Literal across both code paths.
+    """
+    return AccountStatusEntry(
+        broker=row['broker'],
+        account_id=row['account_id'],
+        name=row['name'],
+        enabled=row['enabled'] == 'true',  # ← typed bool
+        status=row['status'],
+        balance_raw=row['balance_raw'],
+        equity_raw=row['equity_raw'],
+        margin_raw=row['margin_raw'],
+        free_margin_raw=row['free_margin_raw'],
+        currency=row['currency'],
+        money_digits=row['money_digits'],
+    )
+```
+
+Function-local imports in `accounts.py` to break circular dependency (D-149) — `accounts.py` defines `AccountStatusEntry`, `account_helpers.py` imports it; both REST endpoints reach back to `row_to_entry` via local import inside route handler. Phase 5 cleanup: extract schemas sang `app/api/schemas/`.
+
+### 10.7 `account_status.py` — broadcast loop (D-126)
+
+```python
+# server/app/services/account_status.py
+async def account_status_loop() -> None:
+    """5s interval, broadcast snapshot of all accounts to 'accounts' WS channel.
+    
+    Single global task (not per-account). Reads via 
+    RedisService.get_all_accounts_with_status() → row_to_entry() per row →
+    broadcast typed entries (D-147).
+    """
+    while True:
+        rows = await redis.get_all_accounts_with_status()
+        entries = [row_to_entry(r) for r in rows]
+        await broadcast.publish('accounts', {
+            'type': 'account_status',
+            'ts': int(time.time() * 1000),
+            'accounts': [e.model_dump() for e in entries],  # typed → JSON-native bool
+        })
+        await asyncio.sleep(5.0)
+```
+
+### 10.8 cTrader trading credentials separation (D-051)
+
+Phase 2 server uses `ctrader:market_data_creds` (single market-data account). Phase 3 FTMO trading credentials at `ctrader:ftmo:{account_id}:creds` (per-account). Shared OAuth flow via `hedger-shared/ctrader_oauth.py` (D-049) — same code path, different credential namespace.

@@ -7,7 +7,9 @@ Công cụ hedge thủ công giữa FTMO (cTrader) và Exness (MT5). Mỗi lện
 - Trạng thái hiện tại: [docs/PROJECT_STATE.md](docs/PROJECT_STATE.md)
 - Sổ quyết định: [docs/DECISIONS.md](docs/DECISIONS.md)
 - Báo cáo phase 1: [docs/PHASE_1_REPORT.md](docs/PHASE_1_REPORT.md)
-- Runbook (skeleton, sẽ điền dần ở Phase 5): [docs/RUNBOOK.md](docs/RUNBOOK.md)
+- Báo cáo phase 2: [docs/PHASE_2_REPORT.md](docs/PHASE_2_REPORT.md)
+- Báo cáo phase 3: [docs/PHASE_3_REPORT.md](docs/PHASE_3_REPORT.md)
+- Runbook (dev workflow + ops): [docs/RUNBOOK.md](docs/RUNBOOK.md)
 - Template handoff CTO: [docs/CTO_HANDOFF_TEMPLATE.md](docs/CTO_HANDOFF_TEMPLATE.md)
 
 ## Quick start (Phase 1 features)
@@ -324,6 +326,41 @@ curl -X POST http://localhost:8000/api/pairs/ \
 7. Tạo lỗi auto (503 / 400) trong khi manual mode → SL distance + Est. SL $ ẩn (không stale).
 8. Side error xảy ra trong manual mode: đổi SL violate side → Volume Preview hiện side error; Vol P input vẫn edit được nhưng metrics ẩn. Fix SL → metrics quay lại NGAY (state.result preserved).
 9. Phase-3 prep: Zustand `volumeReady` = true khi (auto ready hoặc manual > 0) AND không có side error; false trong các trường hợp khác.
+
+## Phase 3 features (production-ready)
+
+Phase 3 ship **single-leg FTMO trading** end-to-end. Exness hedging cascade defer Phase 4.
+
+### Operator flow
+
+1. **Login** — `admin` / `admin` (Phase 5 sẽ ship password change UI).
+2. **Main page layout** — Header (title + WS pill + AccountStatusBar + Settings gear + Logout), HedgeChart (left 70%), HedgeOrderForm (right 30%), PositionList (bottom 35% của left column với Open + History tabs).
+3. **AccountStatusBar header** — per-FTMO-account dot màu (online green / offline red / disabled gray) + balance + equity, refresh mỗi 5s qua WS broadcast.
+4. **Order form** — Pair picker (dropdown từ `/api/pairs`), Symbol read-only (linked to pair primary symbol), Side BUY/SELL toggle, Order Type segmented Market/Limit/Stop (Market default), Entry/SL/TP inputs (auto-hidden trong Market mode — entry auto-drives từ throttled tick), Risk Amount USD input, VolumeCalculator (auto risk-based hoặc manual override), Submit button (disabled khi FTMO client offline/disabled với 3-tier tooltip).
+5. **PositionList Open tab** — live P&L update mỗi 1s với USD conversion (JPY pairs via USDJPY bid). Mỗi row: Pair, Symbol, Side, Volume, Entry, Current Price, P&L, SL, TP, Close + Modify action buttons.
+6. **PositionList History tab** — closed orders với time-range filter (default 7 ngày trailing). Mỗi row: Pair, Symbol, Side, Volume, Entry, Close, P&L, Close Reason (manual/sl/tp/stopout/unknown), Closed at.
+7. **Settings modal** (gear icon header) — 2 tabs Pairs + Accounts. Pairs CRUD (create/edit/delete với 409 pair_in_use guard nếu có orders reference). Accounts toggle enabled (PATCH endpoint).
+8. **Real-time updates** — order_updated + positions_tick + account_status broadcasts qua WebSocket, frontend reactive store updates.
+
+### Phase 3 limitations
+
+- Single FTMO account workflow (Phase 4 sẽ add Exness hedging cascade).
+- Full position close only — no partial close (Phase 4+ scope).
+- No drag-to-modify SL/TP trên chart (Phase 5 hardening backlog).
+- No row click → chart overlay entry/SL/TP highlight (Phase 5).
+- FTMO account create cần OAuth flow CLI Phase 3 (Settings UI defer Phase 5).
+- Exness account dropdown Phase 3 vẫn text-input free-form (Phase 4 widens to dropdown khi accounts:exness populated).
+- Single admin user (multi-user defer per non-goals).
+
+### Stack version (production-tested)
+
+- **Backend**: Python 3.12 + FastAPI + Pydantic v2 + redis.asyncio + uvicorn.
+- **FTMO client**: Python 3.12 + Twisted (cTrader Open API protobuf bridge) + hedger-shared (OAuth + symbol mapping).
+- **Frontend**: React 19 + TypeScript strict + Vite 8 + Tailwind 3 + Zustand 5 + Axios 1.16 + Lightweight Charts 5.2 + react-hot-toast.
+- **Redis**: 7.x.
+- **Tests**: server 473 (pytest + fakeredis), ftmo-client 177, web tsc + eslint + vite build clean.
+
+Xem `docs/PHASE_3_REPORT.md` cho full acceptance table + step ledger + Phase 5 hardening backlog.
 
 ## Account Management (Phase 3+)
 

@@ -502,3 +502,188 @@ if (import.meta.env.DEV && import.meta.env.VITE_MOCK === 'true') {
 - ❌ Position state thay vì keyed → re-render toàn bộ list. **V2: keyed by order_id.**
 - ❌ WS resubscribe full mỗi lần đổi symbol. **V2: diff subscribe.**
 - ❌ Inline CSS huge → hard to maintain. **V2: vẫn inline (đơn giản hóa) nhưng tách styles vào const objects.**
+
+---
+
+## 15. Phase 3 additions
+
+> Phase 3 implement spec từ §1-§14. Mục này ghi nhận **deltas thực tế** trong Phase 3 — chi tiết quyết định xem `DECISIONS.md` D-046 → D-149. Web stack vẫn React + TS + Vite + Tailwind nhưng v2 Phase 3 dùng **Tailwind CSS** (D-029 Phase 1 lock) thay vì inline CSS-in-JS object styles như §1 mention.
+
+### 15.1 Actual layout
+
+Code thực tế tại `web/src/` (không `apps/web/` như spec §2). Structure đã evolve:
+- `components/Chart/HedgeChart.tsx` — chart canvas + price line + setup lines.
+- `components/Header/Header.tsx` — title + WS pill + `<AccountStatusBar />` + Settings gear + Logout.
+- `components/Header/AccountStatusBar.tsx` — per-account dot + balance + equity (D-130 extends Phase 1 placeholder).
+- `components/OrderForm/` — full form (xem §15.3).
+- `components/PositionList/` — Open + History tabs với rows (xem §15.4).
+- `components/Settings/` — modal Pair CRUD + Account toggle (xem §15.5).
+- `components/MainPage.tsx` — layout shell hosting useWebSocket + useTickThrottle hooks (D-105, D-131 hoist patterns).
+- `hooks/` — useWebSocket, useDebouncedValue, useTickThrottle.
+- `lib/` — orderValidation.ts (Phase 2), pairHelpers.ts (Phase 3 D-132).
+- `store/index.ts` — Zustand single store + persist middleware (D-106 single file convention).
+- `api/client.ts` — Axios + JWT interceptor + all endpoint helpers (D-106 single file).
+
+### 15.2 useWebSocket hoisted to MainPage (D-105)
+
+Phase 2 placeholder had `useWebSocket` in HedgeChart. Phase 3 hoists to **MainPage** as the single WS connection per session. Chart accepts a `candleHandler` prop để register cho `candles:{symbol}:{tf}` channel; positions/orders/accounts dispatched directly to Zustand store.
+
+Subscribe pattern on (re)connect (D-127):
+```typescript
+ws.send(JSON.stringify({
+  type: 'subscribe',
+  channels: [
+    `ticks:${selectedSymbol}`,
+    `candles:${selectedSymbol}:${selectedTimeframe}`,
+    'positions',
+    'orders',
+    'accounts',
+  ]
+}))
+```
+
+### 15.3 OrderForm components Phase 3
+
+`web/src/components/OrderForm/`:
+
+| Component | Purpose | Phase 3 deltas |
+|---|---|---|
+| `HedgeOrderForm.tsx` | Main form, submit handler, preflight, reset on success | D-110 market-only submit, D-112 2-layer preflight, D-113 partial reset, D-129 submit gating với hasOnlineFtmoAccount, D-148 3-tier ftmoBlockMessage |
+| `PairPicker.tsx` | Pair selector dropdown | D-114 stale validate selectedPairId membership |
+| `SideSelector.tsx` | BUY/SELL toggle | Phase 2 |
+| `OrderTypeSelector.tsx` | **NEW** Market/Limit/Stop segmented | D-134 (default Market, persisted) |
+| `VolumeCalculator.tsx` | Risk-based + manual override | D-110 manual mode, D-140 ApiState.refreshing variant, D-141 decorative dot |
+| `PriceInput.tsx` | Entry/SL/TP numeric input | Phase 2 |
+| `RiskAmountInput.tsx` | Risk USD input | Phase 2 |
+
+**Submit gating** (D-129, D-148): button disabled khi `hasOnlineFtmoAccount === false`. Tooltip + inline red banner 3-tier priority:
+1. No FTMO accounts → "Chưa có FTMO account được cấu hình".
+2. All FTMO disabled (operator-toggled) → "FTMO account đã bị vô hiệu hóa (mở Settings → Accounts để bật lại)".
+3. Heartbeat-dead → "FTMO client offline (heartbeat đã expired)".
+
+**Market mode entry auto-drive** (D-135): Entry input hidden; `entryPrice` auto-drives từ `tickThrottled` (ask cho BUY, bid cho SELL). Throttle 5s (D-139) tránh volume number jitter. On orderType change to limit/stop, entry reset to null (D-137).
+
+**Direction validation preflight** (D-136): Limit BUY: `entry < ask`, SELL: `entry > bid`. Stop BUY: `entry > ask`, SELL: `entry < bid`. Client preflight + server validate authoritative.
+
+### 15.4 PositionList components Phase 3
+
+`web/src/components/PositionList/`:
+
+| Component | Purpose | Phase 3 deltas |
+|---|---|---|
+| `PositionList.tsx` | Tab switcher Open/History | Phase 3 new |
+| `OpenTab.tsx` | Live positions table | Phase 3 new |
+| `HistoryTab.tsx` | Closed orders table với time-range | Phase 3 new |
+| `PositionRow.tsx` | Live position row | D-133 joins via orders slice for pair_id, D-122 current_price str unified |
+| `OrderRow.tsx` | Closed order row | Direct pair_id |
+| `ModifyModal.tsx` | SL/TP edit dialog | Phase 3 new, D-101 None/0/positive semantics |
+
+Columns Open tab: Pair (D-132 lookupPairName), Symbol, Side, Volume, Entry, Current Price, P&L, SL, TP, Actions (Close + Modify).
+Columns History tab: Pair, Symbol, Side, Volume, Entry, Close, P&L, Close Reason, Closed at.
+
+Money display via `scaleMoney(raw, money_digits)` helper (D-108).
+
+### 15.5 Settings modal Phase 3 (D-144)
+
+`web/src/components/Settings/` (NEW directory):
+
+| Component | Purpose |
+|---|---|
+| `SettingsModal.tsx` | Overlay với click-outside close + × button (Escape Phase 5 defer) |
+| `PairsTab.tsx` | List + create/edit/delete actions; D-142 409 pair_in_use server-message display |
+| `PairForm.tsx` | Create/edit pair với FTMO account dropdown từ accountStatuses slice (D-145 Exness account text-input free-form Phase 3) |
+| `AccountsTab.tsx` | List với enabled toggle (D-143 PATCH endpoint); D-146 FTMO create UI defer Phase 5 OAuth |
+
+Access via Header gear icon button. Window.confirm cho delete confirm (Phase 5 custom modal backlog).
+
+### 15.6 Hooks Phase 3
+
+`web/src/hooks/`:
+- `useWebSocket.ts` — single connection, subscribe channels (D-105 hoisted). Reconnect logic exponential backoff, ping/pong, auto-resend set_symbol. Dispatcher dispatch positions_tick / order_updated / account_status / tick / candle_update.
+- `useDebouncedValue.ts` — generic debounce (Phase 2).
+- `useTickThrottle.ts` — **NEW** 5s throttle latestTick → tickThrottled (D-138 symbol-at-copy-time, D-139 5s interval).
+
+### 15.7 Zustand store slices Phase 3
+
+`web/src/store/index.ts` single file (D-106). Phase 3 added slices (xem `06-data-models.md` §15.7 cho TypedDict):
+
+**Persisted** (partialize whitelist):
+- `token`, `selectedSymbol`, `selectedTimeframe`, `selectedPairId` (Phase 1+2).
+- `riskAmount` (Phase 2).
+- `orderType` (Phase 3, D-134 default "market").
+
+**Runtime-only** (NOT persisted):
+- `side, entryPrice, slPrice, tpPrice, manualVolumePrimary, volumeReady, effectiveVolumeLots` (form draft — reset per session).
+- `latestTick, tickThrottled, wsState, symbolDigits` (server-derived).
+- `orders, positions, history, accountStatuses, pairs` (Phase 3 server-derived REST + WS).
+
+**Setters**: simple Zustand action methods, e.g., `setOrderType(orderType: OrderType) => set({ orderType })`. `upsertPositionTick(update)` insert prepend khi findIndex===-1 (D-121 true upsert).
+
+### 15.8 Helper libraries `web/src/lib/`
+
+- `orderValidation.ts` — Phase 2 `validateSideDirection`; Phase 3.11a extension cho server-side normalize precision sync (D-115).
+- `pairHelpers.ts` — **NEW** `lookupPairName(pairs, pair_id)` với fallback hierarchy (D-132): pair found → `pair.name`; pair_id missing → "—"; pair not in cache → truncated UUID `xxxxxxxx...`.
+
+### 15.9 API client `web/src/api/client.ts` (D-106 single file)
+
+Phase 3 thêm endpoint helpers:
+
+```typescript
+// Orders (Phase 3)
+export async function createOrder(req: OrderCreateRequest): Promise<OrderCreateResponse>
+export async function listOrders(params?: ListOrdersParams): Promise<OrderListResponse>
+export async function getOrder(orderId: string): Promise<OrderDetailResponse>
+export async function closeOrder(orderId: string): Promise<OrderActionResponse>
+export async function modifyOrder(orderId: string, body: ModifyBody): Promise<OrderActionResponse>
+
+// Positions (Phase 3)
+export async function listPositions(params?: ListPositionsParams): Promise<PositionListResponse>
+
+// History (Phase 3)
+export async function listHistory(params?: ListHistoryParams): Promise<OrderListResponse>
+
+// Accounts (Phase 3)
+export async function listAccounts(): Promise<AccountListResponse>
+export async function updateAccount(broker: string, accountId: string, enabled: boolean): Promise<AccountStatusEntry>
+
+// Volume calc (Phase 2) — Phase 3 unchanged
+export async function calculateVolume(req: CalcVolumeRequest): Promise<CalcVolumeResponse>
+
+// Error mapping helper (D-111)
+export function formatOrderError(err: unknown): string
+export const ORDER_ERROR_MESSAGES: Record<string, string> = { ... }
+```
+
+### 15.10 D-13 / WS message handler routing Phase 3
+
+```typescript
+// useWebSocket dispatcher pattern
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data)
+  if (msg.channel?.startsWith('ticks:')) {
+    setLatestTick(msg.data)
+  } else if (msg.channel?.startsWith('candles:')) {
+    candleHandler?.(msg)
+  } else if (msg.channel === 'positions') {
+    if (msg.data.type === 'positions_tick') {
+      msg.data.positions.forEach((p) => upsertPositionTick({...p, ...coercions}))
+    } else if (msg.data.type === 'position_event') {
+      ...
+    }
+  } else if (msg.channel === 'orders') {
+    if (msg.data.type === 'order_updated') upsertOrder(msg.data)
+  } else if (msg.channel === 'accounts') {
+    if (msg.data.type === 'account_status') setAccountStatuses(msg.data.accounts)
+  }
+}
+```
+
+Property-merge order trong positions_tick handler (D-124): spread first (`...p`), then post-spread coercions for 3 wire-type fields (`current_price: String(p.current_price), is_stale: p.is_stale ? 'true' : 'false', tick_age_ms: String(p.tick_age_ms)`) override.
+
+### 15.11 Lessons learned Phase 3 mở rộng
+
+V2 Phase 3 reuse lessons từ §14, plus thêm:
+- ❌ Drop unknown order_id on positions_tick. **V2 Phase 3**: `upsertPositionTick` true upsert prepend khi findIndex===-1 (D-121). Server payload includes static metadata (D-120) → row renders complete trên insert.
+- ❌ Trust string "false" as falsy in JS. **V2 Phase 3**: server WS payload routes qua typed Pydantic helper `row_to_entry` (D-147) → real bool/Literal types arrive trên wire.
+- ❌ Recompute volume every 1s during market mode auto-entry. **V2 Phase 3**: useTickThrottle 5s (D-139) + VolumeCalculator `refreshing` variant holds prev result (D-140) → smooth UX.
+- ❌ Lose pair name in PositionRow + OrderRow rows. **V2 Phase 3**: pairs cache hoist MainPage (D-131) + `lookupPairName` helper (D-132) với truncated UUID fallback.

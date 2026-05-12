@@ -345,3 +345,139 @@ nssm start ftmo-client-001
 - **Unit test**: mock cTrader Client, test command dispatcher với fake stream entries.
 - **Integration test**: connect cTrader demo account, place + close 1 order, verify resp_stream content.
 - **Smoke test**: start client, server push fake command bằng `redis-cli XADD cmd_stream:ftmo:test_acc * action open ...` → verify execution.
+
+---
+
+## 14. Phase 3 additions
+
+> Phase 3 implement spec từ §1-§13. Mục này ghi nhận **deltas thực tế** — chi tiết quyết định xem `DECISIONS.md` D-046 → D-149. cTrader-specific event behavior xem `docs/ctrader-execution-events.md` (append-only mid-phase per D-069).
+
+### 14.1 Actual layout
+
+Code thực tế tại `apps/ftmo-client/ftmo_client/` (không phải `apps/client-ftmo/client/` như spec ban đầu §3). Module files chính:
+- `main.py` — entry point.
+- `bridge_service.py` — cTrader bridge với `redis: Optional` kwarg (D-073, testable without Redis).
+- `action_handler.py` — place / close / modify action handlers.
+- `command_processor.py` — cmd_stream consumer loop.
+- `event_processor.py` — unsolicited execution event handler.
+- `account_info.py` — account_info_loop publisher.
+- `reconciliation.py` — connect-time snapshot + close history backfill.
+- `ctrader_protobuf_helpers.py` — protobuf builder helpers.
+- `heartbeat.py` — heartbeat publisher.
+- `shutdown.py` — ShutdownController class (ftmo-client-only, không cross-server).
+
+### 14.2 OAuth credentials namespace
+
+Phase 3 FTMO trading credentials lưu ở `ctrader:ftmo:{account_id}:creds` (D-051), tách biệt với Phase 2 market-data credentials ở `ctrader:market_data_creds`. Cho phép Phase 5 hardening: market-data-only sub-account separation.
+
+OAuth flow extraction (D-049): `hedger-shared/ctrader_oauth.py` được dùng chung cả server (Phase 2 market-data) và ftmo-client (Phase 3 trading) — same OAuth code path, different credential namespace.
+
+### 14.3 Volume + price conventions (locked)
+
+- **Volume wire**: `int(volume_lots × lot_size)` (D-053). `lot_size` persisted trong `symbol_config:{symbol}` từ Phase 2 sync. Server stores user-facing decimal `volume_lots`; client converts tại command construction.
+- **Trading prices** (SL/TP/entry): raw `DOUBLE` (D-055). Phase 2 D-032 wire scale (`int / 10^digits`) **chỉ áp dụng** cho tick + trendbar, **không** cho execution events.
+- **deal.executionPrice trong execution events**: `DOUBLE` (D-064), NOT int64.
+- **Money fields** trong account info + closePositionDetail: raw `int` scaled by `money_digits` (D-054). Server stores raw; frontend chia tại render boundary.
+- **Response timeout**: 30s cho cTrader async ops (D-056), aligned với cTrader connection-pool default.
+
+### 14.4 Action handler: place_market_order_with_sltp (D-058)
+
+cTrader **không** chấp nhận inline SL/TP trên market orders → pattern post-fill amend:
+
+```
+1. place_market_order(symbol, side, volume, NO sl/tp inline)
+   → wait ORDER_FILLED event
+   → positionId = event.position.positionId (D-065 authoritative)
+2. asyncio.sleep(0.1)  # 100ms settling delay (D-063)
+3. if sl or tp:
+       amend_order(positionId, sl=sl, tp=tp)
+       → wait ORDER_REPLACED event (single, not 2-event D-067)
+4. publish_response('order_placed', broker_order_id=positionId)
+```
+
+**Fill OK + amend fail edge case** (D-059): no rollback. `order_metadata.sl_tp_attach_failed=true` flag → operator decides recovery (re-amend or close). Phase 5 hardening item: retry amend sau POSITION_LOCKED transient error (D-060).
+
+### 14.5 Action handler: place_pending_order (limit/stop)
+
+- Single ORDER_ACCEPTED event (D-062), not 2-event như close.
+- `broker_order_id = event.order.orderId` (D-061 — pending uses orderId, market uses positionId).
+- SL/TP inline supported cho limit/stop (cTrader chấp nhận trên pending orders).
+
+### 14.6 Action handler: close_position (2-event D-066)
+
+cTrader close gửi **2 ProtoOAExecutionEvent** sequentially:
+1. `executionType=ORDER_ACCEPTED` — broker accepted request, position chưa đóng thực sự.
+2. `executionType=ORDER_FILLED` (a separate event) — position truly closed, kèm `deal.closePositionDetail`.
+
+Handler chờ **second event** trước khi publish close response. Race fix: prev implementations treat ACCEPTED as "done" và publish prematurely → position vẫn open trên broker.
+
+**Realized P&L** (D-068): `deal.closePositionDetail.grossProfit` raw int (money_digits-scaled by account). Server uses authoritative single source — không re-compute từ tick prices.
+
+**close_reason inference** (D-071) structured via 3 inputs:
+- `order.orderType == MARKET` AND `closingOrder == true` → `"manual"`.
+- `order.orderType == STOP_LOSS_TAKE_PROFIT` (enum value = 4, verified protobuf descriptor D-075):
+  - `grossProfit > 0` → `"tp"`.
+  - `grossProfit < 0` → `"sl"`.
+- Fallback: `"unknown"`.
+
+**close_position extended event fields Phase 3** (D-074): event_stream `position_closed` kèm 5 fields từ `closePositionDetail`: `commission`, `swap`, `balance_after_close`, `money_digits`, `closed_volume`.
+
+### 14.7 Action handler: modify_sl_tp
+
+- Single ORDER_REPLACED event (D-067).
+- Frontend payload semantics (D-101): `sl/tp = None` → keep existing; `sl/tp = 0` → remove; `sl/tp = positive` → set with direction validation. Server validates → translate sang cTrader amend_order với appropriate `Optional[float]`.
+
+### 14.8 Unsolicited execution events (D-070)
+
+FTMO client subscribes execution events khi connect. Unsolicited events publish vào `event_stream:ftmo:{account_id}`:
+
+- `position_closed` — SL hit, TP hit, manual close on cTrader UI, stopout.
+- `pending_filled` — limit/stop pending → fill (after cTrader trigger).
+- `position_modified` — operator modify SL/TP on cTrader UI (outside our PATCH).
+- `order_cancelled` — operator cancel pending on cTrader UI (rare). 
+  
+**`order_cancelled` noise filter** (D-080): cTrader auto-cancels internal STOP_LOSS_TAKE_PROFIT order khi position close → publishes order_cancelled với internal `orderId` không có trong server Redis cache. Server event_handler ignore nếu no Redis match.
+
+### 14.9 account_info_loop (D-072)
+
+Per-FTMO-account, 30s interval. HSET `account:ftmo:{account_id}` với fields:
+
+```
+balance       # raw int
+equity        # raw int (Phase 3 ≈ balance per ProtoOAAccountInfo limitations)
+margin        # raw int
+free_margin   # raw int
+currency      # "USD" typically
+money_digits  # int
+updated_at    # ms
+```
+
+Phase 5 hardening: detailed margin calculation từ ProtoOAGetAccountListByAccessTokenRes.
+
+### 14.10 Reconciliation on connect (D-076-D-080)
+
+FTMO client reconnect/restart triggers snapshot reconciliation:
+
+1. **ReconcileOpenPositionsReq** → snapshot active positions → publish `reconcile_state:ftmo:{acc}` stream với `message_type="position_snapshot"`.
+2. **ReconcilePendingOrdersReq** → snapshot pending orders → `message_type="pending_snapshot"`.
+3. **Per missing closed order** trong server's Redis cache (server tells client which order_ids cần backfill via `fetch_close_history` command):
+   - **ProtoOADealListByPositionIdReq**: requires `fromTimestamp` + `toTimestamp` (cannot omit, will reject — D-077). Time window typically last 30 days.
+   - Retry 3 attempts, exponential backoff 1s / 2s (D-079).
+   - Reconstructed close events có `close_reason="unknown"` (D-078) — original event lost.
+
+Server-side reconciliation consume task (step 3.7 `reconciliation.py`) ingests stream messages idempotently — skip nếu Redis cache đã có `p_status=closed`.
+
+**Pending order reconciliation full handling**: Phase 5 hardening (currently stub — D-076 incomplete cho non-snapshot edge cases).
+
+**`hasMore` pagination DealListByPositionIdRes**: Phase 5 hardening (current single-page).
+
+### 14.11 Heartbeat unchanged (Phase 1)
+
+`client:ftmo:{account_id}` HASH với `status=online, last_seen, version`. TTL 30s, refresh mỗi 10s (3 missed → mark offline). Server check `EXISTS` qua `RedisService.get_client_status(broker, account_id)` (D-128 status precedence).
+
+### 14.12 Mở rộng v1 lessons (D-119)
+
+V2 Phase 3 reuse lessons từ §12, plus thêm:
+- ❌ Trust execution event `clientMsgId` matching alone. **V2 Phase 3**: 2-event close sequence requires waiting cho second FILLED event before publish.
+- ❌ Assume execution event prices are scaled int. **V2 Phase 3**: prices là raw DOUBLE (D-064).
+- ❌ Treat order.orderType ENUM as just int. **V2 Phase 3**: enum value 4 = STOP_LOSS_TAKE_PROFIT (D-075 protobuf descriptor verified).

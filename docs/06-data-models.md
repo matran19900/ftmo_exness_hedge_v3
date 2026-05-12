@@ -402,3 +402,209 @@ class AccountResponse(BaseModel):
 ## 14. Migration từ v1 (KHÔNG áp dụng — rebuild from scratch)
 
 Không có migration. Project rebuild from scratch, Redis bắt đầu rỗng.
+
+---
+
+## 15. Phase 3 additions (Single-leg Trading — FTMO only)
+
+> Phase 3 implement spec từ §1-§14. Mục này ghi nhận **deltas thực tế** trong Phase 3 — chi tiết quyết định xem `DECISIONS.md` D-046 → D-149.
+
+### 15.1 Money + price wire conventions (locked)
+
+- **Money fields** (balance, equity, P&L, commission, swap, ...): raw `int` cent-style scaled by `money_digits` per D-053. Frontend chia `10^money_digits` tại render boundary qua `scaleMoney(raw, money_digits)` (D-108). Server-side luôn dùng raw — **không bao giờ** chia trong tier business logic.
+- **Trading prices** (sl_price, tp_price, entry_price, p_fill_price, deal.executionPrice trong cTrader events): raw `DOUBLE` (D-055, D-064). D-032 wire scale (`int / 10^digits`) **chỉ áp dụng** cho tick + trendbar, **không** áp dụng cho execution events.
+- **Timestamps**: epoch milliseconds như `int` lưu thành `str` trong Redis HASH (Phase 1 convention unchanged).
+
+### 15.2 OrderHash TypedDict (locked schema Phase 3)
+
+`server/app/services/redis_service.py:OrderHash` (TypedDict). Phase 3 ~30 fields, primary leg fully populated (Exness `s_*` defer Phase 4):
+
+```python
+OrderHash = TypedDict("OrderHash", {
+    # Identifiers
+    "order_id": str,
+    "pair_id": str,
+    "ftmo_account_id": str,
+    "exness_account_id": str,
+    # Request shape
+    "symbol": str,
+    "side": str,                  # Literal["buy", "sell"]
+    "order_type": str,            # Literal["market", "limit", "stop"]
+    "sl_price": str,
+    "tp_price": str,
+    "entry_price": str,           # "0" cho market (D-110, D-137)
+    # Order-level status
+    "status": str,                # pending | filled | closed | rejected | cancelled
+    "created_at": str,            # ms
+    "updated_at": str,
+    # Primary leg (FTMO) — Phase 3 fully populated
+    "p_status": str,
+    "p_volume_lots": str,
+    "p_broker_order_id": str,     # positionId cho market, orderId cho pending (D-061)
+    "p_fill_price": str,
+    "p_executed_at": str,
+    "p_commission": str,
+    "p_swap": str,
+    "p_closed_at": str,
+    "p_close_reason": str,        # manual | sl | tp | stopout | unknown
+    "p_realized_pnl": str,        # raw int (D-068)
+    "p_money_digits": str,
+    # Secondary leg (Exness) — Phase 3 placeholder
+    "s_status": str,              # Phase 3: "pending_phase_4" (D-083)
+    "s_volume_lots": str,         # empty Phase 3
+    # ... other s_* fields empty until Phase 4
+})
+```
+
+**Status state machine Phase 3**: pending → filled (open) → closed. rejected (entry validation fail) hoặc cancelled (operator close before fill — rare edge). D-090 lock 6-state composition rule cho Phase 4 hedge cascade.
+
+**close_reason vocab** (D-071, D-078): `manual | sl | tp | stopout | unknown`. `unknown` đặc biệt cho reconstructed events (D-076-D-079).
+
+### 15.3 PositionEntry (frontend)
+
+```typescript
+// web/src/api/client.ts
+interface Position {
+  order_id: string
+  symbol: string
+  side: "buy" | "sell"
+  volume_lots: string
+  entry_price: string
+  current_price: string         // raw DOUBLE str từ position_cache
+  unrealized_pnl: string        // raw int (money_digits-scaled, D-053)
+  money_digits: string
+  is_stale: string              // "true" | "false" (>5s tick D-093)
+  tick_age_ms: string
+  // Static metadata kèm từ order HASH zero-cost (D-120 step 3.11c)
+  sl_price?: string
+  tp_price?: string
+  p_executed_at?: string
+}
+```
+
+`PositionRow` joins via orders slice để pull `pair_id` (D-133 — Position interface không carry pair_id).
+
+### 15.4 AccountStatusEntry (REST + WS shared)
+
+```typescript
+// web/src/api/client.ts (D-147 typed single source of truth)
+interface AccountStatusEntry {
+  broker: "ftmo" | "exness"
+  account_id: string
+  name: string
+  enabled: boolean              // real bool — D-147 fix pre-3.13a regression
+  status: "online" | "offline" | "disabled"  // D-128 precedence: disabled > online/offline
+  balance_raw: string
+  equity_raw: string
+  margin_raw: string
+  free_margin_raw: string
+  currency: string
+  money_digits: string
+}
+```
+
+Server `app/services/account_helpers.py:row_to_entry(row)` maps `dict[str, str]` từ Redis → typed entry với `enabled = (row["enabled"] == "true")`. Cả REST GET /api/accounts và WS account_status_loop đều route qua helper này (D-147 — fixes pre-3.13a regression where WS shipped string `"false"` and JS `Boolean("false") === true`).
+
+### 15.5 WS message envelopes Phase 3
+
+```typescript
+// Tick (Phase 1+2 unchanged shape)
+interface WsTickMessage {
+  channel: string  // "ticks:{symbol}"
+  data: { type: "tick", symbol: string, bid: number, ask: number, ts: number }
+}
+
+// Candle (Phase 1+2 unchanged shape)
+interface WsCandleMessage {
+  channel: string  // "candles:{symbol}:{timeframe}"
+  data: { type: "candle_update", time: number, open: number, high: number, low: number, close: number }
+}
+
+// Positions tick — Phase 3 broadcast từ position_tracker_loop 1s (D-091, D-097, D-120)
+interface WsPositionsTickMessage {
+  channel: "positions"
+  data: {
+    type: "positions_tick"
+    account_id: string
+    ts: number
+    positions: Array<{
+      order_id: string
+      symbol: string
+      current_price: string      // D-122: unified to str
+      unrealized_pnl: string     // raw int
+      is_stale: boolean
+      tick_age_ms: number
+      // Phase 3 static metadata zero-cost từ order HASH (D-120)
+      side?: string
+      volume_lots?: string
+      entry_price?: string
+      money_digits?: string
+      sl_price?: string
+      tp_price?: string
+      p_executed_at?: string
+    }>
+  }
+}
+
+// Order state change — broadcast từ response_handler + event_handler
+interface WsOrderUpdatedMessage {
+  channel: "orders"
+  data: {
+    type: "order_updated"
+    order_id: string
+    // ... fields phụ thuộc vào event type (place response / close response / unsolicited close / modify)
+  }
+}
+
+// Account status snapshot — broadcast từ account_status_loop 5s (D-126)
+interface WsAccountStatusMessage {
+  channel: "accounts"
+  data: {
+    type: "account_status"
+    ts: number
+    accounts: AccountStatusEntry[]  // typed entries (D-147)
+  }
+}
+```
+
+### 15.6 Pydantic schemas Phase 3
+
+REST request/response models trong `server/app/api/*.py`:
+
+- `OrderCreateRequest` (orders.py): `pair_id`, `symbol`, `side`, `order_type`, `volume_lots`, `sl`, `tp`, `entry_price`.
+- `OrderCreateResponse`: `order_id`, `request_id`, `status="accepted"`, `message`.
+- `OrderListResponse`: `orders[]`, `total`, `limit`, `offset`.
+- `ModifyOrderRequest` (orders.py): `sl: float | None`, `tp: float | None` (D-101 — None=keep, 0=remove, positive=set; Pydantic root validator reject both None).
+- `OrderActionResponse`: dispatch async response.
+- `ListPositionsParams` query.
+- `ListHistoryParams` query với `from_ts`, `to_ts`, `symbol`, `account_id`, `limit`, `offset` (D-103 default window 7 days).
+- `AccountStatusEntry` (accounts.py): xem §15.4.
+- `AccountListResponse`: `accounts[]`, `total`.
+- `AccountUpdateRequest` (D-143): `enabled: bool`.
+- `OrderValidationError` (exception): `error_code: str` (lowercase snake_case, D-057) + `http_status: int` + `message: str`. Maps 1:1 to FastAPI HTTPException detail `{error_code, message}` (D-082).
+
+### 15.7 Frontend Zustand slices Phase 3
+
+```typescript
+// web/src/store/index.ts
+interface AppState {
+  // ... Phase 1+2 slices (token, selectedSymbol, side, entryPrice, slPrice, tpPrice,
+  //                      riskAmount, manualVolumePrimary, latestTick, etc.)
+
+  // Phase 3 added (persisted = in partialize whitelist):
+  orderType: "market" | "limit" | "stop"  // default "market", persisted (D-134)
+  selectedPairId: string | null           // persisted
+
+  // Phase 3 runtime-only (NOT persisted — server-derived):
+  orders: Order[]
+  positions: Position[]
+  history: Order[]
+  accountStatuses: AccountStatusEntry[]
+  pairs: PairResponse[]                   // pairs cache hoist MainPage (D-131)
+  tickThrottled: TickThrottled | null     // 5s snapshot (D-138, D-139)
+  volumeReady: boolean
+  effectiveVolumeLots: number | null
+}
+```
+
+`partialize` whitelist (persisted): `token`, `selectedSymbol`, `selectedTimeframe`, `selectedPairId`, `riskAmount`, `orderType`. NOT persisted: order-form draft prices (Entry/SL/TP/manualVolume reset per session), tickThrottled, server-derived slices (orders/positions/history/accountStatuses/pairs).

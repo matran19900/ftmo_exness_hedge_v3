@@ -217,6 +217,57 @@ class MarketDataService:
 ## 9. Error handling
 
 - Global FastAPI exception handlers cho `HTTPException`, `ValidationError`, `Exception`.
-- Format error: `{ "detail": "human readable message" }`.
+- Format error: `{ "detail": "human readable message" }` cho Phase 1/2. Phase 3 mở rộng structured: `{ "detail": { "error_code": "<snake>", "message": "<human>" } }` (D-082, D-111).
 - Validation fail (user error) → log INFO/WARN.
 - Adapter exception → log ERROR + stack trace.
+
+---
+
+## 10. Phase 3 additions
+
+> Phase 3 implement spec từ §1-§9. Mục này ghi nhận **deltas thực tế** — chi tiết quyết định xem `DECISIONS.md` D-046 → D-149.
+
+### 10.1 Actual code layout
+
+Spec §1 đã list `apps/server/` nhưng repo thực tế dùng `server/` (root) thay vì `apps/server/`. Module paths:
+- `server/app/api/` — REST routers (orders, positions, history, accounts, pairs, symbols, charts, auth, auth_ctrader, ws).
+- `server/app/services/` — business logic (redis_service, market_data, broadcast, order_service, response_handler, event_handler, position_tracker, account_status, account_helpers, symbol_whitelist).
+- `server/app/dependencies/` — FastAPI DI helpers (auth.get_current_user_rest, auth.get_current_user_ws).
+- `server/app/main.py` — entry point + lifespan.
+
+### 10.2 Background tasks Phase 3 (D-086, D-088, D-091, D-126)
+
+Phase 3 thêm 4 loại background task. Lifespan **task placement order** quan trọng (D-088):
+
+**Startup order** (sau Redis init + setup_consumer_groups):
+1. MarketDataService start (Phase 2 unchanged).
+2. **Per-FTMO-account loops** (Phase 3 new) — 1 task / loop / account:
+   - `response_handler_loop(account_id)` — consume `resp_stream:ftmo:{acc}`, group "server", consumer "server-{acc}". XREADGROUP BLOCK 1000ms. ACK only on successful handle.
+   - `event_handler_loop(account_id)` — consume `event_stream:ftmo:{acc}`, same pattern. Plus reconciliation consume on connect (D-076).
+   - `position_tracker_loop(account_id)` — 1s poll filled orders, compute unrealized P&L, broadcast `positions` WS channel batched (D-097).
+3. **Global loops** (Phase 3 new) — 1 task total:
+   - `account_status_loop` — 5s, broadcast snapshot toàn bộ accounts qua `accounts` WS channel (D-126).
+
+**Shutdown REVERSE order** (D-088 critical to prevent "talking to closing Redis" race):
+1. account_status_loop cancel + await.
+2. Per-account loops cancel + await (response_handler, event_handler, position_tracker).
+3. MarketDataService stop.
+4. Redis close.
+
+Cancellation pattern: bare `while True` + `asyncio.CancelledError` re-raise + `Task.cancel()` từ lifespan finally. Không dùng `ShutdownController` (class ấy ở `apps/ftmo-client/`, không phải server-side).
+
+### 10.3 Phase 3 REST router additions
+
+`main.py:include_router` thêm Phase 3 (xem `08-server-api.md` §10-§14):
+- `orders_router` — POST + GET list + GET detail + POST close + POST modify.
+- `positions_router` — GET live positions.
+- `history_router` — GET closed orders với time-range.
+- `accounts_router` — GET list + PATCH /{broker}/{account_id} (step 3.13).
+
+### 10.4 WS channel additions Phase 3
+
+`VALID_CHANNEL_PREFIXES` extends: `("ticks:", "candles:", "positions", "orders", "accounts", "agents")`. Channel validator hỗ trợ cả prefix-match và exact-match (D-109). Chi tiết xem `05-redis-protocol.md` §14.4 + `08-server-api.md` §9.
+
+### 10.5 Settings (`config.py`) Phase 3 additions
+
+Phase 3 không thêm settings mới đáng kể — các interval (response_handler block 1000ms, position_tracker 1s, account_status_loop 5s) hardcoded trong service modules (constants, easy override cho tests).
