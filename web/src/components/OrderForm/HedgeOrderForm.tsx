@@ -59,16 +59,32 @@ export function HedgeOrderForm() {
   const orderType = useAppStore((s) => s.orderType)
   const tickThrottled = useAppStore((s) => s.tickThrottled)
 
-  // Step 3.12: block submit while no FTMO account is online. We can't
-  // see Exness here (Phase 4) so we only gate on the FTMO side.
-  // ``accountStatuses === []`` (initial load) is treated as offline —
-  // the disabled state lasts at most one REST roundtrip + 5 s WS tick.
-  const hasOnlineFtmoAccount = accountStatuses.some(
-    (acc) => acc.broker === 'ftmo' && acc.status === 'online'
-  )
-  const submitBlockedReason = !hasOnlineFtmoAccount
-    ? 'FTMO client offline — không thể gửi lệnh'
-    : ''
+  // Step 3.12 / 3.13a: block submit while no FTMO account is online,
+  // AND surface a tooltip that names the specific reason so the
+  // operator knows where to act.
+  //
+  // Three distinct block reasons in priority order (most actionable
+  // wins):
+  //   1. No FTMO accounts configured at all → operator must go to
+  //      Settings → Accounts (or wait for the bootstrap to register one).
+  //   2. Every FTMO account toggled off via Settings → not a client
+  //      crash, just an operator pause. Different fix (re-enable).
+  //   3. Heartbeat-dead client (status=offline) → the FTMO client
+  //      process needs investigation. Different from a deliberate pause.
+  //
+  // Empty ``accountStatuses`` (transient: initial load before REST
+  // returns) trips case 1 and disables submit; the state lasts at
+  // most one REST roundtrip + 5 s WS tick.
+  const ftmoAccounts = accountStatuses.filter((a) => a.broker === 'ftmo')
+  const hasOnlineFtmoAccount = ftmoAccounts.some((a) => a.status === 'online')
+  let ftmoBlockMessage: string | null = null
+  if (ftmoAccounts.length === 0) {
+    ftmoBlockMessage = 'Chưa có FTMO account được cấu hình'
+  } else if (ftmoAccounts.every((a) => a.status === 'disabled')) {
+    ftmoBlockMessage = 'FTMO account đã bị vô hiệu hóa (mở Settings → Accounts để bật lại)'
+  } else if (!hasOnlineFtmoAccount) {
+    ftmoBlockMessage = 'FTMO client offline (heartbeat đã expired)'
+  }
 
   const [submitting, setSubmitting] = useState(false)
 
@@ -326,15 +342,15 @@ export function HedgeOrderForm() {
         type="button"
         onClick={handleSubmit}
         disabled={placeDisabled}
-        title={submitBlockedReason}
+        title={ftmoBlockMessage ?? ''}
         className={`w-full py-2 rounded text-sm font-bold text-white transition-colors disabled:cursor-not-allowed ${sideClasses}`}
       >
         {submitting
           ? 'Đang gửi...'
           : `${side === 'buy' ? 'BUY' : 'SELL'} ${selectedSymbol ?? ''} ${effectiveVolumeLots ?? ''}`.trim()}
       </button>
-      {submitBlockedReason && (
-        <div className="text-xs text-red-600 text-center -mt-1">{submitBlockedReason}</div>
+      {ftmoBlockMessage && (
+        <div className="text-xs text-red-600 text-center -mt-1">{ftmoBlockMessage}</div>
       )}
     </div>
   )

@@ -173,3 +173,63 @@ async def test_loop_exits_on_cancel(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+# ---------- step 3.13a: broadcast payload shape (typed entries) ----------
+
+
+@pytest.mark.asyncio
+async def test_broadcast_payload_enabled_is_boolean(
+    redis_svc: RedisService,
+    redis_client: fakeredis.aioredis.FakeRedis,
+    broadcast: _CapturingBroadcast,
+) -> None:
+    """Step 3.13a: each per-account entry in the broadcast must ship
+    ``enabled`` as a Python bool (``True``/``False``), not the
+    HASH-string literal ``"true"``/``"false"``. Pre-3.13a the WS
+    payload passed raw rows through, and the frontend's
+    ``Boolean("false") === true`` evaluation made disabled accounts
+    render as enabled."""
+    await _seed_ftmo_account_online(redis_svc, redis_client)
+
+    task = asyncio.create_task(account_status_loop(redis_svc, broadcast, interval_seconds=0.05))
+    await asyncio.sleep(0.08)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert broadcast.published
+    _, data = broadcast.published[0]
+    entry = data["accounts"][0]
+    assert entry["enabled"] is True  # not "true"
+
+
+@pytest.mark.asyncio
+async def test_broadcast_payload_disabled_account(
+    redis_svc: RedisService,
+    redis_client: fakeredis.aioredis.FakeRedis,
+    broadcast: _CapturingBroadcast,
+) -> None:
+    """Disabled account → ``enabled: False`` AND ``status: "disabled"``
+    in the WS payload. The two fields together ensure the frontend
+    can distinguish an operator-paused account from a crashed FTMO
+    client (step 3.13a OrderForm tooltip needs this)."""
+    await redis_svc.add_account("ftmo", "ftmo_001", name="paused", enabled=False)
+    # Heartbeat still alive — but operator override beats it.
+    await redis_client.set("client:ftmo:ftmo_001", "1", ex=30)
+
+    task = asyncio.create_task(account_status_loop(redis_svc, broadcast, interval_seconds=0.05))
+    await asyncio.sleep(0.08)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert broadcast.published
+    _, data = broadcast.published[0]
+    entry = data["accounts"][0]
+    assert entry["enabled"] is False
+    assert entry["status"] == "disabled"

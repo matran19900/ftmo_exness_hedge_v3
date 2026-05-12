@@ -26,6 +26,7 @@ import asyncio
 import logging
 import time
 
+from app.services.account_helpers import row_to_entry
 from app.services.broadcast import BroadcastService
 from app.services.redis_service import RedisService
 
@@ -59,10 +60,16 @@ async def account_status_loop(
             cycle_start = time.monotonic()
             try:
                 rows = await redis_svc.get_all_accounts_with_status()
+                # Step 3.13a: route rows through ``row_to_entry`` so the
+                # WS payload's ``enabled`` arrives as a real JSON bool
+                # and ``status`` as the documented Literal. Pre-3.13a
+                # the raw HASH-string rows shipped verbatim and the
+                # frontend's ``Boolean("false") === true`` evaluation
+                # made disabled accounts render as enabled.
                 payload = {
                     "type": "account_status",
                     "ts": int(time.time() * 1000),
-                    "accounts": rows,
+                    "accounts": [row_to_entry(row).model_dump() for row in rows],
                 }
                 await broadcast.publish(ACCOUNTS_CHANNEL, payload)
             except asyncio.CancelledError:

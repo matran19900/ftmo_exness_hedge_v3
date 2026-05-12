@@ -18,7 +18,7 @@ Authentication mirrors the rest of Phase 3 (``Bearer`` JWT via
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, cast
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -64,37 +64,6 @@ class AccountUpdateRequest(BaseModel):
     enabled: bool
 
 
-def _row_to_entry(row: dict[str, str]) -> AccountStatusEntry:
-    """Map a ``get_all_accounts_with_status`` row dict → AccountStatusEntry.
-
-    Pulled into a helper so both ``list_accounts`` and ``update_account``
-    use the same status / broker narrowing — Literal-typed pydantic
-    fields require ``cast`` rather than a string assertion.
-    """
-    broker = cast(Literal["ftmo", "exness"], row["broker"])
-    raw_status = row["status"]
-    status: Literal["online", "offline", "disabled"]
-    if raw_status == "online":
-        status = "online"
-    elif raw_status == "offline":
-        status = "offline"
-    else:
-        status = "disabled"
-    return AccountStatusEntry(
-        broker=broker,
-        account_id=row["account_id"],
-        name=row["name"],
-        enabled=row["enabled"] == "true",
-        status=status,
-        balance_raw=row["balance_raw"],
-        equity_raw=row["equity_raw"],
-        margin_raw=row["margin_raw"],
-        free_margin_raw=row["free_margin_raw"],
-        currency=row["currency"],
-        money_digits=row["money_digits"],
-    )
-
-
 @router.get(
     "",
     response_model=AccountListResponse,
@@ -104,8 +73,16 @@ async def list_accounts(
     _user: Annotated[str, Depends(get_current_user_rest)],
     redis_svc: Annotated[RedisService, Depends(get_redis_service)],
 ) -> AccountListResponse:
+    # Step 3.13a: ``row_to_entry`` was hoisted to
+    # ``app.services.account_helpers`` so both this endpoint and the
+    # ``account_status_loop`` broadcast produce identical typed
+    # shapes. Imported inside the function body to avoid a top-level
+    # import cycle (helpers imports ``AccountStatusEntry`` from this
+    # module).
+    from app.services.account_helpers import row_to_entry  # noqa: PLC0415
+
     rows = await redis_svc.get_all_accounts_with_status()
-    accounts = [_row_to_entry(row) for row in rows]
+    accounts = [row_to_entry(row) for row in rows]
     return AccountListResponse(accounts=accounts, total=len(accounts))
 
 
@@ -159,4 +136,7 @@ async def update_account(
                 "message": "Account update succeeded but entry not found on re-read",
             },
         )
-    return _row_to_entry(matching)
+    # Step 3.13a: shared helper (see ``list_accounts``).
+    from app.services.account_helpers import row_to_entry  # noqa: PLC0415
+
+    return row_to_entry(matching)
