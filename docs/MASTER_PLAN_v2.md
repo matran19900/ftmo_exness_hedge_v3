@@ -332,7 +332,9 @@ Build trading pipeline end-to-end cho **1 leg FTMO**. Verify P&L USD chính xác
 | 3.11 | `step/3.11-web-order-form-submit` | Submit `POST /orders` real + lifecycle toasts. |
 | 3.12 | `step/3.12-web-chart-order-overlay` | `useChartOrderOverlay` + R46/R47 filter + R48 3 trạng thái + map keyed order_id. |
 | 3.13 | `step/3.13-web-chart-drag-sltp` | Drag SL/TP open order → PATCH + revert on reject. |
-| 3.14 | `step/3.14-phase-3-docs-sync` | Update docs + `PHASE_3_REPORT.md` + append `DECISIONS.md`. Tag `phase-3-complete`. |
+| 3.14 | `step/3.14a` + `step/3.14b` | Update docs + `PHASE_3_REPORT.md` + append `DECISIONS.md`. Split 2 parts per WORKFLOW Option B size constraint. Tag `phase-3-complete`. |
+
+> **Phase 3 actual delivery deviated từ plan above** — đặc biệt step 3.12 (Account status indicator thay vì chart overlay) và 3.13 (Settings modal thay vì drag SL/TP). Drag SL/TP + chart order overlay defer Phase 5 hardening (kế thừa cùng drag setup line Phase 2). Plus 16 sub-fix steps. Full step ledger với actual scope, commit hashes, decisions impact xem `PHASE_3_REPORT.md`.
 
 ---
 
@@ -775,12 +777,13 @@ CEO chỉ điền 2 dòng cuối → CTO mới có đủ context bắt đầu wo
 |---|---|---|---|---|
 | 1 — Foundation | ✅ done | 9/9 | `phase-1-complete` | `docs/PHASE_1_REPORT.md` |
 | 2 — Market Data + Chart + Form | ✅ done | 21/10 | `phase-2-complete` | `docs/PHASE_2_REPORT.md` |
-| 3 — Single-leg Trading | ⏳ pending | 0/14 | — | — |
+| 3 — Single-leg Trading | ✅ done | 30/14 | `phase-3-complete` (chờ merge 3.14b) | `docs/PHASE_3_REPORT.md` |
 | 4 — Hedge + Cascade | ⏳ pending | 0/11 | — | — |
 | 5 — Hardening + Deploy | ⏳ pending | 0/10 | — | — |
 
 > Phase 1 đếm 9 step khi tính cả 1.4a (sub-fix). Plan gốc có 8.
 > Phase 2 đếm 21 step khi tính 10 step chính + 11 sub-fix (2.1a, 2.1b, 2.2a, 2.6a, 2.7a, 2.7b, 2.7c, 2.7e, 2.8a, 2.9a, 2.9b). Plan gốc có 10. Step 2.7d (RAF throttle) làm xong nhưng REJECT — không merge. Chi tiết deviation xem `PHASE_2_REPORT.md`.
+> Phase 3 đếm 30 step actions khi tính 13 step chính (3.1–3.13) + 16 sub-fix (3.3a, 3.3b, 3.4a, 3.4b, 3.4c, 3.5a, 3.5b, 3.10a, 3.11a, 3.11b, 3.11c, 3.11d, 3.12a, 3.12b, 3.12c, 3.13a) + 1 docs sync split 2 commits (3.14a + 3.14b). Plan gốc có 14 step. Chi tiết deviation + cumulative deliverables (REST surface 6 endpoints + 6 WS channels + 650 tests + 104 decisions D-046→D-149) xem `PHASE_3_REPORT.md`.
 
 CTO update tracker này sau mỗi phase PASS.
 
