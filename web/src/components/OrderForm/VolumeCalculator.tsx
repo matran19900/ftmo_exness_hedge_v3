@@ -13,9 +13,18 @@ const RATIO_DEFAULT = 1.0
 // means a side-direction violation never overwrites a previous successful
 // `result`, so manual-mode metrics return instantly when the user fixes
 // the direction (no need to wait for the next debounce).
+//
+// Step 3.12c: the ``refreshing`` variant carries the previous ``result``
+// so the result block stays mounted during a recalc. Pre-3.12c every
+// throttled-tick auto-driven entry change triggered ``calculating`` →
+// "Calculating..." 1-liner → ``ready`` → multi-line table, which
+// flickered the whole sidebar at the 1 Hz cadence. Holding the prior
+// result keeps the layout stable; a small dot top-right of the block
+// signals the inflight recalc.
 type ApiState =
   | { status: 'idle' }
   | { status: 'calculating' }
+  | { status: 'refreshing'; result: CalculateVolumeResponse }
   | { status: 'ready'; result: CalculateVolumeResponse }
   | { status: 'error'; error: string }
 
@@ -60,7 +69,20 @@ export function VolumeCalculator() {
     let cancelled = false
 
     async function run(symbol: string, entry: number, sl: number, risk: number) {
-      setApiState({ status: 'calculating' })
+      // Step 3.12c: hold the previous result during a recalc so the
+      // operator never sees the layout swap between "Calculating..."
+      // and the result block on each 5 s tick. Only the first-ever
+      // calc (no prior ``ready`` / ``refreshing``) takes the bare
+      // ``calculating`` path.
+      setApiState((prev) => {
+        if (prev.status === 'ready') {
+          return { status: 'refreshing', result: prev.result }
+        }
+        if (prev.status === 'refreshing') {
+          return prev
+        }
+        return { status: 'calculating' }
+      })
       try {
         const result = await calculateVolume(symbol, {
           entry,
@@ -108,7 +130,9 @@ export function VolumeCalculator() {
       setEffectiveVolumeLots(manualVolumePrimary)
       return
     }
-    if (apiState.status === 'ready') {
+    // Step 3.12c: ``refreshing`` carries the prior result and is still
+    // a valid submit-time volume — drop-through to the same gate.
+    if (apiState.status === 'ready' || apiState.status === 'refreshing') {
       setVolumeReady(true)
       setEffectiveVolumeLots(apiState.result.volume_primary)
       return
@@ -178,15 +202,29 @@ export function VolumeCalculator() {
     )
   }
 
-  // Auto-ready or manual mode. Result preserved across side-direction
-  // violations; cleared by API errors so we never show stale metrics for
+  // Auto-ready / refreshing / manual mode. Result preserved across
+  // side-direction violations and across in-flight recalcs (step
+  // 3.12c); cleared by API errors so we never show stale metrics for
   // an entry/sl that the server actively rejected.
-  const result = apiState.status === 'ready' ? apiState.result : null
+  const result =
+    apiState.status === 'ready' || apiState.status === 'refreshing' ? apiState.result : null
+  const isRefreshing = apiState.status === 'refreshing'
   const effectiveVolP = isManualMode ? manualVolumePrimary : (result?.volume_primary ?? null)
   const effectiveVolS = effectiveVolP === null ? null : effectiveVolP * RATIO_DEFAULT
 
   return (
-    <div className="space-y-2 text-xs">
+    <div className="space-y-2 text-xs relative">
+      {/* Step 3.12c: subtle inflight-recalc indicator. Invisible
+          99 % of the time (calculateVolume typically returns in
+          < 300 ms); blip only shows on slow networks or during
+          the brief window between debounce-fire and API resolve. */}
+      {isRefreshing && (
+        <div
+          className="absolute -top-1 -right-1 w-1.5 h-1.5 rounded-full bg-blue-400 opacity-60"
+          aria-hidden="true"
+          title="Đang cập nhật..."
+        />
+      )}
       <div className="flex justify-between items-center gap-2">
         <span className="text-gray-600 shrink-0">Vol Primary:</span>
         {isManualMode ? (

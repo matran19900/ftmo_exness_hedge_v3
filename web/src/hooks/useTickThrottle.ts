@@ -1,18 +1,28 @@
 import { useEffect } from 'react'
 import { useAppStore } from '../store'
 
-const THROTTLE_INTERVAL_MS = 1000
+const THROTTLE_INTERVAL_MS = 5000
 
 /**
  * Drive the ``tickThrottled`` store slice from ``latestTick`` on a
- * 1 Hz cadence (step 3.12b).
+ * 5 s cadence (step 3.12c — relaxed from 1 s in step 3.12b).
  *
  * WHY: the WS publishes ticks at ~5–10 Hz on liquid FX. If the
  * VolumeCalculator + market-mode entry preview reacted to every
  * tick, the displayed volume number would jitter visibly and the
  * ``calculateVolume`` debounce (300 ms) would keep firing API calls
- * back-to-back. Throttling to 1 Hz at the store boundary keeps the
- * UI calm without losing the "live" feel.
+ * back-to-back. Throttling at the store boundary keeps the UI calm
+ * without losing the "live" feel.
+ *
+ * 3.12b started at 1 s. Operator feedback during active markets:
+ * the 1 Hz layout swap between "Calculating..." and the result block
+ * was distracting and the submit button's volume label flickered.
+ * 3.12c bumps to 5 s AND VolumeCalculator now holds the previous
+ * result during recalc (see ``ApiState.refreshing``) — together they
+ * make the form feel stable during market-mode sizing. The server
+ * fills at the actual tick on submit, so the on-screen preview
+ * lagging the real market by up to ~5 s is acceptable for the
+ * sizing-feedback purpose.
  *
  * Symbol snapshot: ``latestTick`` itself doesn't carry the symbol
  * (the WS handler filters by symbol before storing it), but the
@@ -44,7 +54,7 @@ export function useTickThrottle(): void {
     }
 
     // Seed immediately so the first render after mount doesn't have
-    // to wait a full second before market-mode entry populates.
+    // to wait 5 s before market-mode entry populates.
     snapshot()
 
     const interval = setInterval(snapshot, THROTTLE_INTERVAL_MS)
