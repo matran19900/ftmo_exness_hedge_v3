@@ -483,6 +483,18 @@ export interface WsPositionsTickMessage {
       unrealized_pnl: string
       is_stale: boolean
       tick_age_ms: number
+      // Step 3.11c server payload enrichment — static metadata sourced
+      // from the order HASH so the WS handler (step 3.11d) can forward
+      // enough data into ``upsertPositionTick`` to render a brand-new
+      // row without a REST refresh. Optional so the TS compiler tolerates
+      // older server versions (pre-3.11c) that don't ship these keys.
+      side?: string
+      volume_lots?: string
+      entry_price?: string
+      money_digits?: string
+      sl_price?: string
+      tp_price?: string
+      p_executed_at?: string
     }[]
   }
 }

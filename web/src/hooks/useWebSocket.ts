@@ -84,16 +84,20 @@ export function useWebSocket(): UseWebSocketResult {
     const handlePositionsChannel = (msg: WsPositionsTickMessage | WsPositionEventMessage) => {
       const store = useAppStore.getState()
       if (msg.data.type === 'positions_tick') {
-        // The batched envelope carries N position updates. The store
-        // merges each into the existing positions array; rows for
-        // order_ids not in the array are dropped (next REST refresh
-        // will pull them).
+        // The batched envelope carries N position updates. Since
+        // step 3.11c the store reducer is a true upsert — unknown
+        // order_ids are inserted (newest-first) rather than dropped.
+        // Step 3.11d spreads the full server payload through so the
+        // 7 static metadata fields (side, volume_lots, entry_price,
+        // money_digits, sl_price, tp_price, p_executed_at) land in
+        // the inserted row and the operator sees complete cells
+        // without waiting for the next REST refresh. Explicit
+        // coercions cover the 3 fields where the wire type differs
+        // from the ``Position`` interface (string vs number/bool).
         for (const p of msg.data.positions) {
           store.upsertPositionTick({
-            order_id: p.order_id,
-            symbol: p.symbol,
+            ...p,
             current_price: String(p.current_price),
-            unrealized_pnl: p.unrealized_pnl,
             is_stale: p.is_stale ? 'true' : 'false',
             tick_age_ms: String(p.tick_age_ms),
           })
