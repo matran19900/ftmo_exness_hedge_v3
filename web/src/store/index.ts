@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
-import type { Order, Position } from '../api/client'
+import type { AccountStatusEntry, Order, Position } from '../api/client'
 
 export interface LatestTick {
   bid: number | null
@@ -102,6 +102,13 @@ export interface AppState {
   history: Order[]
   setHistory: (history: Order[]) => void
   prependHistory: (order: Order) => void
+
+  // Step 3.12: server-derived account status snapshot. Initial REST
+  // load + 5s WS refresh via ``accounts`` channel. NOT persisted —
+  // a stale localStorage snapshot would mislead the operator about
+  // whether the FTMO client is actually reachable right now.
+  accountStatuses: AccountStatusEntry[]
+  setAccountStatuses: (statuses: AccountStatusEntry[]) => void
 }
 
 export const useAppStore = create<AppState>()(
@@ -218,6 +225,9 @@ export const useAppStore = create<AppState>()(
         set((state) => ({
           history: [order, ...state.history].slice(0, HISTORY_MAX),
         })),
+
+      accountStatuses: [],
+      setAccountStatuses: (accountStatuses) => set({ accountStatuses }),
     }),
     {
       name: 'ftmo-hedge-store',

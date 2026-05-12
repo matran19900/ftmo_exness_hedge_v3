@@ -171,6 +171,25 @@ def test_ws_subscribe_positions_channel_still_accepted(
     assert broadcast_svc.channel_subscriber_count("positions") == 0
 
 
+def test_ws_subscribe_accounts_channel_accepted(
+    ws_test_client: TestClient, jwt_token: str, broadcast_svc: BroadcastService
+) -> None:
+    """step 3.12: ``accounts`` channel must be in the whitelist so the
+    frontend can subscribe and consume the ``account_status_loop``
+    broadcasts that drive the header status bar."""
+    with ws_test_client.websocket_connect(f"/ws?token={jwt_token}") as ws:
+        ws.send_json({"type": "subscribe", "channels": ["accounts"]})
+        # Round-trip via an invalid subscribe to confirm the prior
+        # valid one was processed (TestClient send_json is
+        # fire-and-forget).
+        ws.send_json({"type": "subscribe", "channels": ["garbage:foo"]})
+        msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert "Invalid channels" in msg["detail"]
+        assert broadcast_svc.channel_subscriber_count("accounts") == 1
+    assert broadcast_svc.channel_subscriber_count("accounts") == 0
+
+
 def test_ws_subscribe_orders_and_positions_mixed_both_accepted(
     ws_test_client: TestClient, jwt_token: str, broadcast_svc: BroadcastService
 ) -> None:

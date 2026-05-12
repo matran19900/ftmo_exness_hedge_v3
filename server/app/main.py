@@ -13,6 +13,7 @@ from urllib.parse import urlparse, urlunparse
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.accounts import router as accounts_router
 from app.api.auth import router as auth_router
 from app.api.auth_ctrader import router as auth_ctrader_router
 from app.api.charts import router as charts_router
@@ -26,6 +27,7 @@ from app.api.ws import router as ws_router
 from app.config import get_settings
 from app.redis_client import close_redis, get_redis, init_redis
 from app.services import symbol_whitelist
+from app.services.account_status import account_status_loop
 from app.services.broadcast import BroadcastService
 from app.services.event_handler import event_handler_loop
 from app.services.market_data import MarketDataService
@@ -160,12 +162,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         len(position_tracker_tasks),
     )
 
+    # Step 3.12: single global account-status broadcaster — one task
+    # for all accounts (not per-account like the handler loops), since
+    # each cycle re-reads the full account set from Redis and publishes
+    # a snapshot. Cancellation goes through the same finally block.
+    account_status_task: asyncio.Task[None] = asyncio.create_task(
+        account_status_loop(redis_svc, broadcast),
+        name="account_status_loop",
+    )
+    app.state.account_status_task = account_status_task
+
     try:
         yield
     finally:
-        # Cancel response/event/position_tracker handlers first so
-        # they don't try to talk to a closing Redis connection
-        # mid-flight.
+        # Cancel response/event/position_tracker handlers + account
+        # status loop first so they don't try to talk to a closing
+        # Redis connection mid-flight.
+        account_status_task.cancel()
         for task in response_tasks + event_tasks + position_tracker_tasks:
             task.cancel()
         if response_tasks or event_tasks or position_tracker_tasks:
@@ -175,6 +188,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 *position_tracker_tasks,
                 return_exceptions=True,
             )
+        try:
+            await account_status_task
+        except asyncio.CancelledError:
+            pass
         md = app.state.market_data
         if md is not None:
             try:
@@ -208,4 +225,5 @@ app.include_router(pairs_router)
 app.include_router(orders_router)
 app.include_router(positions_router)
 app.include_router(history_router)
+app.include_router(accounts_router)
 app.include_router(ws_router)

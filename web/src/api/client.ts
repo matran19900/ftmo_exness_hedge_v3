@@ -423,6 +423,35 @@ export async function listHistory(params?: ListHistoryParams): Promise<HistoryLi
   return response.data
 }
 
+// ----- Accounts (step 3.12) -----
+
+export interface AccountStatusEntry {
+  broker: 'ftmo' | 'exness'
+  account_id: string
+  name: string
+  enabled: boolean
+  status: 'online' | 'offline' | 'disabled'
+  // Money fields are ``money_digits``-scaled int strings (D-108) — divide
+  // by ``10**money_digits`` at the render boundary, never in this layer
+  // so REST + WS payloads stay shape-identical.
+  balance_raw: string
+  equity_raw: string
+  margin_raw: string
+  free_margin_raw: string
+  currency: string
+  money_digits: string
+}
+
+export interface AccountListResponse {
+  accounts: AccountStatusEntry[]
+  total: number
+}
+
+export async function listAccounts(): Promise<AccountListResponse> {
+  const response = await apiClient.get<AccountListResponse>('/accounts')
+  return response.data
+}
+
 // ----- WebSocket messages (server protocol from docs/08-server-api.md §9) -----
 
 export interface WsTickMessage {
@@ -509,6 +538,18 @@ export interface WsPositionEventMessage {
   }
 }
 
+// Step 3.12: account_status snapshot broadcast on the ``accounts`` channel
+// every 5 s by the server's ``account_status_loop``. Drives the
+// AccountStatusBar in the page header.
+export interface WsAccountStatusMessage {
+  channel: 'accounts'
+  data: {
+    type: 'account_status'
+    ts: number
+    accounts: AccountStatusEntry[]
+  }
+}
+
 export type WsServerMessage =
   | WsTickMessage
   | WsCandleMessage
@@ -517,6 +558,7 @@ export type WsServerMessage =
   | WsOrderUpdatedMessage
   | WsPositionsTickMessage
   | WsPositionEventMessage
+  | WsAccountStatusMessage
 
 export type WsClientMessage =
   | { type: 'subscribe'; channels: string[] }

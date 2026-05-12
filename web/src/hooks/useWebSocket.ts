@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 import type {
+  WsAccountStatusMessage,
   WsCandleMessage,
   WsClientMessage,
   WsOrderUpdatedMessage,
@@ -113,6 +114,15 @@ export function useWebSocket(): UseWebSocketResult {
       }
     }
 
+    // Step 3.12: account status snapshot — the server publishes every 5 s.
+    // We replace the whole list rather than upserting since the broadcast
+    // carries the complete current snapshot (no incremental updates).
+    const handleAccountsChannel = (msg: WsAccountStatusMessage) => {
+      if (msg.data.type === 'account_status') {
+        useAppStore.getState().setAccountStatuses(msg.data.accounts)
+      }
+    }
+
     const handleOrdersChannel = (msg: WsOrderUpdatedMessage) => {
       const store = useAppStore.getState()
       if (msg.data.type === 'order_updated') {
@@ -172,7 +182,7 @@ export function useWebSocket(): UseWebSocketResult {
         ws.send(
           JSON.stringify({
             type: 'subscribe',
-            channels: ['positions', 'orders'],
+            channels: ['positions', 'orders', 'accounts'],
           } satisfies WsClientMessage)
         )
       }
@@ -199,6 +209,8 @@ export function useWebSocket(): UseWebSocketResult {
               handlePositionsChannel(msg as WsPositionsTickMessage | WsPositionEventMessage)
             } else if (msg.channel === 'orders') {
               handleOrdersChannel(msg as WsOrderUpdatedMessage)
+            } else if (msg.channel === 'accounts') {
+              handleAccountsChannel(msg as WsAccountStatusMessage)
             }
             return
           }

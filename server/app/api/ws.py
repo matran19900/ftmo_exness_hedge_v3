@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-VALID_CHANNEL_PREFIXES = ("ticks:", "candles:", "positions", "orders", "agents")
+VALID_CHANNEL_PREFIXES = ("ticks:", "candles:", "positions", "orders", "accounts", "agents")
 HEARTBEAT_INTERVAL_SECONDS = 30
 WS_CLOSE_INVALID_TOKEN = 4401
 

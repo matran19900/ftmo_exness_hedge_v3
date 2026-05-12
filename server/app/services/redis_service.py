@@ -873,6 +873,73 @@ class RedisService:
             return None
         return dict(data)
 
+    async def get_all_accounts_with_status(self) -> list[dict[str, str]]:
+        """Return every registered account (ftmo first, exness after) with its
+        meta + heartbeat status + balance / equity snapshot in one call.
+
+        Used by step 3.12's ``GET /api/accounts`` REST endpoint and the
+        ``account_status_loop`` broadcast — both consumers want the
+        same shape, so the merge happens once here. Each entry is a
+        flat ``dict[str, str]`` (Redis HASH-string convention) with:
+
+            broker, account_id, name, enabled, status,
+            balance_raw, equity_raw, margin_raw, free_margin_raw,
+            currency, money_digits
+
+        ``status`` is computed from two sources, in priority order:
+
+          1. ``account_meta:{broker}:{id}.enabled == "false"`` → ``"disabled"``
+             (operator-side override; takes precedence over heartbeat).
+          2. ``client:{broker}:{id}`` key existence → ``"online"`` / ``"offline"``
+             (heartbeat key has a 30s TTL; client refreshes every 10s).
+
+        ``balance_raw`` etc. are the raw int-as-string values written by
+        the FTMO client's ``account_info_loop`` (step 3.5) — they are
+        ``money_digits``-scaled and must be divided at the render
+        boundary (D-108). Defaults: ``"0"`` for the four money fields,
+        ``"USD"`` for currency, ``"2"`` for money_digits, so a brand-new
+        account whose first ``account_info_loop`` cycle hasn't run yet
+        still renders sensibly in the UI.
+
+        Sort order: ``("ftmo", "exness")`` tuple iteration → ftmo block
+        first, exness block second; ``get_all_account_ids`` returns each
+        block already sorted by account_id asc, so the result is
+        deterministic for tests + stable for the UI.
+        """
+        result: list[dict[str, str]] = []
+        for broker in ("ftmo", "exness"):
+            account_ids = await self.get_all_account_ids(broker)
+            for acc_id in account_ids:
+                meta = await self.get_account_meta(broker, acc_id)
+                if meta is None:
+                    # SET membership without a meta hash shouldn't happen
+                    # in practice (``add_account`` writes both in one
+                    # pipeline) but skipping rather than failing keeps
+                    # the loop resilient to half-rolled-back add_account.
+                    continue
+                enabled = meta.get("enabled", "true").lower() == "true"
+                if not enabled:
+                    status = "disabled"
+                else:
+                    status = await self.get_client_status(broker, acc_id)
+                info = await self.get_account_info(broker, acc_id) or {}
+                result.append(
+                    {
+                        "broker": broker,
+                        "account_id": acc_id,
+                        "name": meta.get("name", ""),
+                        "enabled": "true" if enabled else "false",
+                        "status": status,
+                        "balance_raw": info.get("balance", "0"),
+                        "equity_raw": info.get("equity", "0"),
+                        "margin_raw": info.get("margin", "0"),
+                        "free_margin_raw": info.get("free_margin", "0"),
+                        "currency": info.get("currency", "USD"),
+                        "money_digits": info.get("money_digits", "2"),
+                    }
+                )
+        return result
+
     # ----- Settings (docs §3) -----
 
     async def get_settings(self) -> dict[str, str]:

@@ -42,6 +42,18 @@ export function HedgeOrderForm() {
   const volumeReady = useAppStore((s) => s.volumeReady)
   const effectiveVolumeLots = useAppStore((s) => s.effectiveVolumeLots)
   const latestTick = useAppStore((s) => s.latestTick)
+  const accountStatuses = useAppStore((s) => s.accountStatuses)
+
+  // Step 3.12: block submit while no FTMO account is online. We can't
+  // see Exness here (Phase 4) so we only gate on the FTMO side.
+  // ``accountStatuses === []`` (initial load) is treated as offline —
+  // the disabled state lasts at most one REST roundtrip + 5 s WS tick.
+  const hasOnlineFtmoAccount = accountStatuses.some(
+    (acc) => acc.broker === 'ftmo' && acc.status === 'online'
+  )
+  const submitBlockedReason = !hasOnlineFtmoAccount
+    ? 'FTMO client offline — không thể gửi lệnh'
+    : ''
 
   const [submitting, setSubmitting] = useState(false)
 
@@ -154,7 +166,12 @@ export function HedgeOrderForm() {
   // discoverable (mirrors ``preflight`` minus the latestTick check, which
   // we still want to surface as a toast if it fails post-click).
   const placeDisabled =
-    submitting || !selectedPairId || !selectedSymbol || !volumeReady || effectiveVolumeLots === null
+    submitting ||
+    !selectedPairId ||
+    !selectedSymbol ||
+    !volumeReady ||
+    effectiveVolumeLots === null ||
+    !hasOnlineFtmoAccount
 
   const sideClasses =
     side === 'buy'
@@ -208,12 +225,16 @@ export function HedgeOrderForm() {
         type="button"
         onClick={handleSubmit}
         disabled={placeDisabled}
+        title={submitBlockedReason}
         className={`w-full py-2 rounded text-sm font-bold text-white transition-colors disabled:cursor-not-allowed ${sideClasses}`}
       >
         {submitting
           ? 'Đang gửi...'
           : `${side === 'buy' ? 'BUY' : 'SELL'} ${selectedSymbol ?? ''} ${effectiveVolumeLots ?? ''}`.trim()}
       </button>
+      {submitBlockedReason && (
+        <div className="text-xs text-red-600 text-center -mt-1">{submitBlockedReason}</div>
+      )}
     </div>
   )
 }
