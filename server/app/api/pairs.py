@@ -145,6 +145,24 @@ async def delete_pair(
     _user: Annotated[str, Depends(get_current_user_rest)],
     redis_svc: Annotated[RedisService, Depends(get_redis_service)],
 ) -> Response:
+    # Step 3.13: refuse delete while active orders reference this
+    # pair. ``count_orders_by_pair`` scans pending + filled SETs only
+    # (closed/rejected/cancelled orders are frozen references, not
+    # active dependencies). The 409 detail uses the ``error_code`` +
+    # ``message`` shape consumed by the frontend's ``formatOrderError``
+    # helper.
+    referencing = await redis_svc.count_orders_by_pair(pair_id)
+    if referencing > 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "pair_in_use",
+                "message": (
+                    f"Cannot delete pair: {referencing} order(s) reference it. Close them first."
+                ),
+            },
+        )
+
     success = await redis_svc.delete_pair(pair_id)
     if not success:
         raise HTTPException(status_code=404, detail="Pair not found")

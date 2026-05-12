@@ -873,6 +873,52 @@ class RedisService:
             return None
         return dict(data)
 
+    async def update_account_meta(
+        self, broker: str, account_id: str, fields: dict[str, str]
+    ) -> None:
+        """HSET-merge new fields into ``account_meta:{broker}:{id}`` + stamp
+        ``updated_at`` (step 3.13).
+
+        Does NOT verify the key exists — callers that care should
+        ``get_account_meta`` first. HSET on a missing key would silently
+        create one, which is generally not what we want here (we don't
+        want a stray PATCH to bring an account back from the dead), but
+        the callers in step 3.13 always check existence before invoking.
+
+        ``updated_at`` is always overwritten with the current wall-clock
+        ms — same convention as ``update_pair`` (pairs.py).
+        """
+        _validate_broker(broker)
+        _validate_account_id(account_id)
+        fields_with_ts = {**fields, "updated_at": str(int(time.time() * 1000))}
+        await self._redis.hset(  # type: ignore[misc]
+            f"account_meta:{broker}:{account_id}", mapping=fields_with_ts
+        )
+
+    async def count_orders_by_pair(self, pair_id: str) -> int:
+        """Count active orders (pending + filled) that reference ``pair_id``.
+
+        Used by step 3.13's ``DELETE /api/pairs/{id}`` to refuse pair
+        deletion while open positions still hold the pair_id. Closed
+        / rejected / cancelled orders are historical artefacts whose
+        ``pair_id`` is a frozen reference rather than an active
+        dependency — deleting the pair won't corrupt them (the order
+        HASH retains the id string verbatim), so they're excluded.
+
+        Phase 3 budget: ``N = pending + filled`` orders is typically
+        < 100, so the O(N) HGETALL per id is fine. Phase 5+ would
+        want a dedicated ``pair_orders:{pair_id}`` SET index updated
+        in ``create_order`` / status transitions; out of scope here.
+        """
+        referencing = 0
+        for status in ("pending", "filled"):
+            order_ids = await self._redis.smembers(f"orders:by_status:{status}")  # type: ignore[misc]
+            for oid in order_ids:
+                order = await self._redis.hgetall(f"order:{oid}")  # type: ignore[misc]
+                if order.get("pair_id") == pair_id:
+                    referencing += 1
+        return referencing
+
     async def get_all_accounts_with_status(self) -> list[dict[str, str]]:
         """Return every registered account (ftmo first, exness after) with its
         meta + heartbeat status + balance / equity snapshot in one call.

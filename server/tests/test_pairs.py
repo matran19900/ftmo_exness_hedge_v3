@@ -219,3 +219,72 @@ async def test_delete_success_then_get_404(authed_client: AsyncClient) -> None:
 async def test_delete_not_found(authed_client: AsyncClient) -> None:
     resp = await authed_client.delete(f"{PAIR_PATH}00000000-0000-0000-0000-000000000000")
     assert resp.status_code == 404
+
+
+# ---------- step 3.13: delete guard against in-use pair ----------
+
+
+async def _seed_pending_order_referencing(fake_redis: Any, *, order_id: str, pair_id: str) -> None:
+    """Minimal order HASH + ``orders:by_status:pending`` SET entry — the
+    exact shape ``count_orders_by_pair`` looks at."""
+    await fake_redis.hset(
+        f"order:{order_id}",
+        mapping={
+            "order_id": order_id,
+            "pair_id": pair_id,
+            "ftmo_account_id": "ftmo_001",
+            "exness_account_id": "exness_001",
+            "symbol": "EURUSD",
+            "side": "buy",
+            "order_type": "market",
+            "status": "pending",
+            "p_status": "pending",
+            "p_volume_lots": "0.01",
+            "created_at": "1735000000000",
+            "updated_at": "1735000000000",
+        },
+    )
+    await fake_redis.sadd("orders:by_status:pending", order_id)
+
+
+@pytest.mark.asyncio
+async def test_delete_pair_with_open_order_blocked(
+    authed_client: AsyncClient, fake_redis: Any
+) -> None:
+    """Step 3.13: deleting a pair while an order references it must
+    return 409 ``pair_in_use`` so the operator gets a clear "close
+    those orders first" message instead of an orphaned reference."""
+    create = await authed_client.post(PAIR_PATH, json=_create_body())
+    pair_id = create.json()["pair_id"]
+    await _seed_pending_order_referencing(fake_redis, order_id="ord_a", pair_id=pair_id)
+
+    resp = await authed_client.delete(f"{PAIR_PATH}{pair_id}")
+
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["detail"]["error_code"] == "pair_in_use"
+    assert "1 order(s)" in body["detail"]["message"]
+    # And the pair itself is still there.
+    follow = await authed_client.get(f"{PAIR_PATH}{pair_id}")
+    assert follow.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_delete_pair_no_references_succeeds(
+    authed_client: AsyncClient, fake_redis: Any
+) -> None:
+    """Negative-space test: an order referencing a DIFFERENT pair must
+    not prevent deletion of the target. Pins that the guard filters by
+    ``pair_id`` rather than counting all open orders."""
+    create_target = await authed_client.post(PAIR_PATH, json=_create_body(name="target"))
+    target_id = create_target.json()["pair_id"]
+    create_other = await authed_client.post(PAIR_PATH, json=_create_body(name="other"))
+    other_id = create_other.json()["pair_id"]
+    # The order references "other", not "target".
+    await _seed_pending_order_referencing(fake_redis, order_id="ord_b", pair_id=other_id)
+
+    resp = await authed_client.delete(f"{PAIR_PATH}{target_id}")
+
+    assert resp.status_code == 204
+    follow = await authed_client.get(f"{PAIR_PATH}{target_id}")
+    assert follow.status_code == 404

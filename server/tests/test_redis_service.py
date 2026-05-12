@@ -174,3 +174,80 @@ async def test_get_all_accounts_with_status_sorted_ftmo_first_then_by_account_id
         ("exness", "exness_001"),
         ("exness", "exness_002"),
     ]
+
+
+# ---------- step 3.13: update_account_meta ----------
+
+
+@pytest.mark.asyncio
+async def test_update_account_meta_sets_fields_and_updated_at(
+    redis_svc: RedisService,
+    redis_client: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Patching ``enabled`` writes through + stamps ``updated_at``
+    (matches the convention used by ``update_pair``). Other fields
+    from ``add_account`` (name, created_at) stay untouched."""
+    await redis_svc.add_account("ftmo", "ftmo_001", name="primary")
+    created_at_before = (await redis_svc.get_account_meta("ftmo", "ftmo_001") or {})["created_at"]
+
+    await redis_svc.update_account_meta("ftmo", "ftmo_001", {"enabled": "false"})
+
+    after = await redis_svc.get_account_meta("ftmo", "ftmo_001")
+    assert after is not None
+    assert after["enabled"] == "false"
+    assert after["name"] == "primary"  # untouched
+    assert after["created_at"] == created_at_before  # untouched
+    assert "updated_at" in after
+    assert int(after["updated_at"]) > 0
+
+
+# ---------- step 3.13: count_orders_by_pair ----------
+
+
+async def _seed_order(
+    redis_client: fakeredis.aioredis.FakeRedis,
+    *,
+    order_id: str,
+    pair_id: str,
+    status: str,
+) -> None:
+    """Minimal order HASH + matching ``orders:by_status:{status}`` SET
+    entry — the exact shape ``count_orders_by_pair`` inspects."""
+    await redis_client.hset(  # type: ignore[misc]
+        f"order:{order_id}",
+        mapping={
+            "order_id": order_id,
+            "pair_id": pair_id,
+            "status": status,
+            "p_status": status,
+        },
+    )
+    await redis_client.sadd(f"orders:by_status:{status}", order_id)  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_count_orders_by_pair_zero(redis_svc: RedisService) -> None:
+    """No orders at all → 0 (no spurious match against an empty SET)."""
+    assert await redis_svc.count_orders_by_pair("pair_001") == 0
+
+
+@pytest.mark.asyncio
+async def test_count_orders_by_pair_pending_plus_filled_only(
+    redis_svc: RedisService,
+    redis_client: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """2 filled + 1 pending → 3. Closed/rejected/cancelled orders that
+    happen to reference the same pair must be ignored (they're frozen
+    references, not active dependencies)."""
+    await _seed_order(redis_client, order_id="ord_1", pair_id="pair_x", status="filled")
+    await _seed_order(redis_client, order_id="ord_2", pair_id="pair_x", status="filled")
+    await _seed_order(redis_client, order_id="ord_3", pair_id="pair_x", status="pending")
+    # These should NOT be counted:
+    await _seed_order(redis_client, order_id="ord_4", pair_id="pair_x", status="closed")
+    await _seed_order(redis_client, order_id="ord_5", pair_id="pair_x", status="cancelled")
+    # And an unrelated pair shouldn't bleed in:
+    await _seed_order(redis_client, order_id="ord_6", pair_id="pair_y", status="filled")
+
+    assert await redis_svc.count_orders_by_pair("pair_x") == 3
+    assert await redis_svc.count_orders_by_pair("pair_y") == 1
+    assert await redis_svc.count_orders_by_pair("pair_unknown") == 0

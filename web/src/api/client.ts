@@ -86,6 +86,39 @@ export async function listPairs(): Promise<PairResponse[]> {
   return response.data
 }
 
+// ----- Pair CRUD (step 3.13) -----
+
+export interface PairCreateRequest {
+  name: string
+  ftmo_account_id: string
+  exness_account_id: string
+  ratio: number
+}
+
+export interface PairUpdateRequest {
+  name?: string
+  ftmo_account_id?: string
+  exness_account_id?: string
+  ratio?: number
+}
+
+export async function createPair(req: PairCreateRequest): Promise<PairResponse> {
+  const response = await apiClient.post<PairResponse>('/pairs/', req)
+  return response.data
+}
+
+export async function updatePair(
+  pairId: string,
+  req: PairUpdateRequest
+): Promise<PairResponse> {
+  const response = await apiClient.patch<PairResponse>(`/pairs/${pairId}`, req)
+  return response.data
+}
+
+export async function deletePair(pairId: string): Promise<void> {
+  await apiClient.delete(`/pairs/${pairId}`)
+}
+
 // ----- Charts -----
 
 export interface Candle {
@@ -449,6 +482,23 @@ export interface AccountListResponse {
 
 export async function listAccounts(): Promise<AccountListResponse> {
   const response = await apiClient.get<AccountListResponse>('/accounts')
+  return response.data
+}
+
+// Step 3.13: toggle the enabled flag for one account. Returns the
+// updated row (same shape as one entry from listAccounts) so the
+// caller can splice it into its cached list without a follow-up
+// list fetch (though the WS account_status_loop broadcast will
+// overwrite within 5 s anyway).
+export async function updateAccount(
+  broker: 'ftmo' | 'exness',
+  accountId: string,
+  enabled: boolean
+): Promise<AccountStatusEntry> {
+  const response = await apiClient.patch<AccountStatusEntry>(
+    `/accounts/${broker}/${accountId}`,
+    { enabled }
+  )
   return response.data
 }
 

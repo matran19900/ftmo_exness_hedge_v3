@@ -153,3 +153,62 @@ async def test_list_accounts_entry_carries_all_documented_fields(
         "money_digits",
     }
     assert set(acc.keys()) == expected
+
+
+# ---------- step 3.13: PATCH /api/accounts/{broker}/{account_id} ----------
+
+
+@pytest.mark.asyncio
+async def test_patch_account_unauth(client: AsyncClient) -> None:
+    """No Bearer → 401, same posture as the other write endpoints."""
+    resp = await client.patch("/api/accounts/ftmo/ftmo_001", json={"enabled": False})
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_patch_account_disable_happy_path(
+    authed_client: AsyncClient,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Toggle an enabled account off → 200 + ``enabled=false`` +
+    ``status=disabled`` even though the heartbeat is still alive
+    (operator-side override takes precedence per step 3.12)."""
+    await _seed_ftmo_account(fake_redis, enabled=True, heartbeat=True)
+
+    resp = await authed_client.patch("/api/accounts/ftmo/ftmo_001", json={"enabled": False})
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["enabled"] is False
+    assert body["status"] == "disabled"
+    # Money fields still surface unchanged.
+    assert body["balance_raw"] == "1000000"
+
+
+@pytest.mark.asyncio
+async def test_patch_account_enable_happy_path(
+    authed_client: AsyncClient,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Toggle a disabled account on → 200 + ``enabled=true`` +
+    ``status`` reflects heartbeat (online here)."""
+    await _seed_ftmo_account(fake_redis, enabled=False, heartbeat=True)
+
+    resp = await authed_client.patch("/api/accounts/ftmo/ftmo_001", json={"enabled": True})
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["enabled"] is True
+    assert body["status"] == "online"
+
+
+@pytest.mark.asyncio
+async def test_patch_account_not_found(
+    authed_client: AsyncClient,
+) -> None:
+    """Account that's never been registered → 404 with
+    ``account_not_found`` error code so the frontend can surface a
+    targeted toast."""
+    resp = await authed_client.patch("/api/accounts/ftmo/never_existed", json={"enabled": True})
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error_code"] == "account_not_found"
