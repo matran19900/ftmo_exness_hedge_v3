@@ -1,0 +1,47 @@
+[project]
+name = "exness-client"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.4,<3",
+  "redis[hiredis]>=5.0,<6",
+  "hedger-shared",
+  # MetaTrader5 is Windows-only. The `sys_platform` marker keeps pip
+  # from trying to install it on Linux dev / CI; mt5_stub fills in
+  # for those environments. Production Windows runtime installs the
+  # real package via the same pyproject.
+  "MetaTrader5>=5.0.45; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "pytest-mock>=3.14",
+  "fakeredis[lua]>=2.24",
+  "mypy>=1.10",
+  "ruff>=0.5",
+]
+
+[project.scripts]
+exness-client = "exness_client.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["exness_client*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF", "PLC"]
