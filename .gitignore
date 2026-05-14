@@ -48,3 +48,6 @@ server/data/symbol_mapping_cache/*.json
 # Tempfile + backup artifacts from atomic write (Phase 4.A.2)
 server/data/symbol_mapping_cache/*.tmp
 server/data/symbol_mapping_cache/*.bak
+
+# Step self-check reports (Telegram artifacts, not Git-tracked)
+step-*-selfcheck.md
