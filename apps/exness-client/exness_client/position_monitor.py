@@ -159,7 +159,38 @@ class PositionMonitor:
 
     async def _poll_once(self) -> None:
         """Single poll: fetch positions, diff against the last snapshot,
-        publish events, then store the new snapshot."""
+        publish events, then store the new snapshot.
+
+        Step 4.4 refines the D-4.3-4 "None positions_get → empty"
+        contract: BEFORE calling ``positions_get`` we check
+        ``terminal_info().connected``. A transient broker disconnect
+        previously caused ``positions_get`` to return an empty tuple,
+        which made the diff classify every tracked ticket as
+        ``position_closed_external`` — false-alarm cascade WARN spam.
+        With the gate, a disconnected poll cycle is skipped entirely:
+        the in-process snapshot, ``_baseline_done`` flag, and persisted
+        Redis snapshot are all preserved so the next reconnect resumes
+        the diff against truth.
+        """
+        # Step 4.4 broker-connection gate.
+        try:
+            terminal = await asyncio.to_thread(self._mt5.terminal_info)
+        except Exception:
+            logger.warning(
+                "position_monitor.terminal_info_exception account_id=%s",
+                self._account_id,
+                exc_info=True,
+            )
+            terminal = None
+        if terminal is None or not terminal.connected:
+            logger.warning(
+                "position_monitor.broker_disconnected_skip_poll "
+                "account_id=%s connected=%s",
+                self._account_id,
+                getattr(terminal, "connected", None),
+            )
+            return
+
         try:
             positions = await asyncio.to_thread(self._mt5.positions_get)
         except Exception:
@@ -169,11 +200,10 @@ class PositionMonitor:
             )
             return
 
-        # ``mt5.positions_get`` returns ``None`` on connection loss; we
-        # treat None as an empty list so an in-flight disconnect surfaces
-        # as ``position_closed_external`` events for everything currently
-        # tracked. The reconciler in step 4.4 owns the smarter "did the
-        # broker actually drop everything?" question.
+        # ``mt5.positions_get`` returns ``None`` even when ``terminal_info``
+        # said connected (rare race the gate doesn't fully close). Still
+        # treat None as empty here — same conservative D-4.3-4 behaviour
+        # for the residual edge case.
         if positions is None:
             positions = ()
 

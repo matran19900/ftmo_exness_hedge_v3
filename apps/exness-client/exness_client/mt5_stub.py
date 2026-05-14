@@ -82,8 +82,17 @@ DEAL_ENTRY_INOUT = 2
 
 
 class AccountInfo(NamedTuple):
-    """Subset of the real ``mt5.account_info()`` NamedTuple — only the
-    fields step 4.1 consumes. Step 4.2+ may extend."""
+    """Subset of the real ``mt5.account_info()`` NamedTuple.
+
+    Step 4.1 added: ``login`` / ``balance`` / ``currency`` / ``margin_mode``
+    / ``leverage`` / ``server`` (connect-time fields).
+
+    Step 4.4 added: ``equity`` / ``margin`` / ``margin_free`` so the
+    ``AccountInfoPublisher`` can write balance/equity/margin/free_margin
+    to ``account:exness:{account_id}`` for the server's position tracker
+    + the frontend's account-status bar. Defaults preserve every
+    existing call site (``AccountInfo(login=…, balance=…, …)`` without
+    the new kwargs still works)."""
 
     login: int
     balance: float
@@ -91,6 +100,9 @@ class AccountInfo(NamedTuple):
     margin_mode: int
     leverage: int
     server: str
+    equity: float = 0.0
+    margin: float = 0.0
+    margin_free: float = 0.0
 
 
 class TerminalInfo(NamedTuple):
@@ -192,6 +204,9 @@ _DEFAULT_ACCOUNT_INFO = AccountInfo(
     margin_mode=ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
     leverage=500,
     server="Exness-Stub",
+    equity=10000.0,
+    margin=0.0,
+    margin_free=10000.0,
 )
 _DEFAULT_TERMINAL_INFO = TerminalInfo(connected=True, trade_allowed=True, name="stub")
 
@@ -214,6 +229,8 @@ _state: dict[str, Any] = {
     # Step 4.3a — history_deals_get state
     "history_deals_get": [],         # list[Deal]
     "history_deals_get_raises": None,
+    # Step 4.4 — terminal_info raises slot for the position-monitor gate test.
+    "terminal_info_raises": False,
 }
 
 
@@ -251,7 +268,14 @@ def account_info() -> AccountInfo | None:
 
 
 def terminal_info() -> TerminalInfo | None:
-    """Mirror of ``mt5.terminal_info()``."""
+    """Mirror of ``mt5.terminal_info()``.
+
+    Step 4.4 added ``terminal_info_raises`` (test-only) so the position
+    monitor's terminal-info gate can assert it survives a transient MT5
+    exception without crashing the poll loop. ``connected=False`` is
+    distinct: the gate skips the cycle and preserves the snapshot."""
+    if _state.get("terminal_info_raises", False):
+        raise RuntimeError("stub: terminal_info forced to raise")
     if not _state["connected"]:
         return None
     info: TerminalInfo | None = _state["terminal_info"]
@@ -390,6 +414,28 @@ def reset_state_for_tests() -> None:
     _state["positions_get_raises"] = None
     _state["history_deals_get"] = []
     _state["history_deals_get_raises"] = None
+    _state["terminal_info_raises"] = False
+
+
+# ----- Phase 4.4: terminal_info gate test helpers -----
+
+
+def _set_terminal_connected_for_tests(connected: bool) -> None:
+    """Toggle ``terminal_info().connected`` so the position monitor's
+    gate test can simulate a transient broker disconnect without taking
+    the rest of the stub state offline.
+
+    Note: ``connected=True`` here also requires ``_state["connected"]``
+    (set by a successful ``initialize()``) for ``terminal_info()`` to
+    return non-None. Tests that exercise the gate should call
+    ``initialize()`` first."""
+    current: TerminalInfo = _state["terminal_info"]
+    _state["terminal_info"] = current._replace(connected=connected)
+
+
+def _set_terminal_info_raises(should_raise: bool) -> None:
+    """Toggle the ``terminal_info()`` raise switch."""
+    _state["terminal_info_raises"] = bool(should_raise)
 
 
 # ----- Phase 4.3: position-monitor test helpers -----

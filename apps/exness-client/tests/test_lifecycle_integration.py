@@ -20,6 +20,7 @@ from pydantic import SecretStr
 
 from exness_client import main as main_mod
 from exness_client import mt5_stub
+from exness_client.account_info import AccountInfoPublisher
 from exness_client.action_handlers import ActionHandler
 from exness_client.cmd_ledger import CmdLedger
 from exness_client.command_processor import CommandProcessor
@@ -232,3 +233,125 @@ async def test_command_processor_dispatches_to_action_handler(
     payload = dict(fields)
     assert payload["request_id"] == "rINT"
     assert payload["status"] == "filled"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.4 — account_info_task lifecycle integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_amain_account_info_task_runs(
+    amain_settings: ExnessClientSettings,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``main.amain`` spawns the account_info task and the HASH appears
+    in Redis within a short window (publisher fires immediately on start)."""
+
+    async def _fake_connect_redis(_url: str) -> Any:
+        return fake_redis
+
+    monkeypatch.setattr(main_mod, "_connect_redis", _fake_connect_redis)
+    monkeypatch.setattr(
+        main_mod.ShutdownCoordinator,
+        "install_signal_handlers",
+        lambda self: None,
+    )
+
+    task = asyncio.create_task(
+        main_mod.amain(amain_settings, mt5_module=mt5_stub),
+        name="amain",
+    )
+    for _ in range(50):
+        if await fake_redis.exists(
+            f"account:exness:{amain_settings.account_id}"
+        ):
+            break
+        await asyncio.sleep(0.01)
+    payload = await fake_redis.hgetall(
+        f"account:exness:{amain_settings.account_id}"
+    )
+    assert payload
+    assert payload["broker"] == "exness"
+    assert payload["account_id"] == amain_settings.account_id
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_amain_shutdown_includes_account_info_publisher(
+    amain_settings: ExnessClientSettings,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The graceful shutdown path stops the account_info publisher (no
+    leaked task on exit)."""
+
+    async def _fake_connect_redis(_url: str) -> Any:
+        return fake_redis
+
+    monkeypatch.setattr(main_mod, "_connect_redis", _fake_connect_redis)
+    monkeypatch.setattr(
+        main_mod.ShutdownCoordinator,
+        "install_signal_handlers",
+        lambda self: None,
+    )
+
+    task = asyncio.create_task(
+        main_mod.amain(amain_settings, mt5_module=mt5_stub),
+        name="amain",
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    pending = [
+        t for t in asyncio.all_tasks() if t.get_name() == "account_info"
+    ]
+    assert not pending
+
+
+@pytest.mark.asyncio
+async def test_amain_account_info_failure_does_not_block_bridge(
+    amain_settings: ExnessClientSettings,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception inside the account_info loop must not take down the
+    bridge — heartbeat still publishes."""
+
+    async def _fake_connect_redis(_url: str) -> Any:
+        return fake_redis
+
+    monkeypatch.setattr(main_mod, "_connect_redis", _fake_connect_redis)
+    monkeypatch.setattr(
+        main_mod.ShutdownCoordinator,
+        "install_signal_handlers",
+        lambda self: None,
+    )
+
+    async def _boom(self: Any) -> None:
+        raise RuntimeError("simulated_account_info_publish_failure")
+
+    monkeypatch.setattr(AccountInfoPublisher, "_publish_once", _boom)
+
+    task = asyncio.create_task(
+        main_mod.amain(amain_settings, mt5_module=mt5_stub),
+        name="amain",
+    )
+    await asyncio.sleep(0.10)
+    hb = await fake_redis.hgetall(
+        f"client:exness:{amain_settings.account_id}"
+    )
+    assert hb and "last_heartbeat" in hb
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

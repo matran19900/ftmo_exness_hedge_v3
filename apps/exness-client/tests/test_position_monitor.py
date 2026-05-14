@@ -61,6 +61,14 @@ def cmd_ledger(fake_redis: fakeredis.aioredis.FakeRedis) -> CmdLedger:
 def monitor(
     fake_redis: fakeredis.aioredis.FakeRedis, cmd_ledger: CmdLedger
 ) -> PositionMonitor:
+    # Step 4.4: the monitor's terminal_info gate skips a poll when the
+    # stub reports ``connected=False``. The autouse reset leaves the
+    # stub disconnected; mark it as connected here so every existing
+    # diff-path test runs through the gate. The terminal-info gate
+    # tests below explicitly flip this back via
+    # ``mt5_stub.set_state_for_tests(connected=False)`` or
+    # ``_set_terminal_connected_for_tests(False)``.
+    mt5_stub.set_state_for_tests(connected=True)
     return PositionMonitor(fake_redis, "exness_001", mt5_stub, cmd_ledger)
 
 
@@ -646,6 +654,7 @@ async def test_snapshot_ttl_30_days(
 async def test_load_snapshot_on_connect_uses_as_baseline(
     fake_redis: fakeredis.aioredis.FakeRedis, cmd_ledger: CmdLedger
 ) -> None:
+    mt5_stub.set_state_for_tests(connected=True)
     mt5_stub._set_positions_for_tests([_pos(ticket=1100, sl=1.08)])
     m1 = PositionMonitor(fake_redis, "exness_001", mt5_stub, cmd_ledger)
     await m1._poll_once()
@@ -741,6 +750,7 @@ async def test_load_snapshot_invalid_entry_skipped(
 async def test_offline_close_detected_after_restart(
     fake_redis: fakeredis.aioredis.FakeRedis, cmd_ledger: CmdLedger
 ) -> None:
+    mt5_stub.set_state_for_tests(connected=True)
     mt5_stub._set_positions_for_tests([_pos(ticket=2000)])
     m1 = PositionMonitor(fake_redis, "exness_001", mt5_stub, cmd_ledger)
     await m1._poll_once()
@@ -757,6 +767,7 @@ async def test_offline_close_detected_after_restart(
 async def test_offline_modify_detected_after_restart(
     fake_redis: fakeredis.aioredis.FakeRedis, cmd_ledger: CmdLedger
 ) -> None:
+    mt5_stub.set_state_for_tests(connected=True)
     mt5_stub._set_positions_for_tests([_pos(ticket=2010, sl=1.08, tp=1.10)])
     m1 = PositionMonitor(fake_redis, "exness_001", mt5_stub, cmd_ledger)
     await m1._poll_once()
@@ -774,6 +785,7 @@ async def test_offline_modify_detected_after_restart(
 async def test_offline_new_position_detected_after_restart(
     fake_redis: fakeredis.aioredis.FakeRedis, cmd_ledger: CmdLedger
 ) -> None:
+    mt5_stub.set_state_for_tests(connected=True)
     mt5_stub._set_positions_for_tests([])
     m1 = PositionMonitor(fake_redis, "exness_001", mt5_stub, cmd_ledger)
     await m1._poll_once()
@@ -790,6 +802,7 @@ async def test_offline_new_position_detected_after_restart(
 async def test_offline_multiple_changes_detected(
     fake_redis: fakeredis.aioredis.FakeRedis, cmd_ledger: CmdLedger
 ) -> None:
+    mt5_stub.set_state_for_tests(connected=True)
     mt5_stub._set_positions_for_tests([
         _pos(ticket=2030), _pos(ticket=2031, sl=1.08),
     ])
@@ -811,6 +824,7 @@ async def test_offline_multiple_changes_detected(
 async def test_offline_no_change_no_events(
     fake_redis: fakeredis.aioredis.FakeRedis, cmd_ledger: CmdLedger
 ) -> None:
+    mt5_stub.set_state_for_tests(connected=True)
     mt5_stub._set_positions_for_tests([_pos(ticket=2040, sl=1.08)])
     m1 = PositionMonitor(fake_redis, "exness_001", mt5_stub, cmd_ledger)
     await m1._poll_once()
@@ -996,6 +1010,7 @@ async def test_ceo_scenario_modify_stop_close_restart_emits_external(
       7. First poll loads snapshot → diffs against empty → emits
          position_closed_external with close_reason=external + history enrich.
     """
+    mt5_stub.set_state_for_tests(connected=True)
     mt5_stub._set_positions_for_tests([])
     m1 = PositionMonitor(fake_redis, "exness_001", mt5_stub, cmd_ledger)
     await m1._poll_once()
@@ -1029,6 +1044,7 @@ async def test_ceo_scenario_modify_stop_close_restart_emits_external(
 async def test_server_initiated_close_after_restart_uses_ledger_hit(
     fake_redis: fakeredis.aioredis.FakeRedis, cmd_ledger: CmdLedger
 ) -> None:
+    mt5_stub.set_state_for_tests(connected=True)
     mt5_stub._set_positions_for_tests([_pos(ticket=200)])
     m1 = PositionMonitor(fake_redis, "exness_001", mt5_stub, cmd_ledger)
     await m1._poll_once()
@@ -1041,3 +1057,138 @@ async def test_server_initiated_close_after_restart_uses_ledger_hit(
     closed = [e for e in events if e["event_type"] == "position_closed_external"]
     assert closed[0]["close_reason"] == "server_initiated"
     assert await cmd_ledger.is_server_initiated(200) is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.4 — terminal_info gate (refines D-4.3-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_broker_disconnected_skip_poll(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cmd_ledger: CmdLedger,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Disconnected broker → skip poll, no events, snapshot preserved."""
+    mt5_stub.set_state_for_tests(connected=True)
+    mt5_stub._set_positions_for_tests([_pos(ticket=4400, sl=1.08)])
+    monitor = PositionMonitor(
+        fake_redis, "exness_001", mt5_stub, cmd_ledger
+    )
+    await monitor._poll_once()
+    assert 4400 in monitor._last_snapshot
+
+    mt5_stub._set_terminal_connected_for_tests(False)
+    with caplog.at_level("WARNING"):
+        await monitor._poll_once()
+
+    events = await _read_events(fake_redis)
+    assert events == []
+    assert 4400 in monitor._last_snapshot
+    assert any(
+        "broker_disconnected_skip_poll" in r.message for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_broker_disconnected_preserves_persisted_snapshot(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cmd_ledger: CmdLedger,
+) -> None:
+    mt5_stub.set_state_for_tests(connected=True)
+    mt5_stub._set_positions_for_tests([_pos(ticket=4410)])
+    monitor = PositionMonitor(
+        fake_redis, "exness_001", mt5_stub, cmd_ledger
+    )
+    await monitor._poll_once()
+    raw_before = await fake_redis.get(monitor._snapshot_key)
+    mt5_stub._set_terminal_connected_for_tests(False)
+    await monitor._poll_once()
+    raw_after = await fake_redis.get(monitor._snapshot_key)
+    assert raw_after == raw_before
+
+
+@pytest.mark.asyncio
+async def test_broker_reconnects_resume_normal_diff(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cmd_ledger: CmdLedger,
+) -> None:
+    mt5_stub.set_state_for_tests(connected=True)
+    mt5_stub._set_positions_for_tests([_pos(ticket=4420, sl=1.08)])
+    monitor = PositionMonitor(
+        fake_redis, "exness_001", mt5_stub, cmd_ledger
+    )
+    await monitor._poll_once()
+    mt5_stub._set_terminal_connected_for_tests(False)
+    await monitor._poll_once()
+    mt5_stub._set_terminal_connected_for_tests(True)
+    mt5_stub._mutate_position_for_tests(4420, sl=1.07)
+    await monitor._poll_once()
+    events = await _read_events(fake_redis)
+    modified = [e for e in events if e["event_type"] == "position_modified"]
+    assert len(modified) == 1
+    assert modified[0]["broker_position_id"] == "4420"
+    assert modified[0]["changed_fields"] == "sl"
+
+
+@pytest.mark.asyncio
+async def test_terminal_info_none_treated_as_disconnect(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cmd_ledger: CmdLedger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mt5_stub.set_state_for_tests(connected=True)
+    mt5_stub._set_positions_for_tests([_pos(ticket=4430)])
+    monitor = PositionMonitor(
+        fake_redis, "exness_001", mt5_stub, cmd_ledger
+    )
+    await monitor._poll_once()
+    monkeypatch.setattr(mt5_stub, "terminal_info", lambda: None)
+    await monitor._poll_once()
+    events = await _read_events(fake_redis)
+    assert events == []
+    assert 4430 in monitor._last_snapshot
+
+
+@pytest.mark.asyncio
+async def test_terminal_info_exception_treated_as_disconnect(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cmd_ledger: CmdLedger,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mt5_stub.set_state_for_tests(connected=True)
+    mt5_stub._set_positions_for_tests([_pos(ticket=4440)])
+    monitor = PositionMonitor(
+        fake_redis, "exness_001", mt5_stub, cmd_ledger
+    )
+    await monitor._poll_once()
+    mt5_stub._set_terminal_info_raises(True)
+    with caplog.at_level("WARNING"):
+        await monitor._poll_once()
+    events = await _read_events(fake_redis)
+    assert events == []
+    assert any(
+        "terminal_info_exception" in r.message for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_baseline_init_skipped_when_disconnected_at_start(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    cmd_ledger: CmdLedger,
+) -> None:
+    """A monitor that starts with the broker already disconnected
+    should NOT mark its baseline as done — the next poll on reconnect
+    must run the silent baseline pass against the live broker view."""
+    mt5_stub._set_positions_for_tests([_pos(ticket=4450)])
+    monitor = PositionMonitor(
+        fake_redis, "exness_001", mt5_stub, cmd_ledger
+    )
+    await monitor._poll_once()  # disconnected by default → skip
+    assert monitor._baseline_done is False
+    mt5_stub.set_state_for_tests(connected=True)
+    await monitor._poll_once()
+    assert monitor._baseline_done is True
+    events = await _read_events(fake_redis)
+    assert events == []

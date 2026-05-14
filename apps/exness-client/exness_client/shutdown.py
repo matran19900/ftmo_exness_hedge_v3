@@ -3,17 +3,19 @@
 Mirrors ``apps/ftmo-client/ftmo_client/shutdown.py`` but uses an explicit
 ``ShutdownCoordinator`` class that owns the cancellation ORDER specified
 in D-088 (extended in step 4.3 to insert the position monitor between
-the cmd processor and the heartbeat):
+the cmd processor and the heartbeat; step 4.4 added the account-info
+publisher between the monitor and the heartbeat):
 
-  1. ``cmd_processor.stop()`` — stop accepting new actions.
-  2. ``position_monitor.stop()`` — stop polling MT5 (no more events
-     after the heartbeat starts winding down).
-  3. ``heartbeat.stop()`` — flip the running flag last so ``status=online``
-     stays visible to the server until the rest of the lifecycle has
-     wound down.
-  4. Cancel + gather background tasks.
-  5. ``bridge.disconnect()`` — release the MT5 lib handle.
-  6. ``redis_client.aclose()``.
+  1. ``cmd_processor.stop()``        — stop accepting new actions.
+  2. ``position_monitor.stop()``     — stop the 2-second poll loop.
+  3. ``account_info_publisher.stop()`` — stop the 30-second publish loop.
+  4. ``heartbeat.stop()``            — flip the running flag last so
+                                        ``status=online`` stays visible to
+                                        the server until the rest of the
+                                        lifecycle has wound down.
+  5. Cancel + gather background tasks.
+  6. ``bridge.disconnect()`` — release the MT5 lib handle.
+  7. ``redis_client.aclose()``.
 
 Tests construct the coordinator with stubs for each component and assert
 that ``shutdown`` invokes them in the right order.
@@ -57,10 +59,12 @@ class ShutdownCoordinator:
         bridge: _CloseableBridge,
         redis_client: _CloseableRedis,
         position_monitor: _StoppableLoop | None = None,
+        account_info_publisher: _StoppableLoop | None = None,
     ) -> None:
         self._cmd = cmd_processor
         self._heartbeat = heartbeat
         self._position_monitor = position_monitor
+        self._account_info_publisher = account_info_publisher
         self._bridge = bridge
         self._redis = redis_client
         self._event = asyncio.Event()
@@ -120,6 +124,13 @@ class ShutdownCoordinator:
         ]
         if self._position_monitor is not None:
             steps.append(("position_monitor.stop", self._position_monitor.stop()))
+        if self._account_info_publisher is not None:
+            # Step 4.4: stop the account-info publisher between the
+            # position monitor and the heartbeat so a final balance/
+            # equity write doesn't race the heartbeat going offline.
+            steps.append(
+                ("account_info_publisher.stop", self._account_info_publisher.stop())
+            )
         steps.append(("heartbeat.stop", self._heartbeat.stop()))
 
         for step_name, awaitable in steps:

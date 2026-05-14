@@ -19,6 +19,7 @@ from types import ModuleType
 
 import redis.asyncio as redis_asyncio
 
+from exness_client.account_info import AccountInfoPublisher
 from exness_client.action_handlers import ActionHandler
 from exness_client.bridge_service import (
     MT5BridgeService,
@@ -151,14 +152,28 @@ async def amain(
         redis, settings.account_id, mt5_module, cmd_ledger
     )
 
+    # Step 4.4: account info publisher — 30s poll of mt5.account_info()
+    # → ``account:exness:{account_id}`` HASH. The frontend's
+    # AccountStatusBar (step 4.10) and the server's position tracker
+    # (step 4.9) consume this for live balance / equity / margin display.
+    account_info_publisher = AccountInfoPublisher(
+        redis, settings.account_id, mt5_module
+    )
+
     coord = ShutdownCoordinator(
-        cmd_proc, heartbeat, bridge, redis, position_monitor=position_monitor
+        cmd_proc,
+        heartbeat,
+        bridge,
+        redis,
+        position_monitor=position_monitor,
+        account_info_publisher=account_info_publisher,
     )
     coord.install_signal_handlers()
 
     tasks: list[asyncio.Task[None]] = [
         asyncio.create_task(cmd_proc.run(), name="cmd_processor"),
         asyncio.create_task(position_monitor.run(), name="position_monitor"),
+        asyncio.create_task(account_info_publisher.run(), name="account_info"),
         asyncio.create_task(heartbeat.run(), name="heartbeat"),
     ]
     logger.info("exness_client.started account_id=%s", settings.account_id)

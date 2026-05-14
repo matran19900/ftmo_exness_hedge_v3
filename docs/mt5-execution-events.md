@@ -180,6 +180,41 @@ positions: [{ticket, symbol, volume, sl, tp, position_type}]}``.
 Cmd ledger key: ``cmd_ledger:exness:{account_id}:server_initiated`` —
 Redis SET with 24-hour TTL. Members are stringified MT5 tickets.
 
+### 5.b Step 4.4 terminal_info gate
+
+| Gate behaviour | mt5 API | Step | Notes |
+|---|---|---|---|
+| Detect broker disconnect transient → skip poll entirely | `terminal_info().connected` check before `positions_get` | 4.4 | Refines D-4.3-4: ``positions_get → empty`` no longer treated as "every position closed" when the cause is a transient connection loss. The in-process snapshot, ``_baseline_done`` flag, and persisted Redis snapshot are all preserved across disconnected polls so the next reconnect resumes the diff against truth. |
+| `terminal_info()` returns ``None`` → treated as disconnect | n/a | 4.4 | Same skip path; matches MT5 doc behaviour where ``terminal_info()`` returns ``None`` while the lib reconnects. |
+| `terminal_info()` raises → treated as disconnect | n/a | 4.4 | Logged + skipped; the loop survives without crashing. |
+
+### 5.c Step 4.4 account info publish
+
+Per-account 30-second poll of ``mt5.account_info()`` → Redis HASH at
+``account:exness:{account_id}``. Drives the server's position tracker
+(step 4.9 — unrealised P&L baselines) and the frontend
+``AccountStatusBar`` (step 4.10 — live balance / equity / margin).
+
+| Field | mt5 API | Step | Notes |
+|---|---|---|---|
+| login | `account_info().login` | 4.4 | Broker account ID |
+| balance | `account_info().balance` | 4.4 | Account base currency |
+| equity | `account_info().equity` | 4.4 | Balance + unrealised P&L |
+| margin | `account_info().margin` | 4.4 | Used margin |
+| free_margin | `account_info().margin_free` | 4.4 | Available margin |
+| leverage | `account_info().leverage` | 4.4 | 1:N ratio (e.g. 500) |
+| currency | `account_info().currency` | 4.4 | Account base currency code (3-letter) |
+| server | `account_info().server` | 4.4 | Broker server name |
+| margin_mode | `account_info().margin_mode` | 4.4 | Must be ``ACCOUNT_MARGIN_MODE_RETAIL_HEDGING`` (Phase 4 R1); the server uses the published value as a defence-in-depth check before issuing a hedge cmd |
+| broker | (literal "exness") | 4.4 | Routing key for server-side consumers |
+| account_id | (settings.account_id) | 4.4 | Echo of the per-account routing |
+| synced_at_ms | `time.time() * 1000` | 4.4 | Liveness; the AccountStatusBar greys-out the row when this is older than ~60 s |
+
+Constants: ``POLL_INTERVAL_S = 30.0`` locked. The first publish runs
+*immediately* on entry so the server sees a populated HASH before the
+first 30-second interval elapses (otherwise the AccountStatusBar would
+render a "—" placeholder for half a minute on every client restart).
+
 ---
 
 ## 6. MT5 quirks summary
@@ -276,5 +311,6 @@ Append-only mid-phase per D-069 exception (mirrors `docs/ctrader-execution-event
 | 2026-05-14 | 4.2 | Initial action-handler implementation | §3 retcode table marked with `Step` column = 4.2 for the 10 mapped retcodes (DONE / REJECT / INVALID_VOLUME / INVALID_PRICE / INVALID_STOPS / MARKET_CLOSED / NO_MONEY / POSITION_NOT_FOUND / UNSUPPORTED_FILLING / REQUOTE). §6 quirks populated: IOC→FOK retry pattern, pip-size point*10 derivation for 3/5-digit symbols, MarketWatch `symbol_select` requirement, close-needs-position-ticket. ``RETCODE_MAP`` is the single source of truth (`exness_client/retcode_mapping.py`). |
 | 2026-05-14 | 4.3 | Position monitor poll loop | §5.a populated: 3 event types (`position_new`, `position_closed_external`, `position_modified`) on `event_stream:exness:{account_id}`. Baseline pattern locked: first poll = silent snapshot (no replay events on client restart). `POLL_INTERVAL_S = 2.0` locked. SL/TP/volume diff detection runs entirely off the in-process snapshot — no `history_deals_get` reconciliation in this step (deferred to step 4.4). Event order is deterministic: news first (sorted by ticket), then closed, then modified. |
 | 2026-05-14 | 4.3a | Persistent snapshot + cmd ledger | Closes the Windows-smoke leg-open gap: persistent snapshot at `position_monitor:last_snapshot:{account_id}` (JSON STRING, 30-day TTL) saved after every poll and loaded on the first poll of the next process so offline closes/modifies/opens replay correctly. `position_closed_external` events now carry `close_reason` (`server_initiated` via `CmdLedger` lookup OR `external`) + `enrichment_source` (`history_deals` OR `snapshot_fallback`) + broker fill fields (`close_price` / `realized_profit` / `commission` / `swap` / `close_time_ms`) when `mt5.history_deals_get(position=ticket)` succeeds. CEO policy: secondary leg always passive — server step 4.7 will turn every `external` close on a hedge leg into a WARNING alert (no FTMO cascade). |
+| 2026-05-14 | 4.4 | Account info publish + terminal_info gate | §5.b populated: ``terminal_info().connected`` check now gates the position-monitor poll. Refines D-4.3-4 — a transient broker disconnect previously caused ``positions_get → empty → emit position_closed_external for every snapshot ticket`` (false WARN-alert spam); the gate now skips the poll entirely and preserves both the in-process and Redis snapshots. ``terminal_info() == None`` and exceptions are also treated as disconnect. §5.c populated: ``AccountInfoPublisher`` 30-second loop publishes ``account:exness:{account_id}`` HASH (12 fields incl. ``balance``/``equity``/``margin``/``free_margin`` for the AccountStatusBar + position-tracker P&L baselines). First publish runs immediately on entry. ``ShutdownCoordinator`` order: cmd_proc → position_monitor → account_info_publisher → heartbeat → bridge.disconnect → redis.aclose. |
 
 *(Append entries below.)*
