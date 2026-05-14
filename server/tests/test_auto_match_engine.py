@@ -360,6 +360,78 @@ class TestTierSuffixStrip:
 
 
 # ---------------------------------------------------------------------------
+# §2.7.4b — Tier 2 bilateral suffix_strip (Phase 4.2a)
+# ---------------------------------------------------------------------------
+
+
+class TestTierSuffixStripBilateral:
+    """Phase 4.2a refinement: Tier 2 strips ``.cash`` from FTMO names AND
+    a known suffix from Exness names before comparing. A single hint-free
+    pass now covers ``AUS200.cash`` ↔ ``AUS200m`` (Standard), ``AUS200c``
+    (Cent), ``AUS200_premium`` (Pro), and plain ``AUS200`` (cross-broker)."""
+
+    @pytest.mark.parametrize(
+        "exness_name",
+        ["AUS200m", "AUS200c", "AUS200z", "AUS200_premium", "AUS200_raw", "AUS200_i"],
+    )
+    def test_ftmo_cash_matches_each_exness_suffix(
+        self, engine_no_hints: AutoMatchEngine, exness_name: str
+    ) -> None:
+        result = engine_no_hints.match(
+            [_ftmo("AUS200.cash")], [_raw(exness_name)]
+        )
+        assert len(result.proposals) == 1
+        proposal = result.proposals[0]
+        assert proposal.match_type == "suffix_strip"
+        assert proposal.confidence == "medium"
+        assert proposal.exness == exness_name
+
+    def test_ftmo_cash_matches_plain_exness_cross_broker(
+        self, engine_no_hints: AutoMatchEngine
+    ) -> None:
+        # Cross-broker case: FTMO has ``.cash``, Exness sells the same
+        # product unsuffixed (some brokers do this).
+        result = engine_no_hints.match(
+            [_ftmo("AUS200.cash")], [_raw("AUS200")]
+        )
+        assert len(result.proposals) == 1
+        assert result.proposals[0].match_type == "suffix_strip"
+
+    def test_existing_eurusd_eurusdm_still_works(
+        self, engine_no_hints: AutoMatchEngine
+    ) -> None:
+        # Regression: the pre-4.2a Tier 2 pattern (FTMO plain ↔ Exness
+        # suffix only) must still work after the bilateral refactor.
+        result = engine_no_hints.match([_ftmo("EURUSD")], [_raw("EURUSDm")])
+        assert len(result.proposals) == 1
+        assert result.proposals[0].match_type == "suffix_strip"
+        assert result.proposals[0].exness == "EURUSDm"
+
+    def test_no_match_when_normalised_names_differ(
+        self, engine_no_hints: AutoMatchEngine
+    ) -> None:
+        # ``FRA40.cash`` strips to ``FRA40``; ``FR40m`` strips to ``FR40``.
+        # Different stems → Tier 2 must NOT match. (Tier 3 hint covers
+        # this via the bootstrap config.)
+        result = engine_no_hints.match(
+            [_ftmo("FRA40.cash")], [_raw("FR40m")]
+        )
+        assert result.proposals == []
+        assert result.unmapped_ftmo == ["FRA40.cash"]
+
+    def test_dual_strip_still_picks_one_suffix_per_side(
+        self, engine_no_hints: AutoMatchEngine
+    ) -> None:
+        # Defensive: ``GER40.cash`` (FTMO) + ``GER40m`` (Exness). Both
+        # sides have a suffix; both strip; both reduce to ``GER40``.
+        result = engine_no_hints.match(
+            [_ftmo("GER40.cash")], [_raw("GER40m")]
+        )
+        assert len(result.proposals) == 1
+        assert result.proposals[0].match_type == "suffix_strip"
+
+
+# ---------------------------------------------------------------------------
 # §2.7.5 — Tier 3 manual_hint
 # ---------------------------------------------------------------------------
 
@@ -453,6 +525,89 @@ class TestTierManualHint:
         assert len(result.proposals) == 1
         assert result.proposals[0].ftmo == "EURUSD"
         assert "ALIAS" in result.unmapped_ftmo
+
+
+# ---------------------------------------------------------------------------
+# §2.7.5b — Tier 3 normalized hints (Phase 4.2a)
+# ---------------------------------------------------------------------------
+
+
+class TestTierManualHintNormalized:
+    """Phase 4.2a: hints stored in their broker-agnostic plain form
+    (``ftmo: "GER40", candidates: ["DE30"]``) and normalized at match
+    time so a single hint covers every Standard / Cent / Pro / Raw
+    variant of the broker symbol."""
+
+    def _hints_path(self, tmp_path: Path) -> Path:
+        path = tmp_path / "h.json"
+        _write_hints_file(
+            path,
+            [{"ftmo": "GER40", "exness_candidates": ["DE30"], "note": ""}],
+        )
+        return path
+
+    @pytest.mark.parametrize(
+        "exness_name",
+        ["DE30m", "DE30c", "DE30z", "DE30_premium", "DE30_raw", "DE30"],
+    )
+    def test_hint_matches_each_broker_variant(
+        self, tmp_path: Path, exness_name: str
+    ) -> None:
+        engine = AutoMatchEngine(self._hints_path(tmp_path))
+        result = engine.match([_ftmo("GER40.cash")], [_raw(exness_name)])
+        assert len(result.proposals) == 1
+        proposal = result.proposals[0]
+        assert proposal.match_type == "manual_hint"
+        assert proposal.confidence == "low"
+        assert proposal.exness == exness_name
+
+    def test_hint_matches_ftmo_without_cash_too(self, tmp_path: Path) -> None:
+        # If a future FTMO whitelist drops the ``.cash`` branding, the
+        # same hint must still apply (hint stays broker-agnostic).
+        engine = AutoMatchEngine(self._hints_path(tmp_path))
+        result = engine.match([_ftmo("GER40")], [_raw("DE30m")])
+        assert len(result.proposals) == 1
+        assert result.proposals[0].match_type == "manual_hint"
+
+    def test_hint_with_exact_pair_no_suffix_either_side(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "h.json"
+        _write_hints_file(
+            path,
+            [{"ftmo": "NATGAS", "exness_candidates": ["XNGUSD"], "note": ""}],
+        )
+        engine = AutoMatchEngine(path)
+        result = engine.match([_ftmo("NATGAS")], [_raw("XNGUSD")])
+        assert len(result.proposals) == 1
+        assert result.proposals[0].match_type == "manual_hint"
+
+    def test_hint_first_matching_candidate_wins(self, tmp_path: Path) -> None:
+        path = tmp_path / "h.json"
+        _write_hints_file(
+            path,
+            [
+                {
+                    "ftmo": "US100",
+                    "exness_candidates": ["USTEC", "NDX"],
+                    "note": "",
+                }
+            ],
+        )
+        engine = AutoMatchEngine(path)
+        # Both candidates available — first one (USTEC) must be picked.
+        result = engine.match(
+            [_ftmo("US100.cash")], [_raw("USTECm"), _raw("NDXm")]
+        )
+        assert len(result.proposals) == 1
+        assert result.proposals[0].exness == "USTECm"
+
+    def test_hint_no_candidate_in_raw_unmapped(self, tmp_path: Path) -> None:
+        engine = AutoMatchEngine(self._hints_path(tmp_path))
+        # Hint says GER40 → DE30 but raw doesn't have any DE30* symbol.
+        result = engine.match([_ftmo("GER40.cash")], [_raw("XYZm")])
+        assert result.proposals == []
+        assert result.unmapped_ftmo == ["GER40.cash"]
 
 
 # ---------------------------------------------------------------------------
@@ -569,9 +724,12 @@ class TestIntegrationRealConfig:
             pytest.skip(f"missing {REAL_FTMO_WHITELIST_PATH}")
         return FTMOWhitelistService(REAL_FTMO_WHITELIST_PATH)
 
-    def test_real_hints_count_is_14(self, real_engine: AutoMatchEngine) -> None:
-        # Bootstrap derived from 14 archived `match_type=manual` entries.
-        assert real_engine.hint_count == 14
+    def test_real_hints_count_is_5(self, real_engine: AutoMatchEngine) -> None:
+        # Phase 4.2a: bootstrap reduced to 5 broker-agnostic entries
+        # (EU50 / FRA40 / GER40 / NATGAS / US100). The 9 other archived
+        # ``manual`` entries are now handled bilaterally by Tier 2's
+        # ``.cash``-strip path and no longer need an explicit hint.
+        assert real_engine.hint_count == 5
 
     def test_real_whitelist_count_is_117(
         self, real_whitelist: FTMOWhitelistService
@@ -587,8 +745,12 @@ class TestIntegrationRealConfig:
         # Build a synthetic raw Exness list that includes every hint
         # candidate. Tier 1/2/3 should leave zero of the hinted FTMO
         # names in unmapped_ftmo.
-        hint_ftmo_names = {
-            h.ftmo
+        # Phase 4.2a: hints are stored in their broker-agnostic plain
+        # form (``EU50``, not ``EU50.cash``). The FTMO whitelist still
+        # carries the ``.cash`` suffix on these symbols, so we compare
+        # by the normalised stem.
+        hint_ftmo_stems = {
+            h.ftmo.removesuffix(".cash")
             for h in MatchHintsFile.model_validate_json(
                 REAL_HINTS_PATH.read_text(encoding="utf-8")
             ).hints
@@ -603,9 +765,10 @@ class TestIntegrationRealConfig:
         raw = [_raw(name) for name in hint_candidates]
         result = real_engine.match(real_whitelist.all_entries(), raw)
 
-        # Every hinted FTMO should be in proposals (not unmapped_ftmo).
-        proposal_ftmo = {p.ftmo for p in result.proposals}
-        assert hint_ftmo_names.issubset(proposal_ftmo)
+        # Every hinted FTMO stem should appear in proposals (regardless of
+        # whether the whitelist names them ``EU50`` or ``EU50.cash``).
+        proposal_stems = {p.ftmo.removesuffix(".cash") for p in result.proposals}
+        assert hint_ftmo_stems.issubset(proposal_stems)
 
     def test_empty_ftmo_list_returns_all_raw_unmapped(
         self, real_engine: AutoMatchEngine
@@ -631,3 +794,50 @@ class TestIntegrationRealConfig:
         result = engine_no_hints.match([_ftmo("EURUSD")], [_raw("EURUSD")])
         assert isinstance(result, AutoMatchProposal)
         assert all(isinstance(p, MatchProposal) for p in result.proposals)
+
+    def test_full_117_symbols_zero_unmapped_against_trial7_style_raw(
+        self,
+        real_engine: AutoMatchEngine,
+        real_whitelist: FTMOWhitelistService,
+    ) -> None:
+        """Phase 4.2a integration: with the bilateral suffix-strip + the 5
+        broker-agnostic hints, every one of the 117 FTMO symbols must
+        resolve when the broker offers a Trial7-style ``*m`` suffix
+        catalogue. Hint-target stems get the same ``m`` suffix as the
+        rest, so the wizard will surface zero unmapped FTMO symbols."""
+        # Broker-agnostic stem for each FTMO name = strip ``.cash`` once.
+        ftmo_names = [s.name for s in real_whitelist.all_entries()]
+        # For every FTMO whitelist entry, build the equivalent ``*m`` raw
+        # symbol (Trial7-style). For the 5 hint targets, use the hint
+        # candidate stem instead of the FTMO stem.
+        hint_targets = {
+            "EU50": "STOXX50",
+            "FRA40": "FR40",
+            "GER40": "DE30",
+            "NATGAS": "XNGUSD",
+            "US100": "USTEC",
+        }
+        synthetic_raw_names: list[str] = []
+        for name in ftmo_names:
+            stem = name.removesuffix(".cash")
+            stem = hint_targets.get(stem, stem)
+            synthetic_raw_names.append(stem + "m")
+
+        raw = [_raw(n) for n in synthetic_raw_names]
+        result = real_engine.match(real_whitelist.all_entries(), raw)
+        assert result.unmapped_ftmo == [], (
+            "expected zero unmapped FTMO symbols against Trial7-style raw; "
+            f"got {len(result.unmapped_ftmo)}: {result.unmapped_ftmo[:10]}"
+        )
+        assert len(result.proposals) == real_whitelist.count
+
+        # match_type breakdown is informational — keep the assertion soft so
+        # a future whitelist tweak doesn't need a number bump.
+        suffix_strip = sum(
+            1 for p in result.proposals if p.match_type == "suffix_strip"
+        )
+        manual_hint = sum(
+            1 for p in result.proposals if p.match_type == "manual_hint"
+        )
+        assert manual_hint == 5
+        assert suffix_strip == real_whitelist.count - manual_hint

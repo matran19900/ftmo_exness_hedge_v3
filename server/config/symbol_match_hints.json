@@ -3,102 +3,29 @@
   "version": 1,
   "hints": [
     {
-      "ftmo": "AUS200.cash",
-      "exness_candidates": [
-        "AUS200"
-      ],
-      "note": ""
+      "ftmo": "EU50",
+      "exness_candidates": ["STOXX50"],
+      "note": "EuroStoxx 50 index"
     },
     {
-      "ftmo": "DXY.cash",
-      "exness_candidates": [
-        "DXY"
-      ],
-      "note": ""
+      "ftmo": "FRA40",
+      "exness_candidates": ["FR40"],
+      "note": "CAC 40 (France 40)"
     },
     {
-      "ftmo": "EU50.cash",
-      "exness_candidates": [
-        "STOXX50"
-      ],
-      "note": ""
+      "ftmo": "GER40",
+      "exness_candidates": ["DE30"],
+      "note": "DAX (Germany 30/40)"
     },
     {
-      "ftmo": "FRA40.cash",
-      "exness_candidates": [
-        "FR40"
-      ],
-      "note": ""
+      "ftmo": "NATGAS",
+      "exness_candidates": ["XNGUSD"],
+      "note": "Natural gas USD pair"
     },
     {
-      "ftmo": "GER40.cash",
-      "exness_candidates": [
-        "DE30"
-      ],
-      "note": ""
-    },
-    {
-      "ftmo": "HK50.cash",
-      "exness_candidates": [
-        "HK50"
-      ],
-      "note": ""
-    },
-    {
-      "ftmo": "JP225.cash",
-      "exness_candidates": [
-        "JP225"
-      ],
-      "note": ""
-    },
-    {
-      "ftmo": "NATGAS.cash",
-      "exness_candidates": [
-        "XNGUSD"
-      ],
-      "note": ""
-    },
-    {
-      "ftmo": "UK100.cash",
-      "exness_candidates": [
-        "UK100"
-      ],
-      "note": ""
-    },
-    {
-      "ftmo": "UKOIL.cash",
-      "exness_candidates": [
-        "UKOIL"
-      ],
-      "note": ""
-    },
-    {
-      "ftmo": "US100.cash",
-      "exness_candidates": [
-        "USTEC"
-      ],
-      "note": ""
-    },
-    {
-      "ftmo": "US30.cash",
-      "exness_candidates": [
-        "US30"
-      ],
-      "note": ""
-    },
-    {
-      "ftmo": "US500.cash",
-      "exness_candidates": [
-        "US500"
-      ],
-      "note": ""
-    },
-    {
-      "ftmo": "USOIL.cash",
-      "exness_candidates": [
-        "USOIL"
-      ],
-      "note": ""
+      "ftmo": "US100",
+      "exness_candidates": ["USTEC"],
+      "note": "NASDAQ 100 tech index"
     }
   ]
 }
