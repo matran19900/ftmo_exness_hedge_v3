@@ -8,6 +8,7 @@ import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 from fastapi import FastAPI
@@ -41,6 +42,33 @@ from app.services.redis_service import RedisService
 from app.services.response_handler import response_handler_loop
 
 logger = logging.getLogger(__name__)
+
+
+async def _init_mapping_statuses(redis_client: Any) -> int:
+    """Phase 4.2: ensure every known Exness account has a
+    ``mapping_status:{account_id}`` Redis key.
+
+    For each member of ``accounts:exness``:
+      - If a key already exists, leave it alone (covers the wizard-active
+        state that ``populate_redis_from_disk`` set up moments ago).
+      - Else, set ``active`` if ``account_to_mapping:{acc}`` resolves to
+        a known cache file, otherwise ``pending_mapping`` so the
+        AccountsTab UI surfaces the "Map Symbols" CTA on first paint.
+
+    Returns the number of newly-initialised keys (purely diagnostic).
+    """
+    members = await redis_client.smembers("accounts:exness")
+    initialized = 0
+    for member in members or set():
+        acc = member.decode() if isinstance(member, bytes) else str(member)
+        key = f"mapping_status:{acc}"
+        if await redis_client.exists(key):
+            continue
+        sig = await redis_client.get(f"account_to_mapping:{acc}")
+        status = "active" if sig else "pending_mapping"
+        await redis_client.set(key, status)
+        initialized += 1
+    return initialized
 
 
 def _mask_redis_url(url: str) -> str:
@@ -166,6 +194,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     logger.info("mapping_service.initialized")
     app.state.mapping_service = mapping_service
+
+    # Phase 4.2: ensure every known Exness account has a ``mapping_status``
+    # key set so the AccountsTab "Map Symbols" / "Active" / "Edit Mapping"
+    # buttons render correctly on first paint. The Exness client (step 4.2)
+    # may publish raw symbols before the operator officially saves a
+    # mapping; this sweep covers the gap. Accounts already pointing at a
+    # cache via ``account_to_mapping:{acc}`` are marked ``active`` so we
+    # don't trash a wizard-completed state on a server restart.
+    initialized_status_count = await _init_mapping_statuses(get_redis())
+    logger.info(
+        "mapping_status.initialized_on_startup count=%d",
+        initialized_status_count,
+    )
 
     creds = await redis_svc.get_ctrader_market_data_creds()
     if creds and settings.ctrader_client_id and settings.ctrader_client_secret:

@@ -16,11 +16,13 @@ Production code on Windows imports ``MetaTrader5`` directly; tests +
 Linux CI import this stub. The selection happens in ``main.py`` per
 ``sys.platform``.
 
-Step 4.1 covers ONLY the surface the skeleton needs (connect + health).
-Step 4.2+ extends the stub with ``positions_get``, ``order_send``,
-``history_deals_get``, ``symbol_info``, etc., when those handlers land.
-DO NOT pre-emptively expand the stub here — keep it tracking what's
-actually consumed.
+Step 4.1 covered ONLY the surface the skeleton needed (connect + health).
+Step 4.2 extends the stub with the bits the action handlers + symbol-sync
+publisher consume: ``symbols_get``, ``symbol_info``, ``symbol_select``,
+``order_send``, ``positions_get`` plus the trade-action / order-type /
+position-type / order-filling / retcode constants. Stay disciplined —
+extend only when a handler imports the symbol; do not pre-emptively grow
+the surface.
 """
 
 from __future__ import annotations
@@ -33,6 +35,40 @@ from typing import Any, NamedTuple
 ACCOUNT_MARGIN_MODE_RETAIL_NETTING = 0
 ACCOUNT_MARGIN_MODE_EXCHANGE = 1
 ACCOUNT_MARGIN_MODE_RETAIL_HEDGING = 2
+
+# Trade action types (mt5.TRADE_ACTION_*). Step 4.2 only needs DEAL.
+TRADE_ACTION_DEAL = 1
+TRADE_ACTION_SLTP = 6  # for completeness — not exercised in 4.2
+
+# Order direction.
+ORDER_TYPE_BUY = 0
+ORDER_TYPE_SELL = 1
+
+# Filling mode (IOC tried first, FOK as fallback per IOC→FOK retry).
+ORDER_FILLING_FOK = 0
+ORDER_FILLING_IOC = 1
+ORDER_FILLING_RETURN = 2
+
+# Position direction (mirrors order side semantics for opened positions).
+POSITION_TYPE_BUY = 0
+POSITION_TYPE_SELL = 1
+
+# Symbol trade mode — only FULL is tradeable; everything else is filtered.
+SYMBOL_TRADE_MODE_FULL = 4
+
+# Retcodes consumed by retcode_mapping.RETCODE_MAP. Duplicated as
+# module-level ints so production code can compare ``result.retcode ==
+# mt5.TRADE_RETCODE_DONE`` without pulling in the mapping module.
+TRADE_RETCODE_REQUOTE = 10004
+TRADE_RETCODE_REJECT = 10006
+TRADE_RETCODE_DONE = 10009
+TRADE_RETCODE_INVALID_VOLUME = 10014
+TRADE_RETCODE_INVALID_PRICE = 10015
+TRADE_RETCODE_INVALID_STOPS = 10016
+TRADE_RETCODE_MARKET_CLOSED = 10018
+TRADE_RETCODE_NO_MONEY = 10019
+TRADE_RETCODE_POSITION_NOT_FOUND = 10027
+TRADE_RETCODE_UNSUPPORTED_FILLING = 10030
 
 
 # ----- API return shapes -----
@@ -58,6 +94,55 @@ class TerminalInfo(NamedTuple):
     name: str
 
 
+class SymbolInfo(NamedTuple):
+    """Subset of ``mt5.symbol_info(name)`` consumed by step 4.2.
+
+    Real MT5 ``SymbolInfo`` exposes ~40 fields; we keep only the ones the
+    symbol-sync publisher + action handlers consume so a future stub-vs-
+    real type drift is easy to spot. ``bid``/``ask`` carry the latest
+    quote so the action handlers can derive a market price without an
+    extra ``mt5.symbol_info_tick`` call.
+    """
+
+    name: str
+    trade_contract_size: float
+    digits: int
+    point: float
+    volume_min: float
+    volume_step: float
+    volume_max: float
+    currency_profit: str
+    trade_mode: int
+    bid: float
+    ask: float
+
+
+class OrderSendResult(NamedTuple):
+    """Subset of ``mt5.order_send(request)`` result. Real MT5 result has
+    more fields (request_id, external_id, etc.); we keep only the ones
+    the handler reads so the response schema stays narrow."""
+
+    retcode: int
+    deal: int
+    order: int
+    volume: float
+    price: float
+    bid: float
+    ask: float
+    comment: str
+
+
+class Position(NamedTuple):
+    """Subset of ``mt5.positions_get()`` entries used by close handler."""
+
+    ticket: int
+    symbol: str
+    type: int  # POSITION_TYPE_BUY / POSITION_TYPE_SELL
+    volume: float
+    price_open: float
+    magic: int
+
+
 # ----- Test-controllable module state -----
 
 _DEFAULT_ACCOUNT_INFO = AccountInfo(
@@ -76,6 +161,15 @@ _state: dict[str, Any] = {
     "account_info": _DEFAULT_ACCOUNT_INFO,
     "terminal_info": _DEFAULT_TERMINAL_INFO,
     "last_error": (0, "no error"),
+    # Step 4.2 — set via ``set_state_for_tests``. Defaults are empty so an
+    # unconfigured test surface never quietly succeeds.
+    "symbols_get": (),               # tuple[SymbolInfo, ...]
+    "symbol_info": {},               # dict[str, SymbolInfo]
+    "symbol_select_calls": [],       # list[tuple[str, bool]] for assertions
+    "order_send_response": None,     # OrderSendResult | Callable | list[OrderSendResult]
+    "order_send_calls": [],          # list[dict] for assertions
+    "order_send_raises": None,       # Exception to raise instead of returning
+    "positions_get": (),             # tuple[Position, ...]
 }
 
 
@@ -126,6 +220,80 @@ def last_error() -> tuple[int, str]:
     return err
 
 
+# ----- API surface used by step 4.2 (symbol_sync / action_handlers) -----
+
+
+def symbols_get() -> tuple[SymbolInfo, ...]:
+    """Mirror of ``mt5.symbols_get()`` — returns every symbol the broker
+    exposes. Real MT5 returns a tuple."""
+    syms: tuple[SymbolInfo, ...] = _state["symbols_get"]
+    return syms
+
+
+def symbol_info(name: str) -> SymbolInfo | None:
+    """Mirror of ``mt5.symbol_info(name)`` — returns ``None`` when the
+    name is not in MarketWatch / not exposed by the broker."""
+    return _state["symbol_info"].get(name)  # type: ignore[no-any-return]
+
+
+def symbol_select(name: str, enable: bool = True) -> bool:
+    """Mirror of ``mt5.symbol_select(name, enable)`` — returns True on
+    success. Test-side records every call for assertions."""
+    _state["symbol_select_calls"].append((name, enable))
+    return True
+
+
+def order_send(request: dict[str, Any]) -> OrderSendResult | None:
+    """Mirror of ``mt5.order_send(request)`` — runs the test-controllable
+    response.
+
+    State semantics:
+      - ``order_send_raises`` — if set, raises that exception (used by
+        the handler-exception tests).
+      - ``order_send_response`` — if a list, pops the next response
+        (used by IOC→FOK retry tests). If a single ``OrderSendResult``,
+        returns it for every call. If ``None``, returns a synthetic
+        ``DONE`` result so happy-path lifecycle tests don't have to
+        configure anything.
+
+    Records the request dict in ``order_send_calls`` for assertions.
+    """
+    _state["order_send_calls"].append(dict(request))
+    if _state["order_send_raises"] is not None:
+        raise _state["order_send_raises"]
+    resp = _state["order_send_response"]
+    if isinstance(resp, list):
+        return resp.pop(0) if resp else None
+    if resp is not None:
+        return resp  # type: ignore[no-any-return]
+    return OrderSendResult(
+        retcode=TRADE_RETCODE_DONE,
+        deal=12345,
+        order=67890,
+        volume=float(request.get("volume", 0.01)),
+        price=float(request.get("price", 1.0)),
+        bid=float(request.get("price", 1.0)) - 0.0001,
+        ask=float(request.get("price", 1.0)) + 0.0001,
+        comment="stub",
+    )
+
+
+def positions_get(
+    *, ticket: int | None = None, symbol: str | None = None
+) -> tuple[Position, ...]:
+    """Mirror of ``mt5.positions_get(ticket=..., symbol=...)``.
+
+    Real MT5 supports both keyword filters; we implement the same
+    semantics so the close handler doesn't have to special-case the
+    stub. ``ticket`` filter is used by ``_handle_close``."""
+    positions: tuple[Position, ...] = _state["positions_get"]
+    if ticket is not None:
+        return tuple(p for p in positions if p.ticket == ticket)
+    if symbol is not None:
+        return tuple(p for p in positions if p.symbol == symbol)
+    return positions
+
+
 # ----- Test helpers (NOT part of the real MetaTrader5 API) -----
 
 
@@ -144,3 +312,10 @@ def reset_state_for_tests() -> None:
     _state["account_info"] = _DEFAULT_ACCOUNT_INFO
     _state["terminal_info"] = _DEFAULT_TERMINAL_INFO
     _state["last_error"] = (0, "no error")
+    _state["symbols_get"] = ()
+    _state["symbol_info"] = {}
+    _state["symbol_select_calls"] = []
+    _state["order_send_response"] = None
+    _state["order_send_calls"] = []
+    _state["order_send_raises"] = None
+    _state["positions_get"] = ()

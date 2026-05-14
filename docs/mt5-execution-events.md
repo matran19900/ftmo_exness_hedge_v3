@@ -59,20 +59,23 @@ Key entry points:
 
 Known retcodes Phase 4 will encounter. Populate empirical observation during step 4.2.
 
-| Retcode | Constant | Meaning | Server handling |
-|---|---|---|---|
-| 10009 | TRADE_RETCODE_DONE | Success | (no action — happy path) |
-| 10018 | TRADE_RETCODE_MARKET_CLOSED | Market closed (off-hours) | Reject open; Alert if cascade close |
-| 10027 | TRADE_RETCODE_POSITION_NOT_FOUND | Position closed externally before our cmd executed | D-4.0-7 force reconcile |
-| 10030 | TRADE_RETCODE_UNSUPPORTED_FILLING | Filling mode (IOC/FOK) unsupported by broker | Retry with alternate filling mode |
-| 10006 | TRADE_RETCODE_REJECT | Generic reject | Capture error_msg verbatim; surface to operator |
-| 10004 | TRADE_RETCODE_REQUOTE | Price moved between request and execution | Retry once with fresh tick |
-| 10014 | TRADE_RETCODE_INVALID_VOLUME | Volume outside symbol limits | Validation should have caught; ERROR log |
-| 10015 | TRADE_RETCODE_INVALID_PRICE | Price stale | Retry once with fresh tick |
-| 10016 | TRADE_RETCODE_INVALID_STOPS | SL/TP outside allowed band | Phase 5 only (Phase 4 no SL/TP on Exness) |
-| 10019 | TRADE_RETCODE_NO_MONEY | Insufficient margin | Alert 2 path? — TBD step 4.2 |
+| Retcode | Constant | Meaning | Server handling | Step |
+|---|---|---|---|---|
+| 10009 | TRADE_RETCODE_DONE | Success | (no action — happy path) | 4.2 |
+| 10018 | TRADE_RETCODE_MARKET_CLOSED | Market closed (off-hours) | Reject open; Alert if cascade close | 4.2 |
+| 10027 | TRADE_RETCODE_POSITION_NOT_FOUND | Position closed externally before our cmd executed | D-4.0-7 force reconcile | 4.2 |
+| 10030 | TRADE_RETCODE_UNSUPPORTED_FILLING | Filling mode (IOC/FOK) unsupported by broker | Retry with alternate filling mode (IOC → FOK once) | 4.2 |
+| 10006 | TRADE_RETCODE_REJECT | Generic reject | Capture error_msg verbatim; surface to operator | 4.2 |
+| 10004 | TRADE_RETCODE_REQUOTE | Price moved between request and execution | Retry once with fresh tick (Phase 5) | 4.2 |
+| 10014 | TRADE_RETCODE_INVALID_VOLUME | Volume outside symbol limits | Validation should have caught; ERROR log | 4.2 |
+| 10015 | TRADE_RETCODE_INVALID_PRICE | Price stale | Retry once with fresh tick (Phase 5) | 4.2 |
+| 10016 | TRADE_RETCODE_INVALID_STOPS | SL/TP outside allowed band | Phase 5 only (Phase 4 no SL/TP on Exness) | 4.2 |
+| 10019 | TRADE_RETCODE_NO_MONEY | Insufficient margin | Reject open; Alert path TBD step 4.7 | 4.2 |
 
-*(Populate observed retcodes mid-phase per D-069. Update entries below with `step` column indicating where empirically verified.)*
+Step 4.2 lock: ``exness_client/retcode_mapping.py::RETCODE_MAP`` is the single source of truth used by the action handlers.
+``map_retcode(retcode)`` → ``RetcodeOutcome(status, reason, retry_strategy)``. Server-side response handler (step 4.7) reads the same vocab off ``resp_stream:exness:{account_id}``.
+
+*(Populate observed retcodes mid-phase per D-069. Update entries above with `Step` column indicating where empirically verified.)*
 
 ---
 
@@ -154,10 +157,10 @@ Populate empirically mid-phase per D-069 pattern. Bullet list grows as smoke unc
 
 | Quirk | Discovered step | Workaround / Reference |
 |---|---|---|
-| *(placeholder — populate as found)* | | |
-| *(placeholder — populate as found)* | | |
-| *(placeholder — populate as found)* | | |
-| *(placeholder — populate as found)* | | |
+| Filling mode mismatch: broker may reject IOC with retcode 10030 (`TRADE_RETCODE_UNSUPPORTED_FILLING`); FOK accepted. | 4.2 | `exness_client/action_handlers.py::_handle_open` retries the same request once with `ORDER_FILLING_FOK` after an IOC reject. Single retry only; further failures pass through. |
+| Pip size derivation: `mt5.symbol_info` exposes `point` (smallest price increment), not `pip`. 5-digit forex + 3-digit JPY-quote → pip = `point * 10`; 2-digit metals/indices/crypto → pip = `point` as-is. | 4.2 | `exness_client/symbol_sync.py::_derive_pip_size`. CTO Phase 4 lock — see step 4.2 self-check. |
+| Symbol subscription required before tick/positions visible: must call `mt5.symbol_select(name, True)` to add the symbol to MarketWatch before `symbol_info(name)` returns valid bid/ask. | 4.2 | `SymbolSyncPublisher.publish_snapshot` calls `symbol_select` per enumerated symbol before reading `symbol_info`. |
+| Close action requires `position` ticket on the request dict alongside `type` (opposite of position direction); MT5 does NOT accept "close ticket X" as a single primitive. | 4.2 | `_handle_close` looks up `positions_get(ticket=...)` first to discover direction + volume, then issues opposite-direction `TRADE_ACTION_DEAL` with `position=ticket`. |
 | *(placeholder — populate as found)* | | |
 | *(placeholder — populate as found)* | | |
 
@@ -239,5 +242,6 @@ Append-only mid-phase per D-069 exception (mirrors `docs/ctrader-execution-event
 | Date | Step | Trigger | Finding |
 |---|---|---|---|
 | 2026-05-13 | 4.0 | Design doc skeleton creation | Initial structure. Sections 1–8 placeholders; will populate during steps 4.1 (connect+symbol sync), 4.2 (actions+monitor+retcodes), 4.5 (full hedge flow), 4.6 (cascade integration). |
+| 2026-05-14 | 4.2 | Initial action-handler implementation | §3 retcode table marked with `Step` column = 4.2 for the 10 mapped retcodes (DONE / REJECT / INVALID_VOLUME / INVALID_PRICE / INVALID_STOPS / MARKET_CLOSED / NO_MONEY / POSITION_NOT_FOUND / UNSUPPORTED_FILLING / REQUOTE). §6 quirks populated: IOC→FOK retry pattern, pip-size point*10 derivation for 3/5-digit symbols, MarketWatch `symbol_select` requirement, close-needs-position-ticket. ``RETCODE_MAP`` is the single source of truth (`exness_client/retcode_mapping.py`). |
 
 *(Append entries below.)*

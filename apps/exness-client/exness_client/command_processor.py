@@ -20,6 +20,7 @@ import logging
 import redis.asyncio as redis_asyncio
 from redis.exceptions import RedisError, ResponseError
 
+from exness_client.action_handlers import ActionHandler
 from exness_client.bridge_service import MT5BridgeService
 
 logger = logging.getLogger(__name__)
@@ -45,8 +46,11 @@ def _consumer_name(account_id: str) -> str:
 class CommandProcessor:
     """XREADGROUP → dispatch → XACK loop.
 
-    Step 4.1 dispatch is a stub: log + XACK only. Step 4.2 swaps in a
-    real handler table keyed by ``action``.
+    Step 4.2: an ``ActionHandler`` instance is passed in at construction
+    time and ``_dispatch_one`` delegates to ``handler.dispatch(fields)``.
+    The handler is the one place that knows about MT5 — keeping that
+    coupling out of the loop lets us unit-test the loop without an MT5
+    stub when only the XREADGROUP/XACK semantics matter.
     """
 
     def __init__(
@@ -54,11 +58,13 @@ class CommandProcessor:
         redis: redis_asyncio.Redis,
         bridge: MT5BridgeService,
         account_id: str,
+        action_handler: ActionHandler | None = None,
         block_ms: int = 1000,
     ) -> None:
         self._redis = redis
         self._bridge = bridge
         self._account_id = account_id
+        self._action_handler = action_handler
         self._stream = _stream_name(account_id)
         self._group = _group_name(account_id)
         self._consumer = _consumer_name(account_id)
@@ -144,23 +150,42 @@ class CommandProcessor:
     async def _dispatch_one(
         self, msg_id: str, fields: dict[str, str]
     ) -> None:
-        """Step 4.1 stub: log + XACK. Step 4.2 replaces this with a real
-        action handler table.
+        """Step 4.2: route to ``ActionHandler.dispatch`` then XACK.
 
         The XACK runs unconditionally so an unrecognized action does not
         accumulate in XPENDING — matches the FTMO command_loop contract.
+        Handler exceptions are logged but never block the XACK; the
+        handler is responsible for publishing an ``error`` response on
+        its own resp_stream so the server can correlate.
+
+        When ``action_handler`` is ``None`` (the step-4.1 skeleton path,
+        kept alive for the existing dispatch-skeleton tests), we fall
+        back to the old log + XACK behaviour.
         """
-        action = fields.get("action", "")
-        request_id = fields.get("request_id", "")
-        order_id = fields.get("order_id", "")
-        logger.warning(
-            "action_not_implemented_phase_4_1: action=%r order_id=%s "
-            "request_id=%s msg_id=%s",
-            action,
-            order_id,
-            request_id,
-            msg_id,
-        )
+        if self._action_handler is None:
+            action = fields.get("action", "")
+            request_id = fields.get("request_id", "")
+            order_id = fields.get("order_id", "")
+            logger.warning(
+                "action_not_implemented_phase_4_1: action=%r order_id=%s "
+                "request_id=%s msg_id=%s",
+                action,
+                order_id,
+                request_id,
+                msg_id,
+            )
+        else:
+            try:
+                await self._action_handler.dispatch(fields)
+            except Exception:
+                # The handler should publish its own error response; we
+                # log here as a defensive backstop and still XACK so the
+                # cmd doesn't loop forever.
+                logger.exception(
+                    "action_handler.dispatch raised: msg_id=%s action=%s",
+                    msg_id,
+                    fields.get("action", ""),
+                )
         try:
             await self._redis.xack(self._stream, self._group, msg_id)
         except RedisError as exc:

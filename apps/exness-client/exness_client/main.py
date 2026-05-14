@@ -19,6 +19,7 @@ from types import ModuleType
 
 import redis.asyncio as redis_asyncio
 
+from exness_client.action_handlers import ActionHandler
 from exness_client.bridge_service import (
     MT5BridgeService,
     MT5ConnectError,
@@ -28,6 +29,7 @@ from exness_client.command_processor import CommandProcessor
 from exness_client.config import ExnessClientSettings
 from exness_client.heartbeat import HeartbeatLoop
 from exness_client.shutdown import ShutdownCoordinator
+from exness_client.symbol_sync import SymbolSyncPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +101,27 @@ async def amain(
         await redis.aclose()
         return EXIT_CONNECT_FAILED
 
+    # Step 4.2: publish the broker's tradeable symbols once on connect so
+    # the server's wizard sees them on first paint. Failure is non-fatal —
+    # the operator can re-trigger via the ``resync_symbols`` cmd, and we
+    # don't want a transient Redis blip to kill the bridge.
+    symbol_sync = SymbolSyncPublisher(redis, settings.account_id, mt5_module)
+    try:
+        published = await symbol_sync.publish_snapshot()
+        logger.info("initial_symbol_sync_done count=%d", published)
+    except Exception:
+        logger.exception("initial_symbol_sync_failed_continuing")
+
+    action_handler = ActionHandler(
+        redis, settings.account_id, mt5_module, symbol_sync
+    )
+
     cmd_proc = CommandProcessor(
-        redis, bridge, settings.account_id, block_ms=settings.cmd_stream_block_ms
+        redis,
+        bridge,
+        settings.account_id,
+        action_handler=action_handler,
+        block_ms=settings.cmd_stream_block_ms,
     )
     await cmd_proc.ensure_consumer_group()
 
