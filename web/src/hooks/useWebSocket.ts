@@ -3,6 +3,7 @@ import type {
   WsAccountStatusMessage,
   WsCandleMessage,
   WsClientMessage,
+  WsMappingStatusMessage,
   WsOrderUpdatedMessage,
   WsPositionEventMessage,
   WsPositionsTickMessage,
@@ -20,6 +21,20 @@ type CandleUpdateHandler = (msg: WsCandleMessage) => void
 interface UseWebSocketResult {
   sendMessage: (msg: WsClientMessage) => void
   registerCandleHandler: (handler: CandleUpdateHandler | null) => void
+}
+
+// Phase 4.A.6: module-level send helper. ``useWebSocket`` (used once at
+// MainPage) populates this ref so consumers that don't have access to
+// the hook's return value (e.g. the SettingsModal's subscription hook)
+// can still emit subscribe/unsubscribe messages on the shared socket.
+let _sendWsMessage: ((msg: WsClientMessage) => void) | null = null
+
+export function sendWsMessage(msg: WsClientMessage): void {
+  if (_sendWsMessage) {
+    _sendWsMessage(msg)
+  } else {
+    console.warn('WS not initialised; message dropped:', msg)
+  }
 }
 
 /**
@@ -54,6 +69,16 @@ export function useWebSocket(): UseWebSocketResult {
       console.warn('WS not open; message dropped:', msg)
     }
   }, [])
+
+  // Bind the module-level send helper to this hook's sendMessage so the
+  // SymbolMappingWizard subscription path works without re-entering the
+  // hook (would open a second WebSocket).
+  useEffect(() => {
+    _sendWsMessage = sendMessage
+    return () => {
+      _sendWsMessage = null
+    }
+  }, [sendMessage])
 
   const registerCandleHandler = useCallback((handler: CandleUpdateHandler | null) => {
     candleHandlerRef.current = handler
@@ -120,6 +145,17 @@ export function useWebSocket(): UseWebSocketResult {
     const handleAccountsChannel = (msg: WsAccountStatusMessage) => {
       if (msg.data.type === 'account_status') {
         useAppStore.getState().setAccountStatuses(msg.data.accounts)
+      }
+    }
+
+    // Phase 4.A.6: per-Exness-account mapping status. The store mirror is
+    // a flat ``Record<account_id, status>``; subscriptions are issued by
+    // ``useMappingStatusSubscription`` when the Settings modal opens.
+    const handleMappingStatusChannel = (msg: WsMappingStatusMessage) => {
+      if (msg.data.type === 'status_changed') {
+        useAppStore
+          .getState()
+          .setMappingStatusForAccount(msg.data.account_id, msg.data.status)
       }
     }
 
@@ -211,6 +247,8 @@ export function useWebSocket(): UseWebSocketResult {
               handleOrdersChannel(msg as WsOrderUpdatedMessage)
             } else if (msg.channel === 'accounts') {
               handleAccountsChannel(msg as WsAccountStatusMessage)
+            } else if (msg.channel.startsWith('mapping_status:')) {
+              handleMappingStatusChannel(msg as WsMappingStatusMessage)
             }
             return
           }

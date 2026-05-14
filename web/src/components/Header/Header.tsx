@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useAppStore } from '../../store'
 import { SettingsModal } from '../Settings/SettingsModal'
+import { SymbolMappingWizard } from '../SymbolMappingWizard/SymbolMappingWizard'
 import { AccountStatusBar } from './AccountStatusBar'
 
 export function Header() {
@@ -32,6 +33,7 @@ export function Header() {
         </div>
       </header>
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      <SymbolMappingWizard />
     </>
   )
 }

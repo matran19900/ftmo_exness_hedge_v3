@@ -1,6 +1,17 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 import type { AccountStatusEntry, Order, PairResponse, Position } from '../api/client'
+import { symbolMappingApi } from '../api/symbolMapping'
+import type {
+  AutoMatchResponse,
+  Confidence,
+  DecisionAction,
+  MappingStatus,
+  MatchType,
+  RawSymbolResponse,
+  SaveMappingRequest,
+  SpecDivergenceResponse,
+} from '../api/types/symbolMapping'
 
 export interface LatestTick {
   bid: number | null
@@ -148,6 +159,115 @@ export interface AppState {
   // NOT persisted — session-only, driven by useTickThrottle at MainPage.
   tickThrottled: TickThrottled | null
   setTickThrottled: (tick: TickThrottled | null) => void
+
+  // ----- Phase 4.A.6: symbol-mapping wizard -----
+  //
+  // ``mappingStatusByAccount`` mirrors the per-account ``mapping_status``
+  // Redis key, populated by the WS ``mapping_status:{exness_account_id}``
+  // channel + REST refresh on settings open. NOT persisted — server is
+  // the source of truth.
+  mappingStatusByAccount: Record<string, MappingStatus>
+  setMappingStatusForAccount: (accountId: string, status: MappingStatus) => void
+  resetMappingStatuses: () => void
+
+  // Wizard overlay state. ``open=false`` means hidden; opening triggers
+  // the REST sequence raw-symbols → auto-match.
+  wizard: WizardState
+  openWizard: (accountId: string, mode: WizardMode) => Promise<void>
+  closeWizard: () => void
+  updateRowAction: (ftmo: string, action: DecisionAction) => void
+  updateRowOverride: (ftmo: string, exnessValue: string) => void
+  bulkAcceptHighConfidence: () => void
+  bulkAcceptAllProposed: () => void
+  bulkSkipUnmapped: () => void
+  toggleAdvancedSpecs: () => void
+  toggleShowAllExness: () => void
+  saveMapping: () => Promise<{ success: boolean; error?: string }>
+  triggerResync: (accountId: string) => Promise<void>
+}
+
+// ---------------------------------------------------------------------------
+// Wizard sub-types
+// ---------------------------------------------------------------------------
+
+export type WizardMode = 'create' | 'diff' | 'spec_mismatch' | 'edit' | null
+
+export interface WizardRowState {
+  ftmo: string
+  proposed_exness: string
+  current_exness: string
+  match_type: MatchType
+  confidence: Confidence
+  action: DecisionAction
+  override_value: string
+  contract_size: number
+  digits: number
+  pip_size: number
+  pip_value: number
+}
+
+export interface WizardState {
+  open: boolean
+  account_id: string | null
+  mode: WizardMode
+  signature: string | null
+  fuzzy_source: string | null
+  fuzzy_score: number | null
+  rows: WizardRowState[]
+  unmapped_ftmo: string[]
+  unmapped_exness: string[]
+  available_exness: RawSymbolResponse[]
+  show_advanced_specs: boolean
+  show_all_exness: boolean
+  divergences: SpecDivergenceResponse[]
+  loading: boolean
+  saving: boolean
+  load_error: string | null
+  save_error: string | null
+}
+
+const INITIAL_WIZARD_STATE: WizardState = {
+  open: false,
+  account_id: null,
+  mode: null,
+  signature: null,
+  fuzzy_source: null,
+  fuzzy_score: null,
+  rows: [],
+  unmapped_ftmo: [],
+  unmapped_exness: [],
+  available_exness: [],
+  show_advanced_specs: false,
+  show_all_exness: false,
+  divergences: [],
+  loading: false,
+  saving: false,
+  load_error: null,
+  save_error: null,
+}
+
+function _mergeProposalIntoRows(
+  proposal: AutoMatchResponse,
+  rawSymbols: RawSymbolResponse[],
+): WizardRowState[] {
+  const rawByName: Record<string, RawSymbolResponse> = {}
+  for (const r of rawSymbols) rawByName[r.name] = r
+  return proposal.proposals.map((p) => {
+    const raw = rawByName[p.exness]
+    return {
+      ftmo: p.ftmo,
+      proposed_exness: p.exness,
+      current_exness: p.exness,
+      match_type: p.match_type,
+      confidence: p.confidence,
+      action: 'accept' as DecisionAction,
+      override_value: '',
+      contract_size: raw?.contract_size ?? 0,
+      digits: raw?.digits ?? 0,
+      pip_size: raw?.pip_size ?? 0,
+      pip_value: raw ? raw.contract_size * raw.pip_size : 0,
+    }
+  })
 }
 
 export const useAppStore = create<AppState>()(
@@ -276,6 +396,172 @@ export const useAppStore = create<AppState>()(
 
       tickThrottled: null,
       setTickThrottled: (tickThrottled) => set({ tickThrottled }),
+
+      // ----- Phase 4.A.6: symbol-mapping wizard -----
+      mappingStatusByAccount: {},
+      setMappingStatusForAccount: (accountId, status) =>
+        set((state) => ({
+          mappingStatusByAccount: {
+            ...state.mappingStatusByAccount,
+            [accountId]: status,
+          },
+        })),
+      resetMappingStatuses: () => set({ mappingStatusByAccount: {} }),
+
+      wizard: { ...INITIAL_WIZARD_STATE },
+
+      openWizard: async (accountId, mode) => {
+        set((state) => ({
+          wizard: {
+            ...INITIAL_WIZARD_STATE,
+            open: true,
+            account_id: accountId,
+            mode,
+            loading: true,
+          },
+          mappingStatusByAccount: state.mappingStatusByAccount,
+        }))
+        try {
+          const [rawResp, autoMatch] = await Promise.all([
+            symbolMappingApi.getRawSymbols(accountId),
+            symbolMappingApi.runAutoMatch(accountId),
+          ])
+          set((state) => ({
+            wizard: {
+              ...state.wizard,
+              loading: false,
+              signature: autoMatch.signature,
+              fuzzy_source: autoMatch.fuzzy_match_source,
+              fuzzy_score: autoMatch.fuzzy_match_score,
+              rows: _mergeProposalIntoRows(autoMatch, rawResp.symbols),
+              unmapped_ftmo: autoMatch.unmapped_ftmo,
+              unmapped_exness: autoMatch.unmapped_exness,
+              available_exness: rawResp.symbols,
+            },
+          }))
+        } catch (err) {
+          set((state) => ({
+            wizard: {
+              ...state.wizard,
+              loading: false,
+              load_error: err instanceof Error ? err.message : String(err),
+            },
+          }))
+        }
+      },
+
+      closeWizard: () => set({ wizard: { ...INITIAL_WIZARD_STATE } }),
+
+      updateRowAction: (ftmo, action) =>
+        set((state) => ({
+          wizard: {
+            ...state.wizard,
+            rows: state.wizard.rows.map((r) =>
+              r.ftmo === ftmo ? { ...r, action } : r,
+            ),
+          },
+        })),
+
+      updateRowOverride: (ftmo, exnessValue) =>
+        set((state) => ({
+          wizard: {
+            ...state.wizard,
+            rows: state.wizard.rows.map((r) =>
+              r.ftmo === ftmo
+                ? {
+                    ...r,
+                    override_value: exnessValue,
+                    current_exness: exnessValue || r.proposed_exness,
+                  }
+                : r,
+            ),
+          },
+        })),
+
+      bulkAcceptHighConfidence: () =>
+        set((state) => ({
+          wizard: {
+            ...state.wizard,
+            rows: state.wizard.rows.map((r) =>
+              r.confidence === 'high' ? { ...r, action: 'accept' } : r,
+            ),
+          },
+        })),
+
+      bulkAcceptAllProposed: () =>
+        set((state) => ({
+          wizard: {
+            ...state.wizard,
+            rows: state.wizard.rows.map((r) =>
+              r.proposed_exness ? { ...r, action: 'accept' } : r,
+            ),
+          },
+        })),
+
+      bulkSkipUnmapped: () =>
+        set((state) => ({
+          wizard: {
+            ...state.wizard,
+            rows: state.wizard.rows.map((r) =>
+              r.proposed_exness ? r : { ...r, action: 'skip' },
+            ),
+          },
+        })),
+
+      toggleAdvancedSpecs: () =>
+        set((state) => ({
+          wizard: {
+            ...state.wizard,
+            show_advanced_specs: !state.wizard.show_advanced_specs,
+          },
+        })),
+
+      toggleShowAllExness: () =>
+        set((state) => ({
+          wizard: {
+            ...state.wizard,
+            show_all_exness: !state.wizard.show_all_exness,
+          },
+        })),
+
+      saveMapping: async () => {
+        const { wizard } = useAppStore.getState()
+        if (!wizard.account_id) return { success: false, error: 'no account' }
+        set((state) => ({ wizard: { ...state.wizard, saving: true, save_error: null } }))
+        const body: SaveMappingRequest = {
+          decisions: wizard.rows.map((r) => ({
+            ftmo: r.ftmo,
+            action: r.action,
+            exness_override:
+              r.action === 'override'
+                ? r.override_value || null
+                : r.action === 'accept'
+                  ? r.current_exness
+                  : null,
+          })),
+        }
+        try {
+          if (wizard.mode === 'edit') {
+            await symbolMappingApi.editMapping(wizard.account_id, body)
+          } else {
+            await symbolMappingApi.saveMapping(wizard.account_id, body)
+          }
+          set((state) => ({
+            wizard: { ...state.wizard, saving: false, open: false },
+          }))
+          return { success: true }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          set((state) => ({
+            wizard: { ...state.wizard, saving: false, save_error: msg },
+          }))
+          return { success: false, error: msg }
+        }
+      },
+
+      triggerResync: async (accountId) => {
+        await symbolMappingApi.triggerResync(accountId)
+      },
     }),
     {
       name: 'ftmo-hedge-store',

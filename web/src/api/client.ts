@@ -600,6 +600,21 @@ export interface WsAccountStatusMessage {
   }
 }
 
+// Phase 4.A.6: per-Exness-account mapping status broadcast — see
+// ``MappingCacheService.set_mapping_status`` in
+// ``server/app/services/mapping_cache_service.py``. Channel pattern is
+// ``mapping_status:{exness_account_id}``.
+export interface WsMappingStatusMessage {
+  channel: string
+  data: {
+    type: 'status_changed'
+    account_id: string
+    status: 'pending_mapping' | 'active' | 'spec_mismatch' | 'disconnected'
+    signature: string | null
+    cache_filename: string | null
+  }
+}
+
 export type WsServerMessage =
   | WsTickMessage
   | WsCandleMessage
@@ -609,6 +624,7 @@ export type WsServerMessage =
   | WsPositionsTickMessage
   | WsPositionEventMessage
   | WsAccountStatusMessage
+  | WsMappingStatusMessage
 
 export type WsClientMessage =
   | { type: 'subscribe'; channels: string[] }
