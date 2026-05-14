@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from app.dependencies.auth import get_current_user_rest
@@ -72,6 +72,17 @@ class AccountUpdateRequest(BaseModel):
 async def list_accounts(
     _user: Annotated[str, Depends(get_current_user_rest)],
     redis_svc: Annotated[RedisService, Depends(get_redis_service)],
+    broker_type: Annotated[
+        Literal["ftmo", "exness"] | None,
+        Query(
+            description=(
+                "Filter to a single broker. Omit (or send empty) to list both. "
+                "Step 4.5: filter applied post-fetch — the underlying "
+                "``get_all_accounts_with_status`` always reads both broker "
+                "sets in deterministic order (ftmo first, exness second)."
+            ),
+        ),
+    ] = None,
 ) -> AccountListResponse:
     # Step 3.13a: ``row_to_entry`` was hoisted to
     # ``app.services.account_helpers`` so both this endpoint and the
@@ -82,6 +93,8 @@ async def list_accounts(
     from app.services.account_helpers import row_to_entry  # noqa: PLC0415
 
     rows = await redis_svc.get_all_accounts_with_status()
+    if broker_type is not None:
+        rows = [r for r in rows if r["broker"] == broker_type]
     accounts = [row_to_entry(row) for row in rows]
     return AccountListResponse(accounts=accounts, total=len(accounts))
 

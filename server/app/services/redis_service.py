@@ -821,7 +821,13 @@ class RedisService:
         name: str,
         enabled: bool = True,
     ) -> None:
-        """Register an account: SADD set + HSET account_meta in one pipeline."""
+        """Register an account: SADD set + HSET account_meta in one pipeline.
+
+        Step 4.5: ``broker_type`` is now persisted explicitly on the meta
+        HASH (always equal to ``broker``). Pre-step-4.5 records are
+        lazy-backfilled on read by ``get_account_meta`` — see that method
+        for the read-side contract.
+        """
         _validate_broker(broker)
         _validate_account_id(account_id)
         now_ms = int(time.time() * 1000)
@@ -831,6 +837,7 @@ class RedisService:
             f"account_meta:{broker}:{account_id}",
             mapping={
                 "name": name,
+                "broker_type": broker,
                 "created_at": str(now_ms),
                 "enabled": "true" if enabled else "false",
             },
@@ -865,13 +872,25 @@ class RedisService:
         return sorted(members)
 
     async def get_account_meta(self, broker: str, account_id: str) -> dict[str, str] | None:
-        """Return account meta (name, created_at, enabled) or None if missing."""
+        """Return account meta (name, created_at, enabled, broker_type) or
+        None if missing.
+
+        Step 4.5: ``broker_type`` is lazy-backfilled in the returned dict
+        if missing (legacy pre-4.5 records that pre-date the explicit
+        field). The backfill does NOT persist — a subsequent
+        ``add_account`` / ``update_account_meta`` call will write it for
+        real. Forward-compat for any future broker beyond ftmo/exness
+        whose URL key may not match the meta value.
+        """
         _validate_broker(broker)
         _validate_account_id(account_id)
         data = await self._redis.hgetall(f"account_meta:{broker}:{account_id}")  # type: ignore[misc]
         if not data:
             return None
-        return dict(data)
+        result = dict(data)
+        if "broker_type" not in result:
+            result["broker_type"] = broker
+        return result
 
     async def update_account_meta(
         self, broker: str, account_id: str, fields: dict[str, str]

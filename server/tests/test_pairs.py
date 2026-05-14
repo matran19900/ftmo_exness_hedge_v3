@@ -2,29 +2,57 @@
 
 Uses the autouse fakeredis dependency override + real whitelist load from
 conftest. ``authed_client`` provides a JWT-bearing httpx client.
+
+Step 4.5: pair creation now requires (a) both account_ids exist as set
+members and (b) the Exness account's ``mapping_status`` is ``"active"``.
+The module-scoped autouse ``_seed_default_accounts_and_mapping`` fixture
+below seeds those prerequisites so the rest of the file (which pre-dates
+the new validations) keeps testing CRUD shape without re-seeding in every
+test. Tests that exercise the new failure paths live in
+``test_pairs_create_validations.py``.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import AsyncIterator
 from typing import Any
 
+import fakeredis.aioredis
 import pytest
+import pytest_asyncio
+from app.services.redis_service import RedisService
 from httpx import AsyncClient
 
 PAIR_PATH = "/api/pairs/"
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+DEFAULT_FTMO = "ftmo_001"
+DEFAULT_EXNESS = "exness_001"
 
 
 def _create_body(**overrides: Any) -> dict[str, Any]:
     body: dict[str, Any] = {
         "name": "FTMO Challenge $100k <-> Exness Hedge",
-        "ftmo_account_id": "ftmo_001",
-        "exness_account_id": "exness_001",
+        "ftmo_account_id": DEFAULT_FTMO,
+        "exness_account_id": DEFAULT_EXNESS,
         "ratio": 1.0,
     }
     body.update(overrides)
     return body
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _seed_default_accounts_and_mapping(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> AsyncIterator[None]:
+    """Step 4.5: seed both default account_ids + flip Exness mapping_status
+    to ``"active"`` so the existing CRUD tests (written pre-step-4.5) keep
+    passing through the new POST /api/pairs/ validation gates."""
+    svc = RedisService(fake_redis)
+    await svc.add_account("ftmo", DEFAULT_FTMO, name="primary FTMO")
+    await svc.add_account("exness", DEFAULT_EXNESS, name="primary Exness")
+    await fake_redis.set(f"mapping_status:{DEFAULT_EXNESS}", "active")
+    yield
 
 
 # ---------- auth ----------
