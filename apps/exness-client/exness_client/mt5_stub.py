@@ -70,6 +70,13 @@ TRADE_RETCODE_NO_MONEY = 10019
 TRADE_RETCODE_POSITION_NOT_FOUND = 10027
 TRADE_RETCODE_UNSUPPORTED_FILLING = 10030
 
+# Step 4.3a — deal entry direction. Used by the position-monitor close
+# enrichment to pick the deal that *closed* the position out of a list
+# that may also contain the original IN deal + IN-OUT partials.
+DEAL_ENTRY_IN = 0
+DEAL_ENTRY_OUT = 1
+DEAL_ENTRY_INOUT = 2
+
 
 # ----- API return shapes -----
 
@@ -147,6 +154,35 @@ class Position(NamedTuple):
     tp: float = 0.0
 
 
+class Deal(NamedTuple):
+    """Subset of ``mt5.history_deals_get()`` entries.
+
+    Step 4.3a uses these to enrich ``position_closed_external`` events
+    with the actual broker fill details (close_price, realized profit,
+    commission, swap). ``reason`` is included in the shape because
+    Phase 5+ may parse it; today the close-reason classification runs
+    purely off the client-side ``CmdLedger``.
+    """
+
+    ticket: int
+    order: int
+    time: int           # epoch seconds
+    time_msc: int       # epoch milliseconds
+    type: int           # ORDER_TYPE_BUY / ORDER_TYPE_SELL
+    entry: int          # DEAL_ENTRY_IN / DEAL_ENTRY_OUT / DEAL_ENTRY_INOUT
+    magic: int
+    position_id: int
+    reason: int
+    volume: float
+    price: float
+    commission: float
+    swap: float
+    profit: float
+    fee: float
+    symbol: str
+    comment: str
+
+
 # ----- Test-controllable module state -----
 
 _DEFAULT_ACCOUNT_INFO = AccountInfo(
@@ -175,6 +211,9 @@ _state: dict[str, Any] = {
     "order_send_raises": None,       # Exception to raise instead of returning
     "positions_get": (),             # tuple[Position, ...]
     "positions_get_raises": None,    # Exception | None — for monitor tests
+    # Step 4.3a — history_deals_get state
+    "history_deals_get": [],         # list[Deal]
+    "history_deals_get_raises": None,
 }
 
 
@@ -304,6 +343,25 @@ def positions_get(
     return positions
 
 
+def history_deals_get(
+    *, position: int | None = None, **_kwargs: object
+) -> tuple[Deal, ...]:
+    """Mirror of ``mt5.history_deals_get(position=ticket, ...)``.
+
+    Real MT5 supports several keyword filters (``date_from`` /
+    ``date_to`` / ``group`` / ``ticket`` / ``position``); we implement
+    only ``position`` because that's the single filter step 4.3a's
+    enrichment uses. The ``**_kwargs`` swallow keeps a future caller
+    that adds extra filters from blowing up unexpectedly.
+    """
+    if _state["history_deals_get_raises"] is not None:
+        raise _state["history_deals_get_raises"]
+    deals: list[Deal] = list(_state["history_deals_get"])
+    if position is not None:
+        return tuple(d for d in deals if d.position_id == position)
+    return tuple(deals)
+
+
 # ----- Test helpers (NOT part of the real MetaTrader5 API) -----
 
 
@@ -330,6 +388,8 @@ def reset_state_for_tests() -> None:
     _state["order_send_raises"] = None
     _state["positions_get"] = ()
     _state["positions_get_raises"] = None
+    _state["history_deals_get"] = []
+    _state["history_deals_get_raises"] = None
 
 
 # ----- Phase 4.3: position-monitor test helpers -----
@@ -370,3 +430,10 @@ def _remove_position_for_tests(ticket: int) -> None:
     _state["positions_get"] = [
         p for p in _state["positions_get"] if p.ticket != ticket
     ]
+
+
+def _set_history_deals_for_tests(deals: list[Deal]) -> None:
+    """Inject a deals catalogue for ``history_deals_get`` filtering.
+    Tests usually populate this in tandem with ``_remove_position_for_tests``
+    so the close-enrichment path resolves the broker fill data."""
+    _state["history_deals_get"] = list(deals)

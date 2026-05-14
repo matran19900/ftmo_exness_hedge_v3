@@ -21,6 +21,7 @@ from pydantic import SecretStr
 from exness_client import main as main_mod
 from exness_client import mt5_stub
 from exness_client.action_handlers import ActionHandler
+from exness_client.cmd_ledger import CmdLedger
 from exness_client.command_processor import CommandProcessor
 from exness_client.config import ExnessClientSettings
 from exness_client.symbol_sync import SymbolSyncPublisher
@@ -180,7 +181,10 @@ async def test_command_processor_dispatches_to_action_handler(
     """A cmd XADDed to the stream lands on ``ActionHandler.dispatch``
     and produces a resp_stream entry."""
     sync = SymbolSyncPublisher(fake_redis, "exness_acc_001", mt5_stub)
-    handler = ActionHandler(fake_redis, "exness_acc_001", mt5_stub, sync)
+    ledger = CmdLedger(fake_redis, "exness_acc_001")
+    handler = ActionHandler(
+        fake_redis, "exness_acc_001", mt5_stub, sync, ledger
+    )
     bridge = AsyncMock()
     proc = CommandProcessor(
         fake_redis,

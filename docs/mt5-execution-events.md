@@ -161,10 +161,24 @@ reconstruction; step 4.3 is the in-process diff layer that fires the events.
 | Detect closed externally (manual / SL-TP hit / stop-out) | `positions_get()` poll diff (last − current) | 4.3 | Triggers cascade Path B (server step 4.7/4.8) |
 | Detect SL/TP modification (terminal-side edit) | `positions_get()` field diff against last snapshot | 4.3 | `changed_fields` enumerates `sl` / `tp` / `volume` |
 | Volume change (partial close, future scope) | `positions_get()` field diff | 4.3 | Detected today; partial-close cmd-stream support is Phase 5 |
+| Detect offline-period diff via persistent snapshot | snapshot vs current diff on first poll after restart | 4.3a | Closes the leg-open gap CEO surfaced in Windows smoke (modify→stop→manual-close→restart) |
+| Enrich closed event with broker fill data | `history_deals_get(position=ticket)` | 4.3a | `close_price` / `realized_profit` / `commission` / `swap` / `close_time_ms`; falls back to `enrichment_source="snapshot_fallback"` on error |
+| Classify close as `server_initiated` vs `external` | client-side `CmdLedger` Redis SET | 4.3a | Server step 4.7 will route `external` → WARNING alert (no FTMO cascade) |
 
 Event stream key: `event_stream:exness:{account_id}`. Payload schema (flat string dict):
 ``event_type``, ``broker_position_id``, ``ts_ms``, ``symbol``, ``side`` (+ event-specific extras
-listed in `exness_client/position_monitor.py`).
+listed in `exness_client/position_monitor.py`). Step 4.3a stamps every
+``position_closed_external`` payload with ``close_reason`` (``server_initiated``
+or ``external``) plus ``enrichment_source`` (``history_deals`` or
+``snapshot_fallback``); the cascade orchestrator (step 4.7) pattern-matches
+on ``close_reason``.
+
+Persistent snapshot key: ``position_monitor:last_snapshot:{account_id}`` —
+JSON STRING with 30-day TTL. Schema: ``{schema_version, last_poll_ts_ms,
+positions: [{ticket, symbol, volume, sl, tp, position_type}]}``.
+
+Cmd ledger key: ``cmd_ledger:exness:{account_id}:server_initiated`` —
+Redis SET with 24-hour TTL. Members are stringified MT5 tickets.
 
 ---
 
@@ -261,5 +275,6 @@ Append-only mid-phase per D-069 exception (mirrors `docs/ctrader-execution-event
 | 2026-05-13 | 4.0 | Design doc skeleton creation | Initial structure. Sections 1–8 placeholders; will populate during steps 4.1 (connect+symbol sync), 4.2 (actions+monitor+retcodes), 4.5 (full hedge flow), 4.6 (cascade integration). |
 | 2026-05-14 | 4.2 | Initial action-handler implementation | §3 retcode table marked with `Step` column = 4.2 for the 10 mapped retcodes (DONE / REJECT / INVALID_VOLUME / INVALID_PRICE / INVALID_STOPS / MARKET_CLOSED / NO_MONEY / POSITION_NOT_FOUND / UNSUPPORTED_FILLING / REQUOTE). §6 quirks populated: IOC→FOK retry pattern, pip-size point*10 derivation for 3/5-digit symbols, MarketWatch `symbol_select` requirement, close-needs-position-ticket. ``RETCODE_MAP`` is the single source of truth (`exness_client/retcode_mapping.py`). |
 | 2026-05-14 | 4.3 | Position monitor poll loop | §5.a populated: 3 event types (`position_new`, `position_closed_external`, `position_modified`) on `event_stream:exness:{account_id}`. Baseline pattern locked: first poll = silent snapshot (no replay events on client restart). `POLL_INTERVAL_S = 2.0` locked. SL/TP/volume diff detection runs entirely off the in-process snapshot — no `history_deals_get` reconciliation in this step (deferred to step 4.4). Event order is deterministic: news first (sorted by ticket), then closed, then modified. |
+| 2026-05-14 | 4.3a | Persistent snapshot + cmd ledger | Closes the Windows-smoke leg-open gap: persistent snapshot at `position_monitor:last_snapshot:{account_id}` (JSON STRING, 30-day TTL) saved after every poll and loaded on the first poll of the next process so offline closes/modifies/opens replay correctly. `position_closed_external` events now carry `close_reason` (`server_initiated` via `CmdLedger` lookup OR `external`) + `enrichment_source` (`history_deals` OR `snapshot_fallback`) + broker fill fields (`close_price` / `realized_profit` / `commission` / `swap` / `close_time_ms`) when `mt5.history_deals_get(position=ticket)` succeeds. CEO policy: secondary leg always passive — server step 4.7 will turn every `external` close on a hedge leg into a WARNING alert (no FTMO cascade). |
 
 *(Append entries below.)*

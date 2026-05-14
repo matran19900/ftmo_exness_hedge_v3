@@ -47,6 +47,7 @@ import logging
 import time
 from typing import Any
 
+from .cmd_ledger import CmdLedger
 from .retcode_mapping import map_retcode
 from .symbol_sync import SymbolSyncPublisher
 
@@ -69,11 +70,13 @@ class ActionHandler:
         account_id: str,
         mt5_module: Any,
         symbol_sync: SymbolSyncPublisher,
+        cmd_ledger: CmdLedger,
     ) -> None:
         self._redis = redis_client
         self._account_id = account_id
         self._mt5 = mt5_module
         self._symbol_sync = symbol_sync
+        self._cmd_ledger = cmd_ledger
         self._resp_key = f"resp_stream:exness:{account_id}"
 
     # ----- Dispatch -----
@@ -241,6 +244,16 @@ class ActionHandler:
                 cascade_trigger=cascade_trigger,
             )
             return
+
+        # Step 4.3a: mark the ticket in the ledger BEFORE issuing the
+        # close so the position monitor's enrichment correctly stamps
+        # ``close_reason="server_initiated"`` even if MT5 fills + the
+        # monitor polls before our resp_stream publish lands. Failure
+        # is logged inside the ledger and never raised — worst case
+        # the close gets misclassified as ``external`` (server emits a
+        # benign WARNING alert in step 4.7) but the close itself goes
+        # through normally.
+        await self._cmd_ledger.mark_server_initiated(position_ticket)
 
         positions = await _to_thread(
             self._mt5.positions_get, ticket=position_ticket

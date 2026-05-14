@@ -1,4 +1,4 @@
-"""Position monitor poll loop for the Exness MT5 client (Phase 4.3).
+"""Position monitor poll loop for the Exness MT5 client (Phase 4.3 + 4.3a).
 
 Polls ``mt5.positions_get()`` every ``POLL_INTERVAL_S`` seconds, diffs
 against the previous snapshot, and publishes one of three event types
@@ -15,16 +15,32 @@ to ``event_stream:exness:{account_id}``:
                                      (step 4.7/4.8) reads this event to
                                      trigger Path B cascade per
                                      ``docs/phase-4-design.md`` §1.A.B.
+                                     Step 4.3a stamps every event with
+                                     ``close_reason`` (``server_initiated``
+                                     vs ``external``) via the ``CmdLedger``.
   - ``position_modified``          — a ticket is still present but at
                                      least one of ``sl`` / ``tp`` /
                                      ``volume`` changed (terminal-side
                                      edit or partial close).
 
-The first poll after construction is treated as a *baseline*: it stores
-the snapshot but emits no events. Without this guard a freshly-started
-client would re-emit a ``position_new`` for every existing position on
-the broker, which the cascade orchestrator would mis-interpret as a
-brand-new manual open.
+Step 4.3a additions:
+
+  * **Persistent snapshot**. After every successful poll the monitor
+    SETs ``position_monitor:last_snapshot:{account_id}`` (JSON, 30-day
+    TTL). On the next process start the loader reads this snapshot and
+    diffs against the live broker view BEFORE marking the baseline —
+    so a position closed during a client outage is detected on the
+    very first poll after reconnect (closes the leg-open gap CEO
+    surfaced in Windows smoke).
+
+  * **history_deals_get enrichment**. Closed events carry the broker's
+    actual fill data (close_price, realized_profit, commission, swap)
+    when the deals query succeeds; falls back to the last-snapshot
+    fields when it doesn't.
+
+The first poll on an account that has *no* persisted snapshot is still
+a silent baseline (we'd otherwise replay every existing position as
+``position_new`` on a fresh install).
 
 Synchronous MT5 calls run via ``asyncio.to_thread`` (D-4.1.A). All
 exceptions are logged and swallowed so a flaky broker / Redis blip
@@ -34,10 +50,13 @@ never takes down the loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass
 from typing import Any
+
+from .cmd_ledger import CmdLedger
 
 logger = logging.getLogger(__name__)
 
@@ -73,18 +92,26 @@ class PositionMonitor:
                        on its next wake (worst case POLL_INTERVAL_S).
     """
 
+    # Step 4.3a — persistent snapshot Redis schema.
+    SNAPSHOT_KEY_PREFIX = "position_monitor:last_snapshot"
+    SNAPSHOT_TTL_SECONDS = 30 * 86400
+    SNAPSHOT_SCHEMA_VERSION = 1
+
     def __init__(
         self,
         redis_client: Any,
         account_id: str,
         mt5_module: Any,
+        cmd_ledger: CmdLedger,
         poll_interval_s: float = POLL_INTERVAL_S,
     ) -> None:
         self._redis = redis_client
         self._account_id = account_id
         self._mt5 = mt5_module
+        self._cmd_ledger = cmd_ledger
         self._poll_interval_s = poll_interval_s
         self._event_key = f"event_stream:exness:{account_id}"
+        self._snapshot_key = f"{self.SNAPSHOT_KEY_PREFIX}:{account_id}"
         # ticket → snapshot from the previous poll
         self._last_snapshot: dict[int, PositionSnapshot] = {}
         self._baseline_done = False
@@ -166,16 +193,32 @@ class PositionMonitor:
             raw_by_ticket[pos.ticket] = pos
 
         if not self._baseline_done:
+            # Step 4.3a: try to load the persisted snapshot first. If it
+            # exists, treat it as the previous-poll state and emit any
+            # offline-period diff events on this very first poll. Closes
+            # the leg-open gap CEO surfaced in the Windows smoke (client
+            # restart while a position was still open then closed manually).
+            loaded = await self._load_persisted_snapshot()
+            if loaded is not None:
+                self._last_snapshot = loaded
+                self._baseline_done = True
+                await self._emit_diff_events(loaded, current, raw_by_ticket)
+                self._last_snapshot = current
+                await self._persist_snapshot(current)
+                return
+            # No persisted snapshot → silent baseline (fresh install).
             self._last_snapshot = current
             self._baseline_done = True
             logger.info(
-                "position_monitor.baseline_set position_count=%d",
+                "position_monitor.baseline_empty_init position_count=%d",
                 len(current),
             )
+            await self._persist_snapshot(current)
             return
 
         await self._emit_diff_events(self._last_snapshot, current, raw_by_ticket)
         self._last_snapshot = current
+        await self._persist_snapshot(current)
 
     async def _emit_diff_events(
         self,
@@ -208,16 +251,19 @@ class PositionMonitor:
 
         for ticket in sorted(last_tickets - current_tickets):
             snap = last[ticket]
+            enrichment = await self._enrich_closed_position(ticket)
+            extra: dict[str, str] = {
+                "symbol": snap.symbol,
+                "side": _side_label(snap.position_type, self._mt5),
+                "last_volume": str(snap.volume),
+                "last_sl": str(snap.sl),
+                "last_tp": str(snap.tp),
+            }
+            extra.update(enrichment)
             await self._publish_event(
                 event_type="position_closed_external",
                 ticket=ticket,
-                extra={
-                    "symbol": snap.symbol,
-                    "side": _side_label(snap.position_type, self._mt5),
-                    "last_volume": str(snap.volume),
-                    "last_sl": str(snap.sl),
-                    "last_tp": str(snap.tp),
-                },
+                extra=extra,
             )
 
         for ticket in sorted(last_tickets & current_tickets):
@@ -246,6 +292,183 @@ class PositionMonitor:
                     "old_volume": str(last_snap.volume),
                 },
             )
+
+    # ----- Step 4.3a: persistent snapshot -----
+
+    async def _persist_snapshot(
+        self, snapshot: dict[int, PositionSnapshot]
+    ) -> None:
+        """SET ``position_monitor:last_snapshot:{account_id}`` JSON with
+        ``SNAPSHOT_TTL_SECONDS`` TTL. Called after every successful poll
+        (post-emit) so the next process start sees the most recent
+        broker view. Failure is logged but never raised — a missed save
+        only loses the offline-diff coverage for the next restart."""
+        payload: dict[str, Any] = {
+            "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
+            "last_poll_ts_ms": int(time.time() * 1000),
+            "positions": [
+                {
+                    "ticket": s.ticket,
+                    "symbol": s.symbol,
+                    "volume": s.volume,
+                    "sl": s.sl,
+                    "tp": s.tp,
+                    "position_type": s.position_type,
+                }
+                for s in snapshot.values()
+            ],
+        }
+        try:
+            await self._redis.set(
+                self._snapshot_key,
+                json.dumps(payload),
+                ex=self.SNAPSHOT_TTL_SECONDS,
+            )
+            logger.debug(
+                "position_monitor.snapshot_persisted key=%s position_count=%d",
+                self._snapshot_key,
+                len(snapshot),
+            )
+        except Exception:
+            logger.exception(
+                "position_monitor.snapshot_persist_failed key=%s",
+                self._snapshot_key,
+            )
+
+    async def _load_persisted_snapshot(
+        self,
+    ) -> dict[int, PositionSnapshot] | None:
+        """Return the last persisted snapshot keyed by ticket, or ``None``
+        when the key is missing / TTL-expired / malformed / schema-mismatched.
+
+        Logs every failure mode so an operator can grep for the cause if
+        the offline-diff path ever silently no-ops."""
+        try:
+            raw = await self._redis.get(self._snapshot_key)
+        except Exception:
+            logger.exception(
+                "position_monitor.snapshot_load_failed key=%s",
+                self._snapshot_key,
+            )
+            return None
+        if raw is None:
+            logger.info(
+                "position_monitor.no_persisted_snapshot key=%s",
+                self._snapshot_key,
+            )
+            return None
+        try:
+            text = raw if isinstance(raw, str) else raw.decode()
+            payload = json.loads(text)
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning(
+                "position_monitor.snapshot_malformed_json key=%s",
+                self._snapshot_key,
+                exc_info=True,
+            )
+            return None
+        if payload.get("schema_version") != self.SNAPSHOT_SCHEMA_VERSION:
+            logger.warning(
+                "position_monitor.snapshot_schema_mismatch expected=%s got=%s",
+                self.SNAPSHOT_SCHEMA_VERSION,
+                payload.get("schema_version"),
+            )
+            return None
+        snapshot: dict[int, PositionSnapshot] = {}
+        for entry in payload.get("positions", []):
+            try:
+                ticket = int(entry["ticket"])
+                snapshot[ticket] = PositionSnapshot(
+                    ticket=ticket,
+                    symbol=entry["symbol"],
+                    volume=float(entry["volume"]),
+                    sl=float(entry["sl"]),
+                    tp=float(entry["tp"]),
+                    position_type=int(entry["position_type"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "position_monitor.snapshot_entry_invalid entry=%r",
+                    entry,
+                    exc_info=True,
+                )
+                continue
+        age_ms = int(time.time() * 1000) - int(payload.get("last_poll_ts_ms", 0))
+        logger.info(
+            "position_monitor.snapshot_loaded key=%s position_count=%d age_ms=%d",
+            self._snapshot_key,
+            len(snapshot),
+            age_ms,
+        )
+        return snapshot
+
+    # ----- Step 4.3a: closed-event enrichment -----
+
+    async def _enrich_closed_position(self, ticket: int) -> dict[str, str]:
+        """Build the close-side extras for a ``position_closed_external``
+        payload. Two pieces:
+
+          1. ``close_reason`` from the ``CmdLedger`` — ``server_initiated``
+             when we issued the close, ``external`` for everything else.
+             Server step 4.7 routes ``external`` → WARNING alert.
+          2. Broker fill data (``close_price`` / ``close_time_ms`` /
+             ``realized_profit`` / ``commission`` / ``swap``) via
+             ``mt5.history_deals_get``. Falls back to
+             ``enrichment_source="snapshot_fallback"`` when the deals
+             query fails or has no DEAL_ENTRY_OUT row.
+        """
+        is_server = await self._cmd_ledger.is_server_initiated(ticket)
+        if is_server:
+            close_reason = "server_initiated"
+            await self._cmd_ledger.clear(ticket)
+        else:
+            close_reason = "external"
+
+        try:
+            deals = await asyncio.to_thread(
+                self._mt5.history_deals_get, position=ticket
+            )
+        except Exception:
+            logger.warning(
+                "position_monitor.history_deals_get_exception ticket=%s",
+                ticket,
+                exc_info=True,
+            )
+            return {
+                "close_reason": close_reason,
+                "enrichment_source": "snapshot_fallback",
+            }
+        if not deals:
+            logger.warning(
+                "position_monitor.history_deals_empty ticket=%s", ticket
+            )
+            return {
+                "close_reason": close_reason,
+                "enrichment_source": "snapshot_fallback",
+            }
+        close_deal = next(
+            (d for d in deals if d.entry == self._mt5.DEAL_ENTRY_OUT),
+            None,
+        )
+        if close_deal is None:
+            logger.warning(
+                "position_monitor.no_close_deal_found ticket=%s deal_count=%d",
+                ticket,
+                len(deals),
+            )
+            return {
+                "close_reason": close_reason,
+                "enrichment_source": "snapshot_fallback",
+            }
+        return {
+            "close_price": str(close_deal.price),
+            "close_time_ms": str(int(close_deal.time * 1000)),
+            "realized_profit": str(close_deal.profit),
+            "commission": str(close_deal.commission),
+            "swap": str(close_deal.swap),
+            "close_reason": close_reason,
+            "enrichment_source": "history_deals",
+        }
 
     async def _publish_event(
         self,

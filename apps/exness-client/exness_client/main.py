@@ -25,6 +25,7 @@ from exness_client.bridge_service import (
     MT5ConnectError,
     MT5HedgingModeRequiredError,
 )
+from exness_client.cmd_ledger import CmdLedger
 from exness_client.command_processor import CommandProcessor
 from exness_client.config import ExnessClientSettings
 from exness_client.heartbeat import HeartbeatLoop
@@ -113,8 +114,14 @@ async def amain(
     except Exception:
         logger.exception("initial_symbol_sync_failed_continuing")
 
+    # Step 4.3a: per-account ledger of server-issued close cmds. The
+    # action handler marks tickets here BEFORE issuing the close to MT5
+    # so the position monitor can stamp ``close_reason="server_initiated"``
+    # on the resulting ``position_closed_external`` event.
+    cmd_ledger = CmdLedger(redis, settings.account_id)
+
     action_handler = ActionHandler(
-        redis, settings.account_id, mt5_module, symbol_sync
+        redis, settings.account_id, mt5_module, symbol_sync, cmd_ledger
     )
 
     cmd_proc = CommandProcessor(
@@ -141,7 +148,7 @@ async def amain(
     # positions and publishes ``event_stream:exness:{account_id}``
     # events. Drives the server-side cascade orchestrator (step 4.7/4.8).
     position_monitor = PositionMonitor(
-        redis, settings.account_id, mt5_module
+        redis, settings.account_id, mt5_module, cmd_ledger
     )
 
     coord = ShutdownCoordinator(

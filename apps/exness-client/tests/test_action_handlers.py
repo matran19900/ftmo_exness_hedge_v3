@@ -7,11 +7,14 @@ the contract the server's response handler (step 4.7) consumes.
 
 from __future__ import annotations
 
+from typing import Any
+
 import fakeredis.aioredis
 import pytest
 
 from exness_client import mt5_stub
 from exness_client.action_handlers import ActionHandler
+from exness_client.cmd_ledger import CmdLedger
 from exness_client.symbol_sync import SymbolSyncPublisher
 
 # ---------------------------------------------------------------------------
@@ -21,8 +24,10 @@ from exness_client.symbol_sync import SymbolSyncPublisher
 
 @pytest.fixture
 def handler(fake_redis: fakeredis.aioredis.FakeRedis) -> ActionHandler:
+
     sync = SymbolSyncPublisher(fake_redis, "exness_001", mt5_stub)
-    return ActionHandler(fake_redis, "exness_001", mt5_stub, sync)
+    ledger = CmdLedger(fake_redis, "exness_001")
+    return ActionHandler(fake_redis, "exness_001", mt5_stub, sync, ledger)
 
 
 def _stub_symbol(
@@ -571,7 +576,9 @@ async def test_resync_publisher_exception_publishes_error(
         raise RuntimeError("snap_failed")
 
     monkeypatch.setattr(sync, "publish_snapshot", _boom)
-    handler = ActionHandler(fake_redis, "exness_001", mt5_stub, sync)
+
+    ledger = CmdLedger(fake_redis, "exness_001")
+    handler = ActionHandler(fake_redis, "exness_001", mt5_stub, sync, ledger)
     await handler.dispatch(
         {"request_id": "r3", "action": "resync_symbols"}
     )
@@ -600,3 +607,79 @@ async def test_publish_response_extras_make_it_through(
     )
     payload = await _read_one_response(fake_redis)
     assert payload["custom_field_alpha"] == "123"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.3a — CmdLedger integration in _handle_close
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_action_handler_close_marks_ledger_before_send(
+    handler: ActionHandler, fake_redis: fakeredis.aioredis.FakeRedis
+) -> None:
+
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        positions_get=(_open_position(),),
+    )
+    await handler.dispatch(
+        {
+            "request_id": "rL1",
+            "action": "close",
+            "broker_position_id": "67890",
+        }
+    )
+    ledger = CmdLedger(fake_redis, "exness_001")
+    assert await ledger.is_server_initiated(67890) is True
+
+
+@pytest.mark.asyncio
+async def test_action_handler_close_ledger_failure_does_not_block_send(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flaky Redis on the ledger SADD must NOT block the close cmd —
+    the close still fires, the resp_stream still publishes."""
+
+    async def _boom_sadd(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("redis_dropped")
+
+    monkeypatch.setattr(fake_redis, "sadd", _boom_sadd)
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        positions_get=(_open_position(),),
+    )
+    await handler.dispatch(
+        {
+            "request_id": "rL2",
+            "action": "close",
+            "broker_position_id": "67890",
+        }
+    )
+    payload = await _read_one_response(fake_redis)
+    assert payload["status"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_action_handler_open_does_not_mark_ledger(
+    handler: ActionHandler, fake_redis: fakeredis.aioredis.FakeRedis
+) -> None:
+
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(symbol_info={"EURUSDm": sym})
+    await handler.dispatch(
+        {
+            "request_id": "rL3",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    ledger = CmdLedger(fake_redis, "exness_001")
+    members = await fake_redis.smembers(ledger.key)
+    assert members == set()
