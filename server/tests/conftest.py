@@ -36,7 +36,12 @@ import fakeredis.aioredis  # noqa: E402
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
 from app.main import app  # noqa: E402
-from app.services import symbol_whitelist  # noqa: E402
+from app.services.auto_match_engine import AutoMatchEngine  # noqa: E402
+from app.services.broadcast import BroadcastService  # noqa: E402
+from app.services.ftmo_whitelist_service import FTMOWhitelistService  # noqa: E402
+from app.services.mapping_cache_repository import MappingCacheRepository  # noqa: E402
+from app.services.mapping_cache_service import MappingCacheService  # noqa: E402
+from app.services.mapping_service import MappingService  # noqa: E402
 from app.services.redis_service import RedisService, get_redis_service  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
@@ -73,12 +78,6 @@ def real_mapping_path(real_ftmo_whitelist_path: Path) -> Path:
     return real_ftmo_whitelist_path
 
 
-@pytest.fixture(autouse=True)
-def _load_real_whitelist(real_ftmo_whitelist_path: Path) -> None:
-    """Ensure the in-process whitelist cache is loaded before every test."""
-    symbol_whitelist.load_whitelist(str(real_ftmo_whitelist_path))
-
-
 @pytest.fixture
 def fake_redis() -> fakeredis.aioredis.FakeRedis:
     """A fresh fakeredis-async client per test, decoded as strings."""
@@ -91,6 +90,46 @@ def _override_redis_service(fake_redis: fakeredis.aioredis.FakeRedis) -> Iterato
     app.dependency_overrides[get_redis_service] = lambda: RedisService(fake_redis)
     yield
     app.dependency_overrides.pop(get_redis_service, None)
+
+
+@pytest.fixture(autouse=True)
+def _wire_app_state_for_tests(
+    real_ftmo_whitelist_path: Path,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
+    """Phase 4.A.5: tests bypass the real lifespan, so the per-test FastAPI
+    app needs the same ``app.state.*`` shape that lifespan would build —
+    minus the cTrader feed and consumer-group tasks. We pin a fresh
+    ``MappingCacheRepository`` per test (under a tmp dir), build a real
+    ``AutoMatchEngine`` from the bootstrap hints, and stitch it all into
+    a ``MappingService`` so route-level ``Depends(get_mapping_service)``
+    resolves cleanly without each test reproducing the wiring."""
+    cache_dir = tmp_path_factory.mktemp("symbol_mapping_cache")
+    repo = MappingCacheRepository(cache_dir)
+    hints_path = REPO_ROOT / "server" / "config" / "symbol_match_hints.json"
+    engine = AutoMatchEngine(hints_path)
+    whitelist = FTMOWhitelistService(real_ftmo_whitelist_path)
+    broadcast = BroadcastService()
+    cache_service = MappingCacheService(
+        repository=repo,
+        engine=engine,
+        ftmo_whitelist=whitelist,
+        redis=fake_redis,
+        broadcast=broadcast,
+    )
+    mapping_service = MappingService(
+        ftmo_whitelist=whitelist,
+        cache_service=cache_service,
+        redis=fake_redis,
+    )
+    app.state.ftmo_whitelist = whitelist
+    app.state.mapping_cache_repository = repo
+    app.state.auto_match_engine = engine
+    app.state.broadcast = broadcast
+    app.state.mapping_cache_service = cache_service
+    app.state.mapping_service = mapping_service
+    yield
 
 
 @pytest_asyncio.fixture

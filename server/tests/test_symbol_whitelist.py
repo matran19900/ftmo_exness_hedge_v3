@@ -1,9 +1,10 @@
-"""Tests for the FTMO whitelist loader + shim (Phase 4.A.1).
+"""Tests for the FTMO whitelist service + the archived legacy loader.
 
-The shim ``app.services.symbol_whitelist`` delegates to
-``FTMOWhitelistService``; the legacy file format (with Exness fields)
-still loads through the unchanged ``hedger_shared.symbol_mapping`` module
-for archived-data tests.
+Phase 4.A.5 cleanup: the ``app.services.symbol_whitelist`` shim is gone;
+all callers consume ``FTMOWhitelistService`` directly. The legacy file
+format (with Exness fields) still loads through the unchanged
+``hedger_shared.symbol_mapping`` module for the archived-data regression
+test below.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ import json
 from pathlib import Path
 
 import pytest
-from app.services import symbol_whitelist
 from app.services.ftmo_whitelist_service import (
     FTMOSymbol,
     FTMOWhitelistFile,
@@ -24,12 +24,7 @@ from pydantic import ValidationError
 EXPECTED_SYMBOL_COUNT = 117
 
 
-def _existing_symbol() -> str:
-    syms = symbol_whitelist.get_all_symbols()
-    return "EURUSD" if "EURUSD" in syms else syms[0]
-
-
-# ---------- New FTMOWhitelistService (Phase 4.A.1) ----------
+# ---------- FTMOWhitelistService ----------
 
 
 def test_load_real_ftmo_whitelist(real_ftmo_whitelist_path: Path) -> None:
@@ -66,48 +61,38 @@ def test_ftmo_whitelist_missing_file_raises(tmp_path: Path) -> None:
         FTMOWhitelistService(tmp_path / "does_not_exist.json")
 
 
-def test_ftmo_whitelist_asset_class_of() -> None:
-    svc = symbol_whitelist._service  # type: ignore[attr-defined]
-    assert svc is not None
-    # EURUSD is forex.
+def test_ftmo_whitelist_asset_class_of(real_ftmo_whitelist_path: Path) -> None:
+    svc = FTMOWhitelistService(real_ftmo_whitelist_path)
     assert svc.asset_class_of("EURUSD") == "forex"
-    # XAUUSD is metals.
     assert svc.asset_class_of("XAUUSD") == "metals"
-    # Unknown returns None.
     assert svc.asset_class_of("NOTREAL") is None
 
 
-def test_ftmo_whitelist_moved_methods_raise() -> None:
-    """Step 4.A.1 stub: methods moved to MappingService raise to flag the
-    migration debt for step 4.A.5 reviewers."""
-    svc = symbol_whitelist._service  # type: ignore[attr-defined]
-    assert svc is not None
-    with pytest.raises(NotImplementedError, match="MappingService"):
-        svc.map_to_exness("EURUSD")
-    with pytest.raises(NotImplementedError, match="MappingService"):
-        svc.volume_conversion_ratio("EURUSD")
-
-
-# ---------- Legacy shim (delegates to FTMOWhitelistService) ----------
-
-
-def test_shim_get_all_symbols_returns_sorted() -> None:
-    names = symbol_whitelist.get_all_symbols()
-    assert names == sorted(names)
-    assert len(names) == EXPECTED_SYMBOL_COUNT
-
-
-def test_shim_get_symbol_mapping_returns_ftmo_symbol() -> None:
-    target = _existing_symbol()
-    entry = symbol_whitelist.get_symbol_mapping(target)
+def test_ftmo_whitelist_get_returns_typed_entry(
+    real_ftmo_whitelist_path: Path,
+) -> None:
+    svc = FTMOWhitelistService(real_ftmo_whitelist_path)
+    entry = svc.get("EURUSD")
     assert entry is not None
     assert isinstance(entry, FTMOSymbol)
-    assert entry.name == target
+    assert entry.name == "EURUSD"
     assert len(entry.quote_ccy) == 3
 
 
-def test_shim_get_symbol_mapping_returns_none_for_unknown() -> None:
-    assert symbol_whitelist.get_symbol_mapping("NOTREAL") is None
+def test_ftmo_whitelist_get_returns_none_for_unknown(
+    real_ftmo_whitelist_path: Path,
+) -> None:
+    svc = FTMOWhitelistService(real_ftmo_whitelist_path)
+    assert svc.get("NOTREAL") is None
+
+
+def test_ftmo_whitelist_all_symbols_sorted(
+    real_ftmo_whitelist_path: Path,
+) -> None:
+    svc = FTMOWhitelistService(real_ftmo_whitelist_path)
+    names = svc.all_symbols()
+    assert names == sorted(names)
+    assert len(names) == EXPECTED_SYMBOL_COUNT
 
 
 # ---------- Legacy loader (archived file regression) ----------

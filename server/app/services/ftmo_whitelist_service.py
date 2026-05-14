@@ -131,18 +131,3 @@ class FTMOWhitelistService:
     @property
     def count(self) -> int:
         return len(self._entries)
-
-    # ----- Stubs for methods moved to MappingService (step 4.A.5) -----
-
-    def map_to_exness(self, ftmo_symbol: str) -> str:
-        raise NotImplementedError(
-            "map_to_exness moved to MappingService at step 4.A.5 "
-            "(per-Exness-account mapping; cannot be resolved without "
-            "an account context)"
-        )
-
-    def volume_conversion_ratio(self, ftmo_symbol: str) -> float:
-        raise NotImplementedError(
-            "volume_conversion_ratio moved to MappingService at step 4.A.5 "
-            "(depends on per-account exness_contract_size)"
-        )

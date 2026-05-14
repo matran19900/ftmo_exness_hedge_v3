@@ -40,9 +40,12 @@ import json
 import logging
 import time
 import uuid
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from app.services.redis_service import RedisService
+
+if TYPE_CHECKING:
+    from app.services.mapping_service import MappingService
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,7 @@ class OrderService:
         sl: float,
         tp: float,
         entry_price: float,
+        mapping_service: MappingService | None = None,
     ) -> tuple[str, str]:
         """Validate + create order row + push FTMO leg command.
 
@@ -173,6 +177,23 @@ class OrderService:
                 http_status=404,
                 error_code="symbol_not_synced",
             )
+
+        # 5b. Phase 4.A.5 pre-flight (D-4.A.0-5): if a MappingService is
+        #     wired in (route handlers do, internal seeders/tests do not),
+        #     verify that the FTMO symbol can be hedged on this pair's
+        #     Exness account. Phase-3-compat: when the wizard hasn't been
+        #     run for the Exness account, the check passes silently — see
+        #     ``MappingService.is_pair_symbol_tradeable``.
+        if mapping_service is not None:
+            tradeable, reason = await mapping_service.is_pair_symbol_tradeable(
+                pair_id, symbol
+            )
+            if not tradeable:
+                raise OrderValidationError(
+                    f"symbol {symbol} not tradeable for pair {pair_id}: {reason}",
+                    http_status=400,
+                    error_code="symbol_not_tradeable_for_pair",
+                )
 
         # 6. Volume bounds. cTrader wire volume = lots * lot_size.
         lot_size = int(symbol_config["lot_size"])

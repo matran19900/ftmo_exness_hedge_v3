@@ -25,6 +25,8 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.dependencies.auth import get_current_user_rest
+from app.dependencies.mapping_service import get_mapping_service
+from app.services.mapping_service import MappingService
 from app.services.order_service import OrderService, OrderValidationError
 from app.services.redis_service import RedisService, get_redis_service
 
@@ -85,6 +87,7 @@ async def create_order(
     req: OrderCreateRequest,
     _user: Annotated[str, Depends(get_current_user_rest)],
     redis_svc: Annotated[RedisService, Depends(get_redis_service)],
+    mapping_service: Annotated[MappingService, Depends(get_mapping_service)],
 ) -> OrderCreateResponse:
     """Create a hedge order.
 
@@ -93,7 +96,8 @@ async def create_order(
 
     Error mapping (see ``OrderValidationError``):
       - 400: bad input (volume out of range, invalid SL/TP direction,
-        pair/account disabled, symbol not whitelisted).
+        pair/account disabled, symbol not whitelisted, symbol not
+        tradeable for pair Phase 4.A.5).
       - 404: missing referenced resource (pair, FTMO account,
         symbol_config).
       - 409: server-state conflict (FTMO client offline, no recent
@@ -110,6 +114,7 @@ async def create_order(
             sl=req.sl,
             tp=req.tp,
             entry_price=req.entry_price,
+            mapping_service=mapping_service,
         )
     except OrderValidationError as exc:
         raise HTTPException(

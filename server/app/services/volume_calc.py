@@ -4,10 +4,11 @@ R6 sizes the primary leg from a USD risk amount. R7/R15 derives the secondary
 leg from the primary using the FTMO/Exness contract-size ratio and a user
 ``ratio`` multiplier.
 
-Phase 2 limitation: the secondary leg is clamped using the FTMO-side
-constraints from ``symbol_config`` because Exness broker-side constraints
-aren't available until the Exness client lands in Phase 4. The TODO comment
-in :func:`calculate_volume` flags the swap-in point.
+Phase 4.A.5 (D-4.A.0-4): ``calculate_volume`` now consumes the split type
+parameters ``ftmo_symbol`` (FTMOSymbol) + ``exness_mapping`` (MappingEntry)
+instead of the legacy ``SymbolMapping``. The caller is responsible for
+resolving these via ``MappingService.get_pair_mapping`` so the calculator
+itself stays pure-function.
 """
 
 from __future__ import annotations
@@ -16,7 +17,8 @@ import logging
 import math
 from typing import Any
 
-from hedger_shared.symbol_mapping import SymbolMapping
+from app.services.ftmo_whitelist_service import FTMOSymbol
+from app.services.mapping_cache_schemas import MappingEntry
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,8 @@ def calculate_volume(
     entry: float,
     sl: float,
     symbol_config: dict[str, str],
-    whitelist_row: SymbolMapping,
+    ftmo_symbol: FTMOSymbol,
+    exness_mapping: MappingEntry,
     ratio: float = 1.0,
     quote_to_usd_rate: float,
     min_sl_pips: float = MIN_SL_PIPS_DEFAULT,
@@ -52,9 +55,9 @@ def calculate_volume(
     if ratio <= 0:
         raise ValueError(f"ratio must be positive, got {ratio}")
 
-    pip_size = float(whitelist_row.ftmo_pip_size)
-    ftmo_contract_size = float(whitelist_row.ftmo_units_per_lot)
-    exness_contract_size = float(whitelist_row.exness_trade_contract_size)
+    pip_size = float(ftmo_symbol.ftmo_pip_size)
+    ftmo_contract_size = float(ftmo_symbol.ftmo_units_per_lot)
+    exness_contract_size = float(exness_mapping.contract_size)
 
     # R6 — sl_pips and the per-lot pip value.
     sl_pips = abs(entry - sl) / pip_size

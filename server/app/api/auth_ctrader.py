@@ -132,7 +132,10 @@ async def ctrader_callback(
 
     try:
         await md.authenticate(access_token, account_id)
-        cached = await md.sync_symbols(redis_svc)
+        # Phase 4.A.5: sync_symbols now takes the whitelist names explicitly
+        # (was a module-level shim lookup, deleted in step 4.A.5).
+        whitelist = app.state.ftmo_whitelist
+        cached = await md.sync_symbols(redis_svc, whitelist.all_symbols())
         logger.info("OAuth callback completed: cached %d symbols", cached)
     except Exception:
         logger.exception("MarketDataService authenticate/sync failed after OAuth callback")

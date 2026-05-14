@@ -1038,3 +1038,67 @@ async def test_create_order_default_digits_5_when_symbol_config_missing(
     row = await redis_client.hgetall(f"order:{order_id}")  # type: ignore[misc]
     # Rounded to 5 digits → 0.3 (Python str() drops trailing zeros).
     assert row["sl_price"] == "0.3"
+
+
+# ---------- Phase 4.A.5 pre-flight ----------
+
+
+@pytest.mark.asyncio
+async def test_create_order_with_mapping_service_phase3_compat(
+    redis_client: fakeredis.aioredis.FakeRedis,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Pre-flight is wired but the wizard hasn't run for the Exness account
+    → mapping_status != active → check passes silently (Phase 3 compat,
+    D-4.A.5-2). Order goes through.
+
+    Note: the pre-flight queries through MappingService which is wired to
+    the autouse ``fake_redis`` (the same instance the lifespan/test app
+    state shares). The OrderService is wired to ``redis_client`` (its own
+    instance for stream/HASH writes). Both must be seeded with the pair so
+    the OrderService validation pipeline AND the pre-flight see it."""
+    from app.main import app
+
+    svc = OrderService(RedisService(fake_redis))
+    await _seed_happy(fake_redis)
+    order_id, _ = await svc.create_order(
+        pair_id="pair_001",
+        symbol="EURUSD",
+        side="buy",
+        order_type="market",
+        volume_lots=0.01,
+        sl=1.08200,
+        tp=0,
+        entry_price=0,
+        mapping_service=app.state.mapping_service,
+    )
+    assert order_id
+
+
+@pytest.mark.asyncio
+async def test_create_order_pre_flight_blocks_when_active_no_mapping(
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """When the wizard HAS been run (mapping_status=active) but the FTMO
+    symbol is NOT in the mapping cache, pre-flight raises with the new
+    ``symbol_not_tradeable_for_pair`` error_code."""
+    from app.main import app
+    from app.services.order_service import OrderValidationError
+
+    svc = OrderService(RedisService(fake_redis))
+    await _seed_happy(fake_redis)
+    # Force the "active but symbol not mapped" branch.
+    await fake_redis.set("mapping_status:exness_001", "active")
+    with pytest.raises(OrderValidationError) as exc_info:
+        await svc.create_order(
+            pair_id="pair_001",
+            symbol="EURUSD",
+            side="buy",
+            order_type="market",
+            volume_lots=0.01,
+            sl=1.08200,
+            tp=0,
+            entry_price=0,
+            mapping_service=app.state.mapping_service,
+        )
+    assert exc_info.value.error_code == "symbol_not_tradeable_for_pair"

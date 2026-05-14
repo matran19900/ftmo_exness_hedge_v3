@@ -17,6 +17,8 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from app.dependencies.auth import get_current_user_rest
+from app.dependencies.mapping_service import get_mapping_service
+from app.services.mapping_service import MappingService
 from app.services.redis_service import RedisService, get_redis_service
 
 router = APIRouter(prefix="/api/pairs", tags=["pairs"])
@@ -167,3 +169,38 @@ async def delete_pair(
     if not success:
         raise HTTPException(status_code=404, detail="Pair not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.A.5 — pre-flight check for HedgeOrderForm submission
+# ---------------------------------------------------------------------------
+
+
+class CheckSymbolResponse(BaseModel):
+    """Result of ``GET /api/pairs/{pair_id}/check-symbol/{symbol}``."""
+
+    tradeable: bool
+    reason: str | None = None
+
+
+@router.get(
+    "/{pair_id}/check-symbol/{symbol}",
+    response_model=CheckSymbolResponse,
+    summary="Pre-flight tradeability check for a (pair, FTMO symbol) combo",
+)
+async def check_pair_symbol(
+    pair_id: str,
+    symbol: str,
+    _user: Annotated[str, Depends(get_current_user_rest)],
+    mapping_service: Annotated[MappingService, Depends(get_mapping_service)],
+) -> CheckSymbolResponse:
+    """Return whether ``symbol`` can be hedged on ``pair_id``.
+
+    Phase 3 single-leg pairs (no ``exness_account_id``) get an FTMO-only
+    check. Phase 4 hedge pairs additionally require an active mapping
+    cache entry — see ``MappingService.is_pair_symbol_tradeable`` for
+    the full rule set."""
+    tradeable, reason = await mapping_service.is_pair_symbol_tradeable(
+        pair_id, symbol
+    )
+    return CheckSymbolResponse(tradeable=tradeable, reason=reason)

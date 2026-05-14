@@ -260,7 +260,7 @@ async def test_sync_symbols_batches_detail_request(
     md._account_id = 42
     md._send_and_wait = AsyncMock(side_effect=[list_resp, detail_resp])  # type: ignore[method-assign]
 
-    cached = await md.sync_symbols(svc)
+    cached = await md.sync_symbols(svc, ["EURUSD", "GBPUSD", "USDJPY"])
 
     assert cached == 3
     assert md._send_and_wait.await_count == 2
@@ -319,7 +319,7 @@ async def test_sync_symbols_skips_symbols_missing_from_batch_response(
     md._account_id = 42
     md._send_and_wait = AsyncMock(side_effect=[list_resp, detail_resp])  # type: ignore[method-assign]
 
-    cached = await md.sync_symbols(svc)
+    cached = await md.sync_symbols(svc, ["EURUSD", "GBPUSD", "USDJPY"])
 
     assert cached == 1
     assert await svc.get_active_symbols() == ["EURUSD"]
@@ -345,7 +345,7 @@ async def test_sync_symbols_returns_zero_when_batch_fails(
     md._account_id = 42
     md._send_and_wait = AsyncMock(side_effect=[list_resp, RuntimeError("timeout")])  # type: ignore[method-assign]
 
-    cached = await md.sync_symbols(svc)
+    cached = await md.sync_symbols(svc, ["EURUSD", "GBPUSD", "USDJPY"])
 
     assert cached == 0
     assert await svc.get_active_symbols() == []

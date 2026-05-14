@@ -27,7 +27,6 @@ from app.api.symbols import router as symbols_router
 from app.api.ws import router as ws_router
 from app.config import get_settings
 from app.redis_client import close_redis, get_redis, init_redis
-from app.services import symbol_whitelist
 from app.services.account_status import account_status_loop
 from app.services.auto_match_engine import AutoMatchEngine
 from app.services.broadcast import BroadcastService
@@ -35,6 +34,7 @@ from app.services.event_handler import event_handler_loop
 from app.services.ftmo_whitelist_service import FTMOWhitelistService
 from app.services.mapping_cache_repository import MappingCacheRepository
 from app.services.mapping_cache_service import MappingCacheService
+from app.services.mapping_service import MappingService
 from app.services.market_data import MarketDataService
 from app.services.position_tracker import position_tracker_loop
 from app.services.redis_service import RedisService
@@ -90,18 +90,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         n_ftmo,
         n_exness,
     )
-    symbol_whitelist.load_whitelist(settings.symbol_mapping_path)
-    # Phase 4.A.4 needs a typed reference to the FTMOWhitelistService for
-    # MappingCacheService. The legacy module-level shim
-    # (``app.services.symbol_whitelist``) keeps Phase 1-3 callers working;
-    # the explicit ``app.state.ftmo_whitelist`` pointer is the new path
-    # that step 4.A.5 will eventually be the only consumer of.
+    # Phase 4.A.5: the legacy ``app.services.symbol_whitelist`` shim is
+    # gone. ``ftmo_whitelist_service`` is the single source of truth for
+    # FTMO whitelist lookups and gets stashed on ``app.state`` so the
+    # mapping orchestrators can pick it up.
     ftmo_whitelist_service = FTMOWhitelistService(settings.symbol_mapping_path)
     app.state.ftmo_whitelist = ftmo_whitelist_service
     logger.info(
         "Server ready (redis=%s, symbols=%d)",
         _mask_redis_url(settings.redis_url),
-        len(symbol_whitelist.get_all_symbols()),
+        ftmo_whitelist_service.count,
     )
 
     # Phase 4.A.2: per-Exness-account mapping cache files. The repository
@@ -158,6 +156,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.mapping_cache_service = mapping_cache_service
 
+    # Phase 4.A.5: MappingService is the read-only per-pair facade used by
+    # OrderService pre-flight, volume_calc, and the /check-symbol endpoint.
+    # No I/O of its own at construction — it just stashes references.
+    mapping_service = MappingService(
+        ftmo_whitelist=ftmo_whitelist_service,
+        cache_service=mapping_cache_service,
+        redis=get_redis(),
+    )
+    logger.info("mapping_service.initialized")
+    app.state.mapping_service = mapping_service
+
     creds = await redis_svc.get_ctrader_market_data_creds()
     if creds and settings.ctrader_client_id and settings.ctrader_client_secret:
         md = MarketDataService(
@@ -171,7 +180,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await md.start()
             if creds["expires_at"] > int(time.time()):
                 await md.authenticate(creds["access_token"], creds["account_id"])
-                cached = await md.sync_symbols(redis_svc)
+                cached = await md.sync_symbols(
+                    redis_svc, ftmo_whitelist_service.all_symbols()
+                )
                 logger.info("MarketDataService ready, authenticated, %d symbols cached", cached)
             else:
                 logger.warning(

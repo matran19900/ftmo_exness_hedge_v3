@@ -1,4 +1,23 @@
-"""Strict loader and Pydantic models for the FTMO/Exness symbol mapping JSON file."""
+"""LEGACY MODULE — replaced by per-Exness-account mapping cache architecture.
+
+Phase 4.A migration is complete as of step 4.A.5. The Phase 1-3 single-file
+``symbol_mapping_ftmo_exness.json`` shape modeled here was split into:
+
+  - ``server/data/ftmo_whitelist.json`` (FTMO half), loaded by
+    ``app.services.ftmo_whitelist_service.FTMOWhitelistService``.
+  - ``server/data/symbol_mapping_cache/{account}_{signature}.json``
+    (per-Exness-account half), managed by
+    ``app.services.mapping_cache_service.MappingCacheService``.
+
+Per-pair lookups now go through
+``app.services.mapping_service.MappingService``.
+
+Kept on disk for the archive-file regression test
+(``server/tests/test_symbol_whitelist.py::test_load_legacy_mapping_file``)
+and any external scripts that still reference ``SymbolMapping``. Do NOT
+import in new code. Phase 5 cleanup will delete this module after the
+``phase-4-complete`` tag.
+"""
 
 from __future__ import annotations
 

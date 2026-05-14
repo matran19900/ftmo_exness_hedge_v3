@@ -13,38 +13,61 @@ from unittest.mock import AsyncMock
 import fakeredis.aioredis
 import pytest
 from app.services.conversion_rate import get_quote_to_usd_rate
+from app.services.ftmo_whitelist_service import FTMOSymbol
+from app.services.mapping_cache_schemas import MappingEntry
 from app.services.redis_service import RedisService
 from app.services.volume_calc import calculate_volume
-from hedger_shared.symbol_mapping import SymbolMapping
 
 
-def _eurusd_mapping() -> SymbolMapping:
-    return SymbolMapping(
-        ftmo="EURUSD",
-        exness="EURUSDm",
-        match_type="exact",
-        ftmo_units_per_lot=100000,
-        exness_trade_contract_size=100000,
-        ftmo_pip_size=0.0001,
-        exness_pip_size=0.0001,
-        ftmo_pip_value=10.0,
-        exness_pip_value=10.0,
+def _eurusd_ftmo() -> FTMOSymbol:
+    return FTMOSymbol(
+        name="EURUSD",
+        asset_class="forex",
         quote_ccy="USD",
+        ftmo_units_per_lot=100000.0,
+        ftmo_pip_size=0.0001,
+        ftmo_pip_value=10.0,
     )
 
 
-def _usdjpy_mapping() -> SymbolMapping:
-    return SymbolMapping(
+def _eurusd_exness(contract_size: float = 100000.0) -> MappingEntry:
+    return MappingEntry(
+        ftmo="EURUSD",
+        exness="EURUSDm",
+        match_type="exact",
+        contract_size=contract_size,
+        pip_size=0.0001,
+        pip_value=10.0,
+        quote_ccy="USD",
+        exness_volume_step=0.01,
+        exness_volume_min=0.01,
+        exness_volume_max=200.0,
+    )
+
+
+def _usdjpy_ftmo() -> FTMOSymbol:
+    return FTMOSymbol(
+        name="USDJPY",
+        asset_class="forex",
+        quote_ccy="JPY",
+        ftmo_units_per_lot=100000.0,
+        ftmo_pip_size=0.01,
+        ftmo_pip_value=1000.0,
+    )
+
+
+def _usdjpy_exness() -> MappingEntry:
+    return MappingEntry(
         ftmo="USDJPY",
         exness="USDJPYm",
         match_type="exact",
-        ftmo_units_per_lot=100000,
-        exness_trade_contract_size=100000,
-        ftmo_pip_size=0.01,
-        exness_pip_size=0.01,
-        ftmo_pip_value=1000.0,
-        exness_pip_value=1000.0,
+        contract_size=100000.0,
+        pip_size=0.01,
+        pip_value=1000.0,
         quote_ccy="JPY",
+        exness_volume_step=0.01,
+        exness_volume_min=0.01,
+        exness_volume_max=200.0,
     )
 
 
@@ -159,7 +182,8 @@ def test_calc_eurusd_basic() -> None:
         entry=1.0850,
         sl=1.0800,
         symbol_config=_fx_symbol_config(),
-        whitelist_row=_eurusd_mapping(),
+        ftmo_symbol=_eurusd_ftmo(),
+        exness_mapping=_eurusd_exness(),
         ratio=1.0,
         quote_to_usd_rate=1.0,
     )
@@ -177,7 +201,8 @@ def test_calc_usdjpy_quote_jpy() -> None:
         entry=156.50,
         sl=156.00,
         symbol_config=_fx_symbol_config(),
-        whitelist_row=_usdjpy_mapping(),
+        ftmo_symbol=_usdjpy_ftmo(),
+        exness_mapping=_usdjpy_exness(),
         ratio=1.0,
         quote_to_usd_rate=1.0 / 156.0,
     )
@@ -198,7 +223,8 @@ def test_calc_sl_too_tight_raises() -> None:
             entry=1.0850,
             sl=1.0848,  # 2 pips
             symbol_config=_fx_symbol_config(),
-            whitelist_row=_eurusd_mapping(),
+            ftmo_symbol=_eurusd_ftmo(),
+        exness_mapping=_eurusd_exness(),
             ratio=1.0,
             quote_to_usd_rate=1.0,
         )
@@ -211,7 +237,8 @@ def test_calc_negative_risk_raises() -> None:
             entry=1.0850,
             sl=1.0800,
             symbol_config=_fx_symbol_config(),
-            whitelist_row=_eurusd_mapping(),
+            ftmo_symbol=_eurusd_ftmo(),
+        exness_mapping=_eurusd_exness(),
             ratio=1.0,
             quote_to_usd_rate=1.0,
         )
@@ -224,7 +251,8 @@ def test_calc_zero_rate_raises() -> None:
             entry=1.0850,
             sl=1.0800,
             symbol_config=_fx_symbol_config(),
-            whitelist_row=_eurusd_mapping(),
+            ftmo_symbol=_eurusd_ftmo(),
+        exness_mapping=_eurusd_exness(),
             ratio=1.0,
             quote_to_usd_rate=0.0,
         )
@@ -237,7 +265,8 @@ def test_calc_entry_equals_sl_raises() -> None:
             entry=1.0850,
             sl=1.0850,
             symbol_config=_fx_symbol_config(),
-            whitelist_row=_eurusd_mapping(),
+            ftmo_symbol=_eurusd_ftmo(),
+        exness_mapping=_eurusd_exness(),
             ratio=1.0,
             quote_to_usd_rate=1.0,
         )
@@ -250,7 +279,8 @@ def test_calc_clamp_to_min() -> None:
         entry=1.0850,
         sl=1.0800,
         symbol_config=_fx_symbol_config(),
-        whitelist_row=_eurusd_mapping(),
+        ftmo_symbol=_eurusd_ftmo(),
+        exness_mapping=_eurusd_exness(),
         ratio=1.0,
         quote_to_usd_rate=1.0,
     )
@@ -266,7 +296,8 @@ def test_calc_step_rounds_down() -> None:
         entry=1.0850,
         sl=1.0800,
         symbol_config=_fx_symbol_config(),
-        whitelist_row=_eurusd_mapping(),
+        ftmo_symbol=_eurusd_ftmo(),
+        exness_mapping=_eurusd_exness(),
         ratio=1.0,
         quote_to_usd_rate=1.0,
     )
@@ -276,7 +307,8 @@ def test_calc_step_rounds_down() -> None:
         entry=1.0850,
         sl=1.0800,
         symbol_config=_fx_symbol_config(),
-        whitelist_row=_eurusd_mapping(),
+        ftmo_symbol=_eurusd_ftmo(),
+        exness_mapping=_eurusd_exness(),
         ratio=1.0,
         quote_to_usd_rate=1.0,
     )
@@ -290,7 +322,8 @@ def test_calc_secondary_ratio_applied() -> None:
         entry=1.0850,
         sl=1.0800,
         symbol_config=_fx_symbol_config(),
-        whitelist_row=_eurusd_mapping(),
+        ftmo_symbol=_eurusd_ftmo(),
+        exness_mapping=_eurusd_exness(),
         ratio=2.0,
         quote_to_usd_rate=1.0,
     )
@@ -299,17 +332,25 @@ def test_calc_secondary_ratio_applied() -> None:
 
 def test_calc_different_contract_sizes_secondary_scales() -> None:
     """If FTMO/Exness contract sizes differ, secondary scales by their ratio."""
-    mapping = SymbolMapping(
+    ftmo_xauusd = FTMOSymbol(
+        name="XAUUSD",
+        asset_class="metals",
+        quote_ccy="USD",
+        ftmo_units_per_lot=100.0,
+        ftmo_pip_size=0.01,
+        ftmo_pip_value=1.0,
+    )
+    exness_xauusd = MappingEntry(
         ftmo="XAUUSD",
         exness="XAUUSDm",
         match_type="exact",
-        ftmo_units_per_lot=100,
-        exness_trade_contract_size=10,  # 10x smaller per lot
-        ftmo_pip_size=0.01,
-        exness_pip_size=0.01,
-        ftmo_pip_value=1.0,
-        exness_pip_value=0.1,
+        contract_size=10.0,  # 10x smaller per lot
+        pip_size=0.01,
+        pip_value=0.1,
         quote_ccy="USD",
+        exness_volume_step=0.01,
+        exness_volume_min=0.01,
+        exness_volume_max=200.0,
     )
     out = calculate_volume(
         risk_amount=100.0,
@@ -317,7 +358,8 @@ def test_calc_different_contract_sizes_secondary_scales() -> None:
         sl=3380.0,  # 20 pips at pip_size=0.01 means 20*0.01=0.20 — but wait:
         # diff/pip_size = 20/0.01 = 2000 pips. Tight risk = 100/(2000*0.01*100*1.0) = 0.05 lot.
         symbol_config=_fx_symbol_config(),
-        whitelist_row=mapping,
+        ftmo_symbol=ftmo_xauusd,
+        exness_mapping=exness_xauusd,
         ratio=1.0,
         quote_to_usd_rate=1.0,
     )
@@ -334,7 +376,8 @@ def test_calc_sl_inverted_works() -> None:
         entry=1.0800,
         sl=1.0850,  # inverted (sell side)
         symbol_config=_fx_symbol_config(),
-        whitelist_row=_eurusd_mapping(),
+        ftmo_symbol=_eurusd_ftmo(),
+        exness_mapping=_eurusd_exness(),
         ratio=1.0,
         quote_to_usd_rate=1.0,
     )
@@ -349,7 +392,8 @@ def test_calc_returns_raw_volumes_for_debug() -> None:
         entry=1.0850,
         sl=1.0800,
         symbol_config=_fx_symbol_config(),
-        whitelist_row=_eurusd_mapping(),
+        ftmo_symbol=_eurusd_ftmo(),
+        exness_mapping=_eurusd_exness(),
         ratio=1.0,
         quote_to_usd_rate=1.0,
     )

@@ -76,7 +76,7 @@ def md_authed_with_subscribe_spy() -> Iterator[AsyncMock]:
 async def test_endpoint_requires_auth(client: AsyncClient) -> None:
     resp = await client.post(
         "/api/symbols/EURUSD/calculate-volume",
-        json={"entry": 1.085, "sl": 1.080, "risk_amount": 100.0, "ratio": 1.0},
+        json={"pair_id": "pair_001", "entry": 1.085, "sl": 1.080, "risk_amount": 100.0, "ratio": 1.0},
     )
     assert resp.status_code == 401
 
@@ -85,7 +85,7 @@ async def test_endpoint_requires_auth(client: AsyncClient) -> None:
 async def test_endpoint_unknown_symbol(authed_client: AsyncClient) -> None:
     resp = await authed_client.post(
         "/api/symbols/NOTREAL/calculate-volume",
-        json={"entry": 1.085, "sl": 1.080, "risk_amount": 100.0, "ratio": 1.0},
+        json={"pair_id": "pair_001", "entry": 1.085, "sl": 1.080, "risk_amount": 100.0, "ratio": 1.0},
     )
     assert resp.status_code == 404
     assert resp.json()["detail"] == "Symbol not in whitelist"
@@ -96,7 +96,7 @@ async def test_endpoint_symbol_not_in_active_set(authed_client: AsyncClient) -> 
     """Whitelist OK but no symbol_config in Redis → 404 'Symbol not in active set'."""
     resp = await authed_client.post(
         "/api/symbols/EURUSD/calculate-volume",
-        json={"entry": 1.085, "sl": 1.080, "risk_amount": 100.0, "ratio": 1.0},
+        json={"pair_id": "pair_001", "entry": 1.085, "sl": 1.080, "risk_amount": 100.0, "ratio": 1.0},
     )
     assert resp.status_code == 404
     assert resp.json()["detail"] == "Symbol not in active set"
@@ -109,7 +109,7 @@ async def test_endpoint_invalid_request_returns_422(
     """Pydantic catches negative entry/sl/risk_amount before the route runs."""
     resp = await authed_client.post(
         "/api/symbols/EURUSD/calculate-volume",
-        json={"entry": -1, "sl": 1.080, "risk_amount": 100.0, "ratio": 1.0},
+        json={"pair_id": "pair_001", "entry": -1, "sl": 1.080, "risk_amount": 100.0, "ratio": 1.0},
     )
     assert resp.status_code == 422
 
@@ -120,7 +120,7 @@ async def test_endpoint_sl_too_tight_returns_400(
 ) -> None:
     resp = await authed_client.post(
         "/api/symbols/EURUSD/calculate-volume",
-        json={"entry": 1.0850, "sl": 1.0849, "risk_amount": 100.0, "ratio": 1.0},
+        json={"pair_id": "pair_001", "entry": 1.0850, "sl": 1.0849, "risk_amount": 100.0, "ratio": 1.0},
     )
     assert resp.status_code == 400
     assert "SL too tight" in resp.json()["detail"]
@@ -136,7 +136,7 @@ async def test_endpoint_eurusd_happy_path(
     """EURUSD has quote_ccy=USD → rate=1.0, no tick lookup needed."""
     resp = await authed_client.post(
         "/api/symbols/EURUSD/calculate-volume",
-        json={"entry": 1.0850, "sl": 1.0800, "risk_amount": 100.0, "ratio": 1.0},
+        json={"pair_id": "pair_001", "entry": 1.0850, "sl": 1.0800, "risk_amount": 100.0, "ratio": 1.0},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -154,7 +154,7 @@ async def test_endpoint_usdjpy_uses_inverse_rate(
     """USDJPY quote_ccy=JPY → rate from USDJPY tick inverse."""
     resp = await authed_client.post(
         "/api/symbols/USDJPY/calculate-volume",
-        json={"entry": 156.50, "sl": 156.00, "risk_amount": 100.0, "ratio": 1.0},
+        json={"pair_id": "pair_001", "entry": 156.50, "sl": 156.00, "risk_amount": 100.0, "ratio": 1.0},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -177,7 +177,7 @@ async def test_endpoint_rate_unavailable_returns_503(
 
     resp = await authed_client.post(
         "/api/symbols/USDJPY/calculate-volume",
-        json={"entry": 156.50, "sl": 156.00, "risk_amount": 100.0, "ratio": 1.0},
+        json={"pair_id": "pair_001", "entry": 156.50, "sl": 156.00, "risk_amount": 100.0, "ratio": 1.0},
     )
     assert resp.status_code == 503
     assert "JPY" in resp.json()["detail"] and "USD" in resp.json()["detail"]
@@ -190,7 +190,7 @@ async def test_endpoint_returns_full_metadata(
 ) -> None:
     resp = await authed_client.post(
         "/api/symbols/EURUSD/calculate-volume",
-        json={"entry": 1.0850, "sl": 1.0800, "risk_amount": 100.0, "ratio": 1.0},
+        json={"pair_id": "pair_001", "entry": 1.0850, "sl": 1.0800, "risk_amount": 100.0, "ratio": 1.0},
     )
     assert resp.status_code == 200
     body = resp.json()

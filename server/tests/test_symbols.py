@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from app.services import symbol_whitelist
+from app.main import app
 from httpx import AsyncClient
 
 EXPECTED_SYMBOL_COUNT = 117
@@ -11,7 +11,7 @@ EXPECTED_SYMBOL_COUNT = 117
 
 def _existing_symbol() -> str:
     """Return EURUSD if present, else the first symbol from the sorted whitelist."""
-    all_syms = symbol_whitelist.get_all_symbols()
+    all_syms = app.state.ftmo_whitelist.all_symbols()
     return "EURUSD" if "EURUSD" in all_syms else all_syms[0]
 
 

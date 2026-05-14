@@ -32,10 +32,6 @@ from twisted.internet import reactor as _reactor
 
 from app.services.broadcast import BroadcastService
 from app.services.redis_service import RedisService
-from app.services.symbol_whitelist import (  # noqa: F401  — get_symbol_mapping retained as legacy import path for downstream callers being migrated in step 4.A.5
-    get_all_symbols,
-    get_symbol_mapping,
-)
 
 # Twisted's installed `reactor` is a runtime singleton typed as the bare base
 # module by its partial stubs. Alias as Any so attribute access (running / run /
@@ -173,14 +169,20 @@ class MarketDataService:
         self._authenticated.set()
         logger.info("MarketDataService authenticated for account_id=%s", account_id)
 
-    async def sync_symbols(self, redis_svc: RedisService) -> int:
-        """Fetch broker symbols, intersect with whitelist, cache to Redis.
+    async def sync_symbols(
+        self, redis_svc: RedisService, whitelist_names: list[str]
+    ) -> int:
+        """Fetch broker symbols, intersect with ``whitelist_names``, cache to Redis.
 
         Returns the number of symbols cached.
 
+        Phase 4.A.5: ``whitelist_names`` is now an explicit parameter (was a
+        module-level lookup via the deleted ``symbol_whitelist`` shim). The
+        caller threads it from ``FTMOWhitelistService.all_symbols()``.
+
         Steps:
             1. ``ProtoOASymbolsListReq``                     → light symbols.
-            2. Match (case-insensitive) against the whitelist.
+            2. Match (case-insensitive) against ``whitelist_names``.
             3. ONE batched ``ProtoOASymbolByIdReq`` carrying every matched id
                → digits / pip / volume metadata for all symbols (step 2.7b).
             4. ``HSET symbol_config:{FTMO_NAME}`` per match.
@@ -200,8 +202,6 @@ class MarketDataService:
             name = (light.symbolName or "").upper()
             if name and light.enabled:
                 broker_index[name] = int(light.symbolId)
-
-        whitelist_names = get_all_symbols()
         matched: list[tuple[str, int]] = []
         for ftmo_name in whitelist_names:
             broker_id = broker_index.get(ftmo_name.upper())

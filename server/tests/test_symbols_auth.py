@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import pytest
-from app.services import symbol_whitelist
+from app.main import app
 from httpx import AsyncClient
 
 
 def _existing_symbol() -> str:
-    syms = symbol_whitelist.get_all_symbols()
+    syms = app.state.ftmo_whitelist.all_symbols()
     return "EURUSD" if "EURUSD" in syms else syms[0]
 
 
