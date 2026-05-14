@@ -44,4 +44,5 @@ async def test_get_symbol_valid_token(authed_client: AsyncClient) -> None:
     target = _existing_symbol()
     resp = await authed_client.get(f"/api/symbols/{target}")
     assert resp.status_code == 200
-    assert resp.json()["ftmo"] == target
+    # Phase 4.A.1: response now uses FTMOSymbol.name (was SymbolMapping.ftmo).
+    assert resp.json()["name"] == target

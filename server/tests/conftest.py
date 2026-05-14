@@ -23,6 +23,14 @@ os.environ.setdefault(
 # the dev environment — the tests assert "no credentials" behaviour.
 os.environ["CTRADER_CLIENT_ID"] = ""
 os.environ["CTRADER_CLIENT_SECRET"] = ""
+# Phase 4.A.1: pin SYMBOL_MAPPING_PATH to the new FTMO whitelist regardless
+# of any stale value in the dev shell or local .env. Tests load + validate
+# the new file format; an inherited old-format path would fail at lifespan
+# startup.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+os.environ["SYMBOL_MAPPING_PATH"] = str(
+    _REPO_ROOT / "server" / "data" / "ftmo_whitelist.json"
+)
 
 import fakeredis.aioredis  # noqa: E402
 import pytest  # noqa: E402
@@ -33,21 +41,42 @@ from app.services.redis_service import RedisService, get_redis_service  # noqa: 
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-REAL_MAPPING_PATH = REPO_ROOT / "symbol_mapping_ftmo_exness.json"
+# Phase 4.A.1 (D-SM-09): the FTMO whitelist now lives in a dedicated file
+# under server/data/. The legacy Exness-bundled file is preserved under
+# archive/ for the few tests that still want to exercise the old loader.
+REAL_FTMO_WHITELIST_PATH = REPO_ROOT / "server" / "data" / "ftmo_whitelist.json"
+LEGACY_MAPPING_PATH = REPO_ROOT / "archive" / "symbol_mapping_ftmo_exness_v1.json"
 
 
 @pytest.fixture(scope="session")
-def real_mapping_path() -> Path:
-    """Path to the committed symbol mapping JSON used by integration-style tests."""
-    if not REAL_MAPPING_PATH.is_file():
-        pytest.skip(f"Real symbol mapping not found at {REAL_MAPPING_PATH}")
-    return REAL_MAPPING_PATH
+def real_ftmo_whitelist_path() -> Path:
+    """Path to the new FTMO whitelist JSON (Phase 4.A.1, D-SM-09)."""
+    if not REAL_FTMO_WHITELIST_PATH.is_file():
+        pytest.skip(
+            f"Real FTMO whitelist not found at {REAL_FTMO_WHITELIST_PATH}"
+        )
+    return REAL_FTMO_WHITELIST_PATH
+
+
+@pytest.fixture(scope="session")
+def legacy_mapping_path() -> Path:
+    """Path to the archived Phase 1-3 symbol mapping (legacy loader regressions)."""
+    if not LEGACY_MAPPING_PATH.is_file():
+        pytest.skip(f"Legacy mapping file not found at {LEGACY_MAPPING_PATH}")
+    return LEGACY_MAPPING_PATH
+
+
+# Back-compat alias so any not-yet-migrated test that references the old
+# fixture name keeps working through step 4.A.1. Step 4.A.5 cleans this up.
+@pytest.fixture(scope="session")
+def real_mapping_path(real_ftmo_whitelist_path: Path) -> Path:
+    return real_ftmo_whitelist_path
 
 
 @pytest.fixture(autouse=True)
-def _load_real_whitelist(real_mapping_path: Path) -> None:
+def _load_real_whitelist(real_ftmo_whitelist_path: Path) -> None:
     """Ensure the in-process whitelist cache is loaded before every test."""
-    symbol_whitelist.load_whitelist(str(real_mapping_path))
+    symbol_whitelist.load_whitelist(str(real_ftmo_whitelist_path))
 
 
 @pytest.fixture

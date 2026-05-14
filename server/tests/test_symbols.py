@@ -35,23 +35,31 @@ async def test_list_symbols_count_matches_file(authed_client: AsyncClient) -> No
 
 @pytest.mark.asyncio
 async def test_get_symbol_existing(authed_client: AsyncClient) -> None:
+    """Phase 4.A.1 (D-SM-09): response is now ``FTMOSymbol`` — Exness-side
+    fields are gone; they live on per-account mapping caches now."""
     target = _existing_symbol()
     resp = await authed_client.get(f"/api/symbols/{target}")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["ftmo"] == target
+    assert body["name"] == target
     for field in (
+        "name",
+        "asset_class",
+        "quote_ccy",
+        "ftmo_units_per_lot",
+        "ftmo_pip_size",
+        "ftmo_pip_value",
+    ):
+        assert field in body, f"missing field {field} in {body}"
+    # Exness-side fields are explicitly removed; assert absence.
+    for forbidden in (
         "exness",
         "match_type",
-        "ftmo_units_per_lot",
         "exness_trade_contract_size",
-        "ftmo_pip_size",
         "exness_pip_size",
-        "ftmo_pip_value",
         "exness_pip_value",
-        "quote_ccy",
     ):
-        assert field in body
+        assert forbidden not in body, f"unexpected field {forbidden}"
 
 
 @pytest.mark.asyncio

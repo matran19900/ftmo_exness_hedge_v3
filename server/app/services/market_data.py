@@ -32,7 +32,10 @@ from twisted.internet import reactor as _reactor
 
 from app.services.broadcast import BroadcastService
 from app.services.redis_service import RedisService
-from app.services.symbol_whitelist import get_all_symbols, get_symbol_mapping
+from app.services.symbol_whitelist import (  # noqa: F401  — get_symbol_mapping retained as legacy import path for downstream callers being migrated in step 4.A.5
+    get_all_symbols,
+    get_symbol_mapping,
+)
 
 # Twisted's installed `reactor` is a runtime singleton typed as the bare base
 # module by its partial stubs. Alias as Any so attribute access (running / run /
@@ -255,7 +258,9 @@ class MarketDataService:
                 )
                 continue
             try:
-                mapping = get_symbol_mapping(ftmo_name)
+                # Phase 4.A.1 (D-SM-09): symbol_config no longer carries any
+                # Exness-side field. Exness resolution is per-account through
+                # MappingService — step 4.A.5 wires the lookup.
                 config: dict[str, Any] = {
                     "ftmo_symbol": ftmo_name,
                     "ctrader_symbol_id": broker_id,
@@ -267,8 +272,6 @@ class MarketDataService:
                     "lot_size": int(detail.lotSize),
                     "synced_at": int(time.time() * 1000),
                 }
-                if mapping is not None:
-                    config["exness_symbol"] = mapping.exness
                 await redis_svc.set_symbol_config(ftmo_name, config)
                 await redis_svc.add_active_symbol(ftmo_name)
                 cached += 1

@@ -6,6 +6,13 @@ set. Without a sync (Phase 1 default), it returns the whitelist as-is.
 
 Phase 2.4 adds POST ``/symbols/{ftmo_symbol}/calculate-volume`` — the volume
 preview the order form will use before placing an actual order.
+
+Phase 4.A.1 update: ``GET /api/symbols/{ftmo_symbol}`` now returns the new
+``FTMOSymbol`` shape (ftmo-only fields per D-SM-09). The volume calculator
+still consumes the legacy ``SymbolMapping`` shape; this endpoint constructs
+an adapter from ``FTMOSymbol`` with ``exness_*`` fields populated from the
+FTMO equivalents (1:1 hedge assumption). Step 4.A.5 replaces the adapter
+with a per-pair lookup via ``MappingService``.
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ from pydantic import BaseModel, Field
 from app.dependencies.auth import get_current_user_rest
 from app.services import symbol_whitelist
 from app.services.conversion_rate import get_quote_to_usd_rate
+from app.services.ftmo_whitelist_service import FTMOSymbol
 from app.services.market_data import MarketDataService
 from app.services.redis_service import RedisService, get_redis_service
 from app.services.volume_calc import calculate_volume
@@ -73,11 +81,43 @@ async def list_symbols(
 async def get_symbol(
     ftmo_symbol: str,
     _user: Annotated[str, Depends(get_current_user_rest)],
-) -> SymbolMapping:
-    mapping = symbol_whitelist.get_symbol_mapping(ftmo_symbol)
-    if mapping is None:
+) -> FTMOSymbol:
+    """Return the FTMOSymbol entry (ftmo-only fields per D-SM-09).
+
+    The Phase 1-3 ``SymbolMapping`` return type carried Exness-side fields;
+    those moved to ``MappingService`` (per Exness account) in Phase 4.A.
+    Frontend pieces that still want an Exness-side preview are wired by
+    step 4.A.6+ through the per-account mapping wizard endpoints.
+    """
+    entry = symbol_whitelist.get_symbol_mapping(ftmo_symbol)
+    if entry is None:
         raise HTTPException(status_code=404, detail="Symbol not in whitelist")
-    return mapping
+    return entry
+
+
+def _ftmo_symbol_to_legacy_mapping(entry: FTMOSymbol) -> SymbolMapping:
+    """Build a transitional ``SymbolMapping`` from an ``FTMOSymbol``.
+
+    Phase 4.A.1 leaves ``volume_calc.calculate_volume`` consuming the legacy
+    type; this adapter populates the Exness fields with the FTMO equivalents
+    (1:1 hedge ratio). Behaviour matches a Standard Exness account, which is
+    the Phase 1-3 default and what the existing tests assert.
+
+    Step 4.A.5 replaces this adapter with a per-pair ``MappingService``
+    lookup that honours Cent / Pro / Raw account divergences.
+    """
+    return SymbolMapping(
+        ftmo=entry.name,
+        exness=entry.name,
+        match_type="exact",
+        ftmo_units_per_lot=entry.ftmo_units_per_lot,
+        exness_trade_contract_size=entry.ftmo_units_per_lot,
+        ftmo_pip_size=entry.ftmo_pip_size,
+        exness_pip_size=entry.ftmo_pip_size,
+        ftmo_pip_value=entry.ftmo_pip_value,
+        exness_pip_value=entry.ftmo_pip_value,
+        quote_ccy=entry.quote_ccy,
+    )
 
 
 @router.post("/{ftmo_symbol}/calculate-volume", response_model=CalculateVolumeResponse)
@@ -95,8 +135,8 @@ async def calculate_volume_endpoint(
     a few seconds usually succeeds), 400 for SL too tight, 422 for malformed
     inputs.
     """
-    mapping = symbol_whitelist.get_symbol_mapping(ftmo_symbol)
-    if mapping is None:
+    entry = symbol_whitelist.get_symbol_mapping(ftmo_symbol)
+    if entry is None:
         raise HTTPException(status_code=404, detail="Symbol not in whitelist")
 
     config = await redis_svc.get_symbol_config(ftmo_symbol)
@@ -104,23 +144,24 @@ async def calculate_volume_endpoint(
         raise HTTPException(status_code=404, detail="Symbol not in active set")
 
     md = _get_market_data()
-    rate = await get_quote_to_usd_rate(mapping.quote_ccy, redis_svc, md)
+    rate = await get_quote_to_usd_rate(entry.quote_ccy, redis_svc, md)
     if rate <= 0:
         raise HTTPException(
             status_code=503,
             detail=(
-                f"Conversion rate {mapping.quote_ccy}->USD not available yet. "
+                f"Conversion rate {entry.quote_ccy}->USD not available yet. "
                 "Try again in a few seconds."
             ),
         )
 
+    legacy_mapping = _ftmo_symbol_to_legacy_mapping(entry)
     try:
         result = calculate_volume(
             risk_amount=req.risk_amount,
             entry=req.entry,
             sl=req.sl,
             symbol_config=config,
-            whitelist_row=mapping,
+            whitelist_row=legacy_mapping,
             ratio=req.ratio,
             quote_to_usd_rate=rate,
         )
@@ -134,6 +175,6 @@ async def calculate_volume_endpoint(
         sl_pips=result["sl_pips"],
         pip_value_usd_per_lot=result["pip_value_usd_per_lot"],
         sl_usd_per_lot=result["sl_usd_per_lot"],
-        quote_ccy=mapping.quote_ccy,
+        quote_ccy=entry.quote_ccy,
         quote_to_usd_rate=rate,
     )

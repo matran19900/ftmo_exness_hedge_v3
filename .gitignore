@@ -40,3 +40,11 @@ desktop.ini
 /tmp/
 build/
 .claude/scheduled_tasks.lock
+
+# Phase 4.A symbol mapping cache (runtime-managed; folder bootstrapped step 4.A.2)
+server/data/symbol_mapping_cache/*.json
+!server/data/symbol_mapping_cache/.gitkeep
+
+# Tempfile + backup artifacts from atomic write (Phase 4.A.2)
+server/data/symbol_mapping_cache/*.tmp
+server/data/symbol_mapping_cache/*.bak

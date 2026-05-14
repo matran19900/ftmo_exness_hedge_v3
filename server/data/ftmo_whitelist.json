@@ -1,0 +1,942 @@
+{
+  "schema_version": 1,
+  "version": 1,
+  "symbols": [
+    {
+      "name": "AAPL",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "AMD",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "AMZN",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "AUDCAD",
+      "asset_class": "forex",
+      "quote_ccy": "CAD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "AUDCHF",
+      "asset_class": "forex",
+      "quote_ccy": "CHF",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "AUDJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1000.0
+    },
+    {
+      "name": "AUDNOK",
+      "asset_class": "forex",
+      "quote_ccy": "NOK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "AUDNZD",
+      "asset_class": "forex",
+      "quote_ccy": "NZD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "AUDSEK",
+      "asset_class": "forex",
+      "quote_ccy": "SEK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "AUDSGD",
+      "asset_class": "forex",
+      "quote_ccy": "SGD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "AUDUSD",
+      "asset_class": "forex",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "AUS200.cash",
+      "asset_class": "indices",
+      "quote_ccy": "AUD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "AVGO",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "BA",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "BABA",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "BAC",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "BTCUSD",
+      "asset_class": "crypto",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "CADCHF",
+      "asset_class": "forex",
+      "quote_ccy": "CHF",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "CADJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1000.0
+    },
+    {
+      "name": "CHFJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1000.0
+    },
+    {
+      "name": "CHFNOK",
+      "asset_class": "forex",
+      "quote_ccy": "NOK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.001,
+      "ftmo_pip_value": 100.0
+    },
+    {
+      "name": "CHFSGD",
+      "asset_class": "forex",
+      "quote_ccy": "SGD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "CSCO",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "DXY.cash",
+      "asset_class": "indices",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 100.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1.0
+    },
+    {
+      "name": "ETHUSD",
+      "asset_class": "crypto",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 10.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 1.0
+    },
+    {
+      "name": "EU50.cash",
+      "asset_class": "indices",
+      "quote_ccy": "EUR",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "EURAUD",
+      "asset_class": "forex",
+      "quote_ccy": "AUD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "EURCAD",
+      "asset_class": "forex",
+      "quote_ccy": "CAD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "EURCHF",
+      "asset_class": "forex",
+      "quote_ccy": "CHF",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "EURGBP",
+      "asset_class": "forex",
+      "quote_ccy": "GBP",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "EURJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1000.0
+    },
+    {
+      "name": "EURMXN",
+      "asset_class": "forex",
+      "quote_ccy": "MXN",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "EURNOK",
+      "asset_class": "forex",
+      "quote_ccy": "NOK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "EURNZD",
+      "asset_class": "forex",
+      "quote_ccy": "NZD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "EURPLN",
+      "asset_class": "forex",
+      "quote_ccy": "PLN",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "EURSEK",
+      "asset_class": "forex",
+      "quote_ccy": "SEK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "EURSGD",
+      "asset_class": "forex",
+      "quote_ccy": "SGD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "EURUSD",
+      "asset_class": "forex",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "EURZAR",
+      "asset_class": "forex",
+      "quote_ccy": "ZAR",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "FRA40.cash",
+      "asset_class": "indices",
+      "quote_ccy": "EUR",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "GBPAUD",
+      "asset_class": "forex",
+      "quote_ccy": "AUD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "GBPCAD",
+      "asset_class": "forex",
+      "quote_ccy": "CAD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "GBPCHF",
+      "asset_class": "forex",
+      "quote_ccy": "CHF",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "GBPDKK",
+      "asset_class": "forex",
+      "quote_ccy": "DKK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.001,
+      "ftmo_pip_value": 100.0
+    },
+    {
+      "name": "GBPJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1000.0
+    },
+    {
+      "name": "GBPMXN",
+      "asset_class": "forex",
+      "quote_ccy": "MXN",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.001,
+      "ftmo_pip_value": 100.0
+    },
+    {
+      "name": "GBPNOK",
+      "asset_class": "forex",
+      "quote_ccy": "NOK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "GBPNZD",
+      "asset_class": "forex",
+      "quote_ccy": "NZD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "GBPPLN",
+      "asset_class": "forex",
+      "quote_ccy": "PLN",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.001,
+      "ftmo_pip_value": 100.0
+    },
+    {
+      "name": "GBPSEK",
+      "asset_class": "forex",
+      "quote_ccy": "SEK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "GBPSGD",
+      "asset_class": "forex",
+      "quote_ccy": "SGD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "GBPUSD",
+      "asset_class": "forex",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "GBPZAR",
+      "asset_class": "forex",
+      "quote_ccy": "ZAR",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "GER40.cash",
+      "asset_class": "indices",
+      "quote_ccy": "EUR",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "HK50.cash",
+      "asset_class": "indices",
+      "quote_ccy": "HKD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "HKDJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1000.0
+    },
+    {
+      "name": "IBM",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "INTC",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "JNJ",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "JP225.cash",
+      "asset_class": "indices",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 10.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 1.0
+    },
+    {
+      "name": "JPM",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "KO",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "LMT",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "MCD",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "META",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "MSFT",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "MXNJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "NATGAS.cash",
+      "asset_class": "energies",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "NFLX",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "NKE",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "NOKJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "NOKSEK",
+      "asset_class": "forex",
+      "quote_ccy": "SEK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "NVDA",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "NZDCAD",
+      "asset_class": "forex",
+      "quote_ccy": "CAD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "NZDCHF",
+      "asset_class": "forex",
+      "quote_ccy": "CHF",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "NZDJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1000.0
+    },
+    {
+      "name": "NZDSGD",
+      "asset_class": "forex",
+      "quote_ccy": "SGD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "NZDUSD",
+      "asset_class": "forex",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "PFE",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "SBUX",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "SEKJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1000.0
+    },
+    {
+      "name": "SGDJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1000.0
+    },
+    {
+      "name": "T",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "TSLA",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "UK100.cash",
+      "asset_class": "indices",
+      "quote_ccy": "GBP",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "UKOIL.cash",
+      "asset_class": "energies",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 100.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1.0
+    },
+    {
+      "name": "US100.cash",
+      "asset_class": "indices",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "US30.cash",
+      "asset_class": "indices",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "US500.cash",
+      "asset_class": "indices",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "USDCAD",
+      "asset_class": "forex",
+      "quote_ccy": "CAD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDCHF",
+      "asset_class": "forex",
+      "quote_ccy": "CHF",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDCNH",
+      "asset_class": "forex",
+      "quote_ccy": "CNH",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDDKK",
+      "asset_class": "forex",
+      "quote_ccy": "DKK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDHKD",
+      "asset_class": "forex",
+      "quote_ccy": "HKD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDILS",
+      "asset_class": "forex",
+      "quote_ccy": "ILS",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1000.0
+    },
+    {
+      "name": "USDMXN",
+      "asset_class": "forex",
+      "quote_ccy": "MXN",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDNOK",
+      "asset_class": "forex",
+      "quote_ccy": "NOK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDPLN",
+      "asset_class": "forex",
+      "quote_ccy": "PLN",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDSEK",
+      "asset_class": "forex",
+      "quote_ccy": "SEK",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDSGD",
+      "asset_class": "forex",
+      "quote_ccy": "SGD",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDTHB",
+      "asset_class": "forex",
+      "quote_ccy": "THB",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USDZAR",
+      "asset_class": "forex",
+      "quote_ccy": "ZAR",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.0001,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "USOIL.cash",
+      "asset_class": "energies",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 100.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 1.0
+    },
+    {
+      "name": "V",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "WMT",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "XAGAUD",
+      "asset_class": "metals",
+      "quote_ccy": "AUD",
+      "ftmo_units_per_lot": 5000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 50.0
+    },
+    {
+      "name": "XAGEUR",
+      "asset_class": "metals",
+      "quote_ccy": "EUR",
+      "ftmo_units_per_lot": 5000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 50.0
+    },
+    {
+      "name": "XAGUSD",
+      "asset_class": "metals",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 5000.0,
+      "ftmo_pip_size": 0.01,
+      "ftmo_pip_value": 50.0
+    },
+    {
+      "name": "XAUAUD",
+      "asset_class": "metals",
+      "quote_ccy": "AUD",
+      "ftmo_units_per_lot": 100.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "XAUEUR",
+      "asset_class": "metals",
+      "quote_ccy": "EUR",
+      "ftmo_units_per_lot": 100.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "XAUUSD",
+      "asset_class": "metals",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 100.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "XCUUSD",
+      "asset_class": "forex",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 100.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "XOM",
+      "asset_class": "stocks",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 1.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 0.1
+    },
+    {
+      "name": "XPDUSD",
+      "asset_class": "metals",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 100.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "XPTUSD",
+      "asset_class": "metals",
+      "quote_ccy": "USD",
+      "ftmo_units_per_lot": 100.0,
+      "ftmo_pip_size": 0.1,
+      "ftmo_pip_value": 10.0
+    },
+    {
+      "name": "ZARJPY",
+      "asset_class": "forex",
+      "quote_ccy": "JPY",
+      "ftmo_units_per_lot": 100000.0,
+      "ftmo_pip_size": 0.001,
+      "ftmo_pip_value": 100.0
+    }
+  ]
+}

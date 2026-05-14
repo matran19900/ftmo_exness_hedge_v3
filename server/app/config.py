@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     )
 
     redis_url: str
-    symbol_mapping_path: str = "/workspaces/ftmo_exness_hedge_v3/symbol_mapping_ftmo_exness.json"
+    symbol_mapping_path: str = "/workspaces/ftmo_exness_hedge_v3/server/data/ftmo_whitelist.json"
     # NoDecode disables pydantic-settings' eager JSON parse for this list field
     # so the validator below can accept either CSV or JSON-list strings from env.
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:5173"]
