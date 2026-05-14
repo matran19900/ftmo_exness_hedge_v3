@@ -42,9 +42,7 @@ pip install \
   "inputimeout==1.0.4" \
   "service_identity>=24,<26"
 
-echo "[post-create] Step 4: hedger-shared editable..."
-cd "$REPO_ROOT/shared"
-pip install -e .
+echo "[post-create] Step 4: (removed step 4.4b — hedger-shared package deleted; symbol_mapping moved to server/app/services/legacy_archive_parser.py, ctrader_oauth split between server + ftmo-client vendor copies)"
 
 echo "[post-create] Step 5: hedger-server editable (--no-deps to bypass resolver)..."
 cd "$REPO_ROOT/server"

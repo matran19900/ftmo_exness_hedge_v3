@@ -1,10 +1,12 @@
-"""Tests for the FTMO whitelist service + the archived legacy loader.
+"""Tests for the FTMOWhitelistService.
 
 Phase 4.A.5 cleanup: the ``app.services.symbol_whitelist`` shim is gone;
-all callers consume ``FTMOWhitelistService`` directly. The legacy file
-format (with Exness fields) still loads through the unchanged
-``hedger_shared.symbol_mapping`` module for the archived-data regression
-test below.
+all callers consume ``FTMOWhitelistService`` directly.
+
+Step 4.4b: the archive-parser regression tests that previously lived in
+this file moved to ``test_legacy_archive_parser.py`` after the parser
+itself moved out of ``hedger_shared`` into
+``app.services.legacy_archive_parser``.
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ from app.services.ftmo_whitelist_service import (
     FTMOWhitelistFile,
     FTMOWhitelistService,
 )
-from hedger_shared.symbol_mapping import load_symbol_mapping
 from pydantic import ValidationError
 
 EXPECTED_SYMBOL_COUNT = 117
@@ -93,26 +94,3 @@ def test_ftmo_whitelist_all_symbols_sorted(
     names = svc.all_symbols()
     assert names == sorted(names)
     assert len(names) == EXPECTED_SYMBOL_COUNT
-
-
-# ---------- Legacy loader (archived file regression) ----------
-
-
-def test_load_legacy_mapping_file(legacy_mapping_path: Path) -> None:
-    """The archived Phase 1-3 mapping file still loads via the unchanged
-    ``hedger_shared.symbol_mapping`` module. This guards the archive
-    pathway used by tests + reference scripts."""
-    parsed = load_symbol_mapping(legacy_mapping_path)
-    assert parsed.version == 1
-    assert len(parsed.mappings) == EXPECTED_SYMBOL_COUNT
-
-
-def test_legacy_loader_strict_schema_rejects_unknown_field(
-    tmp_path: Path, legacy_mapping_path: Path
-) -> None:
-    raw = json.loads(legacy_mapping_path.read_text(encoding="utf-8"))
-    raw["mappings"][0]["unexpected_field"] = "boom"
-    bad_path = tmp_path / "bad_legacy.json"
-    bad_path.write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(ValidationError):
-        load_symbol_mapping(bad_path)

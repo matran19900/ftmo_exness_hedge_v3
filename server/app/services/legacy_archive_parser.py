@@ -1,6 +1,15 @@
-"""LEGACY MODULE — replaced by per-Exness-account mapping cache architecture.
+"""Legacy archive mapping parser (Phase 1-3 monolithic format).
 
-Phase 4.A migration is complete as of step 4.A.5. The Phase 1-3 single-file
+Originally ``shared/hedger_shared/symbol_mapping.py``. Moved to
+``server/app/services/`` in step 4.4b as part of the CPR finalization
+that deleted the entire ``hedger_shared`` package.
+
+This module exists ONLY to parse archived Phase 1-3 monolithic symbol
+mapping JSON files (``archive/symbol_mapping_ftmo_exness_v1.json``).
+NOT used by runtime production code post-step 4.A.5 — the
+``MappingService`` orchestrator handles all runtime mapping operations.
+
+Phase 4.A migration completed as of step 4.A.5: the Phase 1-3 single-file
 ``symbol_mapping_ftmo_exness.json`` shape modeled here was split into:
 
   - ``server/data/ftmo_whitelist.json`` (FTMO half), loaded by
@@ -12,11 +21,11 @@ Phase 4.A migration is complete as of step 4.A.5. The Phase 1-3 single-file
 Per-pair lookups now go through
 ``app.services.mapping_service.MappingService``.
 
-Kept on disk for the archive-file regression test
-(``server/tests/test_symbol_whitelist.py::test_load_legacy_mapping_file``)
-and any external scripts that still reference ``SymbolMapping``. Do NOT
-import in new code. Phase 5 cleanup will delete this module after the
-``phase-4-complete`` tag.
+Retained for forensic / data archaeology — the only consumer is the
+archive regression test
+``server/tests/test_legacy_archive_parser.py::test_load_legacy_mapping_file``
+which guards against schema regressions in the parser itself. Do NOT
+import in new runtime code.
 """
 
 from __future__ import annotations
