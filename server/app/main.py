@@ -22,6 +22,7 @@ from app.api.history import router as history_router
 from app.api.orders import router as orders_router
 from app.api.pairs import router as pairs_router
 from app.api.positions import router as positions_router
+from app.api.symbol_mapping import router as symbol_mapping_router
 from app.api.symbols import router as symbols_router
 from app.api.ws import router as ws_router
 from app.config import get_settings
@@ -31,7 +32,9 @@ from app.services.account_status import account_status_loop
 from app.services.auto_match_engine import AutoMatchEngine
 from app.services.broadcast import BroadcastService
 from app.services.event_handler import event_handler_loop
+from app.services.ftmo_whitelist_service import FTMOWhitelistService
 from app.services.mapping_cache_repository import MappingCacheRepository
+from app.services.mapping_cache_service import MappingCacheService
 from app.services.market_data import MarketDataService
 from app.services.position_tracker import position_tracker_loop
 from app.services.redis_service import RedisService
@@ -88,6 +91,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         n_exness,
     )
     symbol_whitelist.load_whitelist(settings.symbol_mapping_path)
+    # Phase 4.A.4 needs a typed reference to the FTMOWhitelistService for
+    # MappingCacheService. The legacy module-level shim
+    # (``app.services.symbol_whitelist``) keeps Phase 1-3 callers working;
+    # the explicit ``app.state.ftmo_whitelist`` pointer is the new path
+    # that step 4.A.5 will eventually be the only consumer of.
+    ftmo_whitelist_service = FTMOWhitelistService(settings.symbol_mapping_path)
+    app.state.ftmo_whitelist = ftmo_whitelist_service
     logger.info(
         "Server ready (redis=%s, symbols=%d)",
         _mask_redis_url(settings.redis_url),
@@ -128,6 +138,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.market_data = None
     broadcast = BroadcastService(redis_svc=redis_svc)
     app.state.broadcast = broadcast
+
+    # Phase 4.A.4: MappingCacheService orchestrates repository + engine + Redis
+    # for the symbol-mapping wizard. Must be wired AFTER BroadcastService
+    # exists (status-change broadcasts publish on `mapping_status:{acc}`)
+    # and AFTER the Redis pool is up (populate_redis_from_disk reads it).
+    # See deviation D-4.A.4-3 in the step self-check for why this lives
+    # here instead of next to the engine init as the plan §2.5 sketched.
+    mapping_cache_service = MappingCacheService(
+        repository=mapping_cache_repository,
+        engine=auto_match_engine,
+        ftmo_whitelist=ftmo_whitelist_service,
+        redis=get_redis(),
+        broadcast=broadcast,
+    )
+    populated = await mapping_cache_service.populate_redis_from_disk()
+    logger.info(
+        "mapping_cache_service.initialized redis_populated_count=%d", populated
+    )
+    app.state.mapping_cache_service = mapping_cache_service
+
     creds = await redis_svc.get_ctrader_market_data_creds()
     if creds and settings.ctrader_client_id and settings.ctrader_client_secret:
         md = MarketDataService(
@@ -259,4 +289,5 @@ app.include_router(orders_router)
 app.include_router(positions_router)
 app.include_router(history_router)
 app.include_router(accounts_router)
+app.include_router(symbol_mapping_router)
 app.include_router(ws_router)

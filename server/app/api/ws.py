@@ -35,7 +35,15 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-VALID_CHANNEL_PREFIXES = ("ticks:", "candles:", "positions", "orders", "accounts", "agents")
+VALID_CHANNEL_PREFIXES = (
+    "ticks:",
+    "candles:",
+    "positions",
+    "orders",
+    "accounts",
+    "agents",
+    "mapping_status:",  # Phase 4.A.4 — per-Exness-account wizard state (D-4.A.0-9)
+)
 HEARTBEAT_INTERVAL_SECONDS = 30
 WS_CLOSE_INVALID_TOKEN = 4401
 
