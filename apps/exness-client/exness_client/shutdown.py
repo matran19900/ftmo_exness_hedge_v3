@@ -2,8 +2,18 @@
 
 Mirrors ``apps/ftmo-client/ftmo_client/shutdown.py`` but uses an explicit
 ``ShutdownCoordinator`` class that owns the cancellation ORDER specified
-in D-088: stop cmd_processor → stop heartbeat → disconnect bridge →
-close Redis.
+in D-088 (extended in step 4.3 to insert the position monitor between
+the cmd processor and the heartbeat):
+
+  1. ``cmd_processor.stop()`` — stop accepting new actions.
+  2. ``position_monitor.stop()`` — stop polling MT5 (no more events
+     after the heartbeat starts winding down).
+  3. ``heartbeat.stop()`` — flip the running flag last so ``status=online``
+     stays visible to the server until the rest of the lifecycle has
+     wound down.
+  4. Cancel + gather background tasks.
+  5. ``bridge.disconnect()`` — release the MT5 lib handle.
+  6. ``redis_client.aclose()``.
 
 Tests construct the coordinator with stubs for each component and assert
 that ``shutdown`` invokes them in the right order.
@@ -14,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from typing import Protocol
+from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +56,11 @@ class ShutdownCoordinator:
         heartbeat: _StoppableLoop,
         bridge: _CloseableBridge,
         redis_client: _CloseableRedis,
+        position_monitor: _StoppableLoop | None = None,
     ) -> None:
         self._cmd = cmd_processor
         self._heartbeat = heartbeat
+        self._position_monitor = position_monitor
         self._bridge = bridge
         self._redis = redis_client
         self._event = asyncio.Event()
@@ -87,24 +99,30 @@ class ShutdownCoordinator:
     async def shutdown(self, tasks: list[asyncio.Task[None]]) -> None:
         """Cancel background tasks in D-088 order then close resources.
 
-        Order:
+        Order (Phase 4.3 inserted ``position_monitor`` between cmd and
+        heartbeat per the class docstring):
           1. ``cmd_processor.stop()`` — flip the running flag so the
              XREADGROUP loop exits on its next BLOCK timeout.
-          2. ``heartbeat.stop()`` — flip the loop flag.
-          3. Cancel + gather the asyncio.Tasks (gives loops time to
+          2. ``position_monitor.stop()`` — stop the 2-second poll loop.
+          3. ``heartbeat.stop()`` — flip the loop flag.
+          4. Cancel + gather the asyncio.Tasks (gives loops time to
              observe the flag and exit cleanly).
-          4. ``bridge.disconnect()`` — release MT5 lib handle.
-          5. ``redis_client.aclose()`` — close the pool.
+          5. ``bridge.disconnect()`` — release MT5 lib handle.
+          6. ``redis_client.aclose()`` — close the pool.
 
         Each stage is wrapped in try/except so a flaky shutdown step
         doesn't prevent the next stage from running.
         """
         logger.info("shutdown.begin")
 
-        for step_name, awaitable in (
+        steps: list[tuple[str, Any]] = [
             ("cmd_processor.stop", self._cmd.stop()),
-            ("heartbeat.stop", self._heartbeat.stop()),
-        ):
+        ]
+        if self._position_monitor is not None:
+            steps.append(("position_monitor.stop", self._position_monitor.stop()))
+        steps.append(("heartbeat.stop", self._heartbeat.stop()))
+
+        for step_name, awaitable in steps:
             try:
                 await awaitable
             except Exception:

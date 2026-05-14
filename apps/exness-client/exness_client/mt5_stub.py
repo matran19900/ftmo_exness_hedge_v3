@@ -133,7 +133,9 @@ class OrderSendResult(NamedTuple):
 
 
 class Position(NamedTuple):
-    """Subset of ``mt5.positions_get()`` entries used by close handler."""
+    """Subset of ``mt5.positions_get()`` entries used by the close handler
+    + position-monitor poll loop. Step 4.3 added ``sl`` / ``tp`` so the
+    monitor can detect terminal-side SL/TP modifications."""
 
     ticket: int
     symbol: str
@@ -141,6 +143,8 @@ class Position(NamedTuple):
     volume: float
     price_open: float
     magic: int
+    sl: float = 0.0
+    tp: float = 0.0
 
 
 # ----- Test-controllable module state -----
@@ -170,6 +174,7 @@ _state: dict[str, Any] = {
     "order_send_calls": [],          # list[dict] for assertions
     "order_send_raises": None,       # Exception to raise instead of returning
     "positions_get": (),             # tuple[Position, ...]
+    "positions_get_raises": None,    # Exception | None — for monitor tests
 }
 
 
@@ -285,8 +290,13 @@ def positions_get(
 
     Real MT5 supports both keyword filters; we implement the same
     semantics so the close handler doesn't have to special-case the
-    stub. ``ticket`` filter is used by ``_handle_close``."""
-    positions: tuple[Position, ...] = _state["positions_get"]
+    stub. ``ticket`` filter is used by ``_handle_close``.
+
+    ``positions_get_raises`` (test-only) lets the monitor tests assert
+    the loop survives a transient MT5 exception."""
+    if _state["positions_get_raises"] is not None:
+        raise _state["positions_get_raises"]
+    positions = tuple(_state["positions_get"])
     if ticket is not None:
         return tuple(p for p in positions if p.ticket == ticket)
     if symbol is not None:
@@ -319,3 +329,44 @@ def reset_state_for_tests() -> None:
     _state["order_send_calls"] = []
     _state["order_send_raises"] = None
     _state["positions_get"] = ()
+    _state["positions_get_raises"] = None
+
+
+# ----- Phase 4.3: position-monitor test helpers -----
+#
+# These mutate the ``positions_get`` state in place so a single test can
+# simulate the full lifecycle (open → SL/TP modify → manual close)
+# without rebuilding the whole list each time. The plain ``set_state``
+# entry above still works for tests that only need a static snapshot.
+
+
+def _set_positions_for_tests(positions: list[Position]) -> None:
+    """Replace the positions_get response with a fresh list."""
+    _state["positions_get"] = list(positions)
+
+
+def _mutate_position_for_tests(ticket: int, **field_updates: object) -> None:
+    """Update fields on the position with ``ticket`` (NamedTuple is
+    immutable, so we ``_replace`` and write back). Used to simulate a
+    terminal-side SL/TP edit between two monitor polls.
+
+    Raises ``ValueError`` when ``ticket`` is not in the current
+    positions list — surfaces a malformed test fixture loudly.
+    """
+    positions = list(_state["positions_get"])
+    for i, pos in enumerate(positions):
+        if pos.ticket == ticket:
+            positions[i] = pos._replace(**field_updates)
+            _state["positions_get"] = positions
+            return
+    raise ValueError(
+        f"position with ticket {ticket} not found in stub state"
+    )
+
+
+def _remove_position_for_tests(ticket: int) -> None:
+    """Drop ``ticket`` from positions_get (simulates a manual / SL-hit
+    close happening between monitor polls)."""
+    _state["positions_get"] = [
+        p for p in _state["positions_get"] if p.ticket != ticket
+    ]

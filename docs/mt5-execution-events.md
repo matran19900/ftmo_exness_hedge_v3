@@ -149,6 +149,23 @@ Edge cases (populate during step 4.2):
 - `history_deals_get()` returns empty for a position that we just observed missing: likely a transient race; retry once after 500ms before publishing.
 - Server restart: prev_ids HAS persisted state; reconstruction works across restart.
 
+### 5.a Step 4.3 implementation summary
+
+Step 4.3 ships a leaner version of the §5 sketch — no `exness_open_positions:{account}`
+SET in Redis, no `history_deals_get` reconciliation. Step 4.4 adds the persistence + deal
+reconstruction; step 4.3 is the in-process diff layer that fires the events.
+
+| Position lifecycle event | mt5 API access | Step | Notes |
+|---|---|---|---|
+| Detect new position (open via cmd OR manual) | `positions_get()` poll diff (current − last) | 4.3 | 2 s interval; first poll = silent baseline |
+| Detect closed externally (manual / SL-TP hit / stop-out) | `positions_get()` poll diff (last − current) | 4.3 | Triggers cascade Path B (server step 4.7/4.8) |
+| Detect SL/TP modification (terminal-side edit) | `positions_get()` field diff against last snapshot | 4.3 | `changed_fields` enumerates `sl` / `tp` / `volume` |
+| Volume change (partial close, future scope) | `positions_get()` field diff | 4.3 | Detected today; partial-close cmd-stream support is Phase 5 |
+
+Event stream key: `event_stream:exness:{account_id}`. Payload schema (flat string dict):
+``event_type``, ``broker_position_id``, ``ts_ms``, ``symbol``, ``side`` (+ event-specific extras
+listed in `exness_client/position_monitor.py`).
+
 ---
 
 ## 6. MT5 quirks summary
@@ -243,5 +260,6 @@ Append-only mid-phase per D-069 exception (mirrors `docs/ctrader-execution-event
 |---|---|---|---|
 | 2026-05-13 | 4.0 | Design doc skeleton creation | Initial structure. Sections 1–8 placeholders; will populate during steps 4.1 (connect+symbol sync), 4.2 (actions+monitor+retcodes), 4.5 (full hedge flow), 4.6 (cascade integration). |
 | 2026-05-14 | 4.2 | Initial action-handler implementation | §3 retcode table marked with `Step` column = 4.2 for the 10 mapped retcodes (DONE / REJECT / INVALID_VOLUME / INVALID_PRICE / INVALID_STOPS / MARKET_CLOSED / NO_MONEY / POSITION_NOT_FOUND / UNSUPPORTED_FILLING / REQUOTE). §6 quirks populated: IOC→FOK retry pattern, pip-size point*10 derivation for 3/5-digit symbols, MarketWatch `symbol_select` requirement, close-needs-position-ticket. ``RETCODE_MAP`` is the single source of truth (`exness_client/retcode_mapping.py`). |
+| 2026-05-14 | 4.3 | Position monitor poll loop | §5.a populated: 3 event types (`position_new`, `position_closed_external`, `position_modified`) on `event_stream:exness:{account_id}`. Baseline pattern locked: first poll = silent snapshot (no replay events on client restart). `POLL_INTERVAL_S = 2.0` locked. SL/TP/volume diff detection runs entirely off the in-process snapshot — no `history_deals_get` reconciliation in this step (deferred to step 4.4). Event order is deterministic: news first (sorted by ticket), then closed, then modified. |
 
 *(Append entries below.)*

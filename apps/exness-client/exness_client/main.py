@@ -28,6 +28,7 @@ from exness_client.bridge_service import (
 from exness_client.command_processor import CommandProcessor
 from exness_client.config import ExnessClientSettings
 from exness_client.heartbeat import HeartbeatLoop
+from exness_client.position_monitor import PositionMonitor
 from exness_client.shutdown import ShutdownCoordinator
 from exness_client.symbol_sync import SymbolSyncPublisher
 
@@ -136,11 +137,21 @@ async def amain(
     except Exception:
         logger.exception("initial heartbeat write failed; loop will retry")
 
-    coord = ShutdownCoordinator(cmd_proc, heartbeat, bridge, redis)
+    # Step 4.3: position monitor — 2s poll loop that diffs MT5
+    # positions and publishes ``event_stream:exness:{account_id}``
+    # events. Drives the server-side cascade orchestrator (step 4.7/4.8).
+    position_monitor = PositionMonitor(
+        redis, settings.account_id, mt5_module
+    )
+
+    coord = ShutdownCoordinator(
+        cmd_proc, heartbeat, bridge, redis, position_monitor=position_monitor
+    )
     coord.install_signal_handlers()
 
     tasks: list[asyncio.Task[None]] = [
         asyncio.create_task(cmd_proc.run(), name="cmd_processor"),
+        asyncio.create_task(position_monitor.run(), name="position_monitor"),
         asyncio.create_task(heartbeat.run(), name="heartbeat"),
     ]
     logger.info("exness_client.started account_id=%s", settings.account_id)
