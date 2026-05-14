@@ -28,6 +28,7 @@ from app.config import get_settings
 from app.redis_client import close_redis, get_redis, init_redis
 from app.services import symbol_whitelist
 from app.services.account_status import account_status_loop
+from app.services.auto_match_engine import AutoMatchEngine
 from app.services.broadcast import BroadcastService
 from app.services.event_handler import event_handler_loop
 from app.services.mapping_cache_repository import MappingCacheRepository
@@ -111,6 +112,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "mapping_cache_repository.loaded cache_count=%d", len(loaded_caches)
     )
     app.state.mapping_cache_repository = mapping_cache_repository
+
+    # Phase 4.A.3: AutoMatchEngine — pure logic layer, no Redis. Hints
+    # config bootstrapped from the 14 archived manual entries (D-SM-12 +
+    # D-4.A.0-10). Engine instance is dormant until step 4.A.4 wires the
+    # POST /symbol-mapping/auto-match endpoint.
+    auto_match_engine = AutoMatchEngine(settings.symbol_match_hints_path)
+    logger.info(
+        "auto_match_engine.initialized hints_path=%s hint_count=%d",
+        settings.symbol_match_hints_path,
+        auto_match_engine.hint_count,
+    )
+    app.state.auto_match_engine = auto_match_engine
 
     app.state.market_data = None
     broadcast = BroadcastService(redis_svc=redis_svc)

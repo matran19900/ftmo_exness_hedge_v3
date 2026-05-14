@@ -19,7 +19,8 @@
     "TZ": "Asia/Ho_Chi_Minh",
     "REDIS_URL": "redis://192.168.88.4:6379/2",
     "SYMBOL_MAPPING_PATH": "/workspaces/ftmo_exness_hedge_v3/server/data/ftmo_whitelist.json",
-    "SYMBOL_MAPPING_CACHE_DIR": "/workspaces/ftmo_exness_hedge_v3/server/data/symbol_mapping_cache"
+    "SYMBOL_MAPPING_CACHE_DIR": "/workspaces/ftmo_exness_hedge_v3/server/data/symbol_mapping_cache",
+    "SYMBOL_MATCH_HINTS_PATH": "/workspaces/ftmo_exness_hedge_v3/server/config/symbol_match_hints.json"
   },
 
   "remoteUser": "vscode",

@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     symbol_mapping_cache_dir: str = (
         "/workspaces/ftmo_exness_hedge_v3/server/data/symbol_mapping_cache"
     )
+    # Phase 4.A.3: AutoMatchEngine tier-3 manual hints config (D-SM-12).
+    # Bootstrapped from the 14 archived manual entries; CEO can hand-edit
+    # afterwards. See docs/phase-4-symbol-mapping-design.md §2.3 + §6.
+    symbol_match_hints_path: str = (
+        "/workspaces/ftmo_exness_hedge_v3/server/config/symbol_match_hints.json"
+    )
     # NoDecode disables pydantic-settings' eager JSON parse for this list field
     # so the validator below can accept either CSV or JSON-list strings from env.
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:5173"]
