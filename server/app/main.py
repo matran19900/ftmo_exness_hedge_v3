@@ -30,6 +30,7 @@ from app.services import symbol_whitelist
 from app.services.account_status import account_status_loop
 from app.services.broadcast import BroadcastService
 from app.services.event_handler import event_handler_loop
+from app.services.mapping_cache_repository import MappingCacheRepository
 from app.services.market_data import MarketDataService
 from app.services.position_tracker import position_tracker_loop
 from app.services.redis_service import RedisService
@@ -91,6 +92,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _mask_redis_url(settings.redis_url),
         len(symbol_whitelist.get_all_symbols()),
     )
+
+    # Phase 4.A.2: per-Exness-account mapping cache files. The repository
+    # is the file-layer only — Redis populate lands in step 4.A.4. Sweeping
+    # crashed tempfiles + listing existing caches at startup is enough to
+    # surface filesystem issues (D-4.A.0-8) loudly here, before any wizard
+    # write path is exercised at runtime.
+    mapping_cache_repository = MappingCacheRepository(settings.symbol_mapping_cache_dir)
+    sweep_result = mapping_cache_repository.sweep_temp_artifacts()
+    logger.info(
+        "mapping_cache_repository.initialized cache_dir=%s tmp_swept=%d bak_swept=%d",
+        settings.symbol_mapping_cache_dir,
+        sweep_result["tmp_removed"],
+        sweep_result["bak_removed"],
+    )
+    loaded_caches = await mapping_cache_repository.list_all()
+    logger.info(
+        "mapping_cache_repository.loaded cache_count=%d", len(loaded_caches)
+    )
+    app.state.mapping_cache_repository = mapping_cache_repository
 
     app.state.market_data = None
     broadcast = BroadcastService(redis_svc=redis_svc)
