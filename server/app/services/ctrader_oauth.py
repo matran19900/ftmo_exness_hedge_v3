@@ -1,11 +1,20 @@
-"""cTrader Open API OAuth helpers.
+"""cTrader OAuth 2.0 helper (server-side path).
 
-Extracted from ``server/app/api/auth_ctrader.py`` in step 3.3 so the
-server (market-data account) and the FTMO trading client (per-account
-trading tokens) can share the URL/exchange/refresh logic. The server
-keeps the FastAPI routing + Redis storage glue; the FTMO client uses
-these helpers from a standalone CLI (``run_oauth_flow.py``) and from
-the in-process token-refresh path.
+Originally ``shared/hedger_shared/ctrader_oauth.py`` (Phase 1-3 D-049,
+itself extracted from ``server/app/api/auth_ctrader.py`` in step 3.3).
+Moved back into ``server/app/services/`` in step 4.4a as part of the
+CPR (Client Packaging Refactor) that drops the ``hedger_shared``
+dependency from both client packages — server keeps its own first-class
+copy here.
+
+FTMO client uses an independent vendor copy at
+``apps/ftmo-client/ftmo_client/ctrader_oauth.py``. Server (this module)
+and the FTMO client vendor copy start identical. Per CEO assessment
+(Phase 4): the cTrader OAuth API is stable, no anticipated updates
+Phase 5+. If a future bug fix or API change is needed, update BOTH
+copies manually.
+
+Exness client does NOT use this module (MetaTrader5 lib, no OAuth).
 
 cTrader OAuth quirk: the consent callback does NOT echo the ``state``
 parameter back, so we don't send one. CSRF risk is accepted for this

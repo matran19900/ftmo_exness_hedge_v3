@@ -3,7 +3,7 @@
 CEO runs this once per FTMO account before starting the client process.
 It:
 
-1. Builds the cTrader consent URL via ``hedger_shared.ctrader_oauth``.
+1. Builds the cTrader consent URL via ``ftmo_client.ctrader_oauth``.
 2. Prints the URL and opens a local HTTP server bound to the
    ``CTRADER_REDIRECT_URI`` host/port for the consent callback.
 3. CEO opens the URL in a browser, grants access; cTrader redirects
@@ -35,13 +35,13 @@ from typing import TextIO
 from urllib.parse import urlparse
 
 import redis.asyncio as redis_asyncio
-from hedger_shared.ctrader_oauth import (
+
+from ftmo_client.config import FtmoClientSettings
+from ftmo_client.ctrader_oauth import (
     build_authorization_url,
     exchange_code_for_token,
     fetch_trading_accounts,
 )
-
-from ftmo_client.config import FtmoClientSettings
 from ftmo_client.oauth_storage import save_token
 
 logger = logging.getLogger(__name__)

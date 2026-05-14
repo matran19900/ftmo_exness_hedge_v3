@@ -4,8 +4,11 @@ Endpoints are intentionally unauthenticated: the OAuth dance is a browser
 redirect chain that cannot carry an Authorization header.
 
 Step 3.3: the URL builder, code-to-token exchange, and trading-accounts
-fetch were extracted to ``hedger_shared.ctrader_oauth`` so the FTMO
-client can reuse them for per-account trading tokens. This module keeps
+fetch were extracted to a shared module so the FTMO client could reuse
+them for per-account trading tokens. Step 4.4a (CPR): the helpers moved
+into ``app.services.ctrader_oauth`` (server-side first-class) and the
+FTMO client now ships a vendor copy at
+``apps/ftmo-client/ftmo_client/ctrader_oauth.py``. This module keeps
 the FastAPI routing + Redis storage + MarketDataService trigger glue.
 """
 
@@ -17,13 +20,13 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
-from hedger_shared.ctrader_oauth import (
+
+from app.config import Settings, get_settings
+from app.services.ctrader_oauth import (
     build_authorization_url,
     exchange_code_for_token,
     fetch_trading_accounts,
 )
-
-from app.config import Settings, get_settings
 from app.services.market_data import MarketDataService
 from app.services.redis_service import RedisService, get_redis_service
 

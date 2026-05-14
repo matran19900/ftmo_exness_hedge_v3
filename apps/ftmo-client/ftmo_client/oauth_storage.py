@@ -2,7 +2,7 @@
 
 Key namespace: ``ctrader:ftmo:{account_id}:creds`` (HASH, no TTL).
 Schema mirrors the camelCase-stripped form returned by
-``hedger_shared.ctrader_oauth.exchange_code_for_token`` plus a
+``ftmo_client.ctrader_oauth.exchange_code_for_token`` plus a
 ``saved_at`` epoch-ms timestamp + the cTrader ``ctid_trader_account_id``
 (numeric trading-account id used as ``ctidTraderAccountId`` in protobuf
 requests).
@@ -17,7 +17,8 @@ import time
 from typing import TypedDict
 
 import redis.asyncio as redis_asyncio
-from hedger_shared.ctrader_oauth import TokenResponse
+
+from ftmo_client.ctrader_oauth import TokenResponse
 
 
 class TokenData(TypedDict):

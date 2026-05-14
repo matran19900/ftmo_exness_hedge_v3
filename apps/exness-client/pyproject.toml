@@ -6,7 +6,6 @@ dependencies = [
   "pydantic>=2.7,<3",
   "pydantic-settings>=2.4,<3",
   "redis[hiredis]>=5.0,<6",
-  "hedger-shared",
   # MetaTrader5 is Windows-only. The `sys_platform` marker keeps pip
   # from trying to install it on Linux dev / CI; mt5_stub fills in
   # for those environments. Production Windows runtime installs the

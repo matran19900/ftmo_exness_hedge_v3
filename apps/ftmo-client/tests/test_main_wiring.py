@@ -12,10 +12,10 @@ from typing import Any
 
 import fakeredis.aioredis
 import pytest
-from hedger_shared.ctrader_oauth import TokenResponse
 
 from ftmo_client import main as main_module
 from ftmo_client.config import FtmoClientSettings
+from ftmo_client.ctrader_oauth import TokenResponse
 from ftmo_client.main import EXIT_CONNECT_FAILED, EXIT_NO_TOKEN, EXIT_OK, amain
 from ftmo_client.oauth_storage import save_token
 
