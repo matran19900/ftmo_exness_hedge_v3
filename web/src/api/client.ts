@@ -167,6 +167,11 @@ export async function getOhlc(
 // ----- Volume calculation -----
 
 export interface CalculateVolumeRequest {
+  // Phase 4.A.5 server breaking change: pair_id is required so the
+  // calculator can resolve the per-Exness-account mapping (real broker
+  // contract size when wizard has been run, 1:1 synthetic for Phase 3
+  // single-leg pairs). See server/app/api/symbols.py.
+  pair_id: string
   entry: number
   sl: number
   risk_amount: number

@@ -30,6 +30,7 @@ type ApiState =
 
 export function VolumeCalculator() {
   const selectedSymbol = useAppStore((s) => s.selectedSymbol)
+  const selectedPairId = useAppStore((s) => s.selectedPairId)
   const side = useAppStore((s) => s.side)
   const entryPrice = useAppStore((s) => s.entryPrice)
   const slPrice = useAppStore((s) => s.slPrice)
@@ -48,8 +49,12 @@ export function VolumeCalculator() {
   // entrySlError is a HARD block (no API call); tpWarning is informational.
   const { entrySlError } = validateSideDirection(side, entryPrice, slPrice, tpPrice)
 
+  // Phase 4.A.7: pair_id is required by the server's calculate-volume API
+  // (step 4.A.5 breaking change). Treat the calculator as "not ready" until
+  // the operator has selected a pair so we never fire a 422-bound request.
   const inputsValid =
     !!selectedSymbol &&
+    !!selectedPairId &&
     debouncedEntry !== null &&
     debouncedSl !== null &&
     debouncedRisk > 0 &&
@@ -62,13 +67,25 @@ export function VolumeCalculator() {
     // NOT setApiState here so any prior `ready.result` is preserved — when
     // the user fixes the direction, metrics return without a fetch.
     if (entrySlError) return
-    if (!inputsValid || !selectedSymbol || debouncedEntry === null || debouncedSl === null) {
+    if (
+      !inputsValid ||
+      !selectedSymbol ||
+      !selectedPairId ||
+      debouncedEntry === null ||
+      debouncedSl === null
+    ) {
       return
     }
 
     let cancelled = false
 
-    async function run(symbol: string, entry: number, sl: number, risk: number) {
+    async function run(
+      symbol: string,
+      pairId: string,
+      entry: number,
+      sl: number,
+      risk: number,
+    ) {
       // Step 3.12c: hold the previous result during a recalc so the
       // operator never sees the layout swap between "Calculating..."
       // and the result block on each 5 s tick. Only the first-ever
@@ -85,6 +102,7 @@ export function VolumeCalculator() {
       })
       try {
         const result = await calculateVolume(symbol, {
+          pair_id: pairId,
           entry,
           sl,
           risk_amount: risk,
@@ -105,12 +123,20 @@ export function VolumeCalculator() {
       }
     }
 
-    void run(selectedSymbol, debouncedEntry, debouncedSl, debouncedRisk)
+    void run(selectedSymbol, selectedPairId, debouncedEntry, debouncedSl, debouncedRisk)
 
     return () => {
       cancelled = true
     }
-  }, [entrySlError, inputsValid, selectedSymbol, debouncedEntry, debouncedSl, debouncedRisk])
+  }, [
+    entrySlError,
+    inputsValid,
+    selectedSymbol,
+    selectedPairId,
+    debouncedEntry,
+    debouncedSl,
+    debouncedRisk,
+  ])
 
   const isManualMode = manualVolumePrimary !== null
 

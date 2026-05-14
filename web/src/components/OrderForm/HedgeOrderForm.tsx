@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
 import { createOrder, formatOrderError } from '../../api/client'
+import { symbolMappingApi } from '../../api/symbolMapping'
 import { validateSideDirection } from '../../lib/orderValidation'
 import { useAppStore } from '../../store'
 import { OrderTypeSelector } from './OrderTypeSelector'
@@ -9,6 +10,23 @@ import { PriceInput } from './PriceInput'
 import { RiskAmountInput } from './RiskAmountInput'
 import { SideSelector } from './SideSelector'
 import { VolumeCalculator } from './VolumeCalculator'
+
+// Phase 4.A.7: 4 failure-reason → human-readable toast strings. Mirrors
+// MappingService.is_pair_symbol_tradeable's TradeableReason literal.
+function checkSymbolReasonToMessage(reason: string | null): string {
+  switch (reason) {
+    case 'pair_not_found':
+      return 'Pair not found. Refresh the pair list and try again.'
+    case 'ftmo_symbol_not_whitelisted':
+      return 'Symbol not in FTMO whitelist.'
+    case 'exness_account_has_no_mapping':
+      return 'Exness wizard not yet run. Go to Settings → Accounts → Map Symbols.'
+    case 'ftmo_symbol_not_mapped_for_exness_account':
+      return 'This symbol has no Exness mapping for the selected pair. Edit the mapping or pick a different symbol.'
+    default:
+      return 'Cannot trade this symbol on the selected pair.'
+  }
+}
 
 /**
  * Hedge order form.
@@ -58,6 +76,23 @@ export function HedgeOrderForm() {
   const accountStatuses = useAppStore((s) => s.accountStatuses)
   const orderType = useAppStore((s) => s.orderType)
   const tickThrottled = useAppStore((s) => s.tickThrottled)
+  const pairs = useAppStore((s) => s.pairs)
+  const mappingStatusByAccount = useAppStore((s) => s.mappingStatusByAccount)
+
+  // Phase 4.A.7: resolve the selected pair and its Exness mapping status
+  // for the wizard-not-run banner + submit gate. Phase 3 single-leg pairs
+  // (no exness_account_id) skip the wizard check entirely — same fallback
+  // as the server's MappingService.is_pair_symbol_tradeable (D-4.A.5-2).
+  const selectedPair = useMemo(
+    () => pairs.find((p) => p.pair_id === selectedPairId) ?? null,
+    [pairs, selectedPairId],
+  )
+  const pairExnessAccountId = selectedPair?.exness_account_id || null
+  const pairMappingStatus = pairExnessAccountId
+    ? (mappingStatusByAccount[pairExnessAccountId] ?? 'pending_mapping')
+    : null
+  const isWizardNotRun =
+    pairExnessAccountId !== null && pairMappingStatus !== 'active'
 
   // Step 3.12 / 3.13a: block submit while no FTMO account is online,
   // AND surface a tooltip that names the specific reason so the
@@ -223,6 +258,25 @@ export function HedgeOrderForm() {
     // TypeScript narrowing.
     if (!selectedPairId || !selectedSymbol || effectiveVolumeLots === null) return
 
+    // Phase 4.A.7: server-side pre-flight via /api/pairs/{}/check-symbol/{}.
+    // Catches the 4 documented TradeableReason failures so the operator
+    // gets a precise toast instead of a generic 400 from the order endpoint.
+    // Phase 3 single-leg pairs return tradeable=true silently (server fallback
+    // D-4.A.5-2) so this call is also harmless on legacy paths.
+    try {
+      const check = await symbolMappingApi.checkPairSymbol(
+        selectedPairId,
+        selectedSymbol,
+      )
+      if (!check.tradeable) {
+        toast.error(checkSymbolReasonToMessage(check.reason))
+        return
+      }
+    } catch (err) {
+      toast.error(formatOrderError(err))
+      return
+    }
+
     setSubmitting(true)
     try {
       const res = await createOrder({
@@ -263,13 +317,21 @@ export function HedgeOrderForm() {
   // Reading them up here keeps the JSX terse + makes the disable contract
   // discoverable (mirrors ``preflight`` minus the latestTick check, which
   // we still want to surface as a toast if it fails post-click).
+  // Phase 4.A.7: ``isWizardNotRun`` blocks hedge orders when the wizard
+  // hasn't been run for the pair's Exness account — CTO-confirmed hard
+  // block (no silent degrade to single-leg). See plan §2.5 / D-4.A.5-2.
   const placeDisabled =
     submitting ||
     !selectedPairId ||
     !selectedSymbol ||
     !volumeReady ||
     effectiveVolumeLots === null ||
-    !hasOnlineFtmoAccount
+    !hasOnlineFtmoAccount ||
+    isWizardNotRun
+
+  const wizardBlockMessage = isWizardNotRun
+    ? `Hedge leg blocked — Exness wizard not run for account ${pairExnessAccountId}. Open Settings → Accounts → Map Symbols.`
+    : null
 
   const sideClasses =
     side === 'buy'
@@ -279,6 +341,16 @@ export function HedgeOrderForm() {
   return (
     <div className="h-full bg-white border border-gray-200 rounded p-4 flex flex-col gap-3 overflow-y-auto">
       <h2 className="text-sm font-semibold text-gray-700">New Order</h2>
+
+      {wizardBlockMessage && (
+        <div
+          data-testid="wizard-not-run-banner"
+          className="border border-amber-300 bg-amber-50 text-amber-900 text-xs rounded px-3 py-2"
+          role="alert"
+        >
+          ⚠ {wizardBlockMessage}
+        </div>
+      )}
 
       <PairPicker />
 
@@ -340,9 +412,10 @@ export function HedgeOrderForm() {
 
       <button
         type="button"
+        data-testid="place-order-button"
         onClick={handleSubmit}
         disabled={placeDisabled}
-        title={ftmoBlockMessage ?? ''}
+        title={ftmoBlockMessage ?? wizardBlockMessage ?? ''}
         className={`w-full py-2 rounded text-sm font-bold text-white transition-colors disabled:cursor-not-allowed ${sideClasses}`}
       >
         {submitting
