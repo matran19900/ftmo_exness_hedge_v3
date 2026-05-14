@@ -26,6 +26,12 @@ class Settings(BaseSettings):
 
     redis_url: str
     symbol_mapping_path: str = "/workspaces/ftmo_exness_hedge_v3/server/data/ftmo_whitelist.json"
+    # Phase 4.A.2: per-Exness-account mapping cache files live under this
+    # directory. One file per signature; see docs/phase-4-symbol-mapping-design.md
+    # §2.2 for layout and §8 for the atomic write contract.
+    symbol_mapping_cache_dir: str = (
+        "/workspaces/ftmo_exness_hedge_v3/server/data/symbol_mapping_cache"
+    )
     # NoDecode disables pydantic-settings' eager JSON parse for this list field
     # so the validator below can accept either CSV or JSON-list strings from env.
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:5173"]
