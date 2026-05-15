@@ -13,6 +13,7 @@ were left untouched (CTO requirement: append-only).
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import Any, Literal, TypedDict, cast
@@ -23,7 +24,10 @@ from redis.commands.core import AsyncScript
 from redis.exceptions import ResponseError
 
 from app.redis_client import get_redis
+from app.services.mapping_cache_repository import MappingCacheRepository
 from app.services.redis_service_lua import UPDATE_ORDER_LUA
+
+logger = logging.getLogger(__name__)
 
 Broker = Literal["ftmo", "exness"]
 StreamKind = Literal["cmd_stream", "resp_stream", "event_stream"]
@@ -154,7 +158,11 @@ def _validate_account_id(account_id: str) -> None:
 class RedisService:
     """Thin async wrapper that owns a single Redis pool reference."""
 
-    def __init__(self, redis: redis_asyncio.Redis) -> None:
+    def __init__(
+        self,
+        redis: redis_asyncio.Redis,
+        mapping_cache_repository: MappingCacheRepository | None = None,
+    ) -> None:
         self._redis = redis
         # Pre-register the order-update Lua script. ``register_script`` is
         # synchronous and just builds a Script wrapper that lazily uploads on
@@ -162,6 +170,26 @@ class RedisService:
         # this in __init__ keeps the per-call path on the hot trading flow
         # free of branching/lazy init.
         self._update_order_script: AsyncScript = redis.register_script(UPDATE_ORDER_LUA)
+        # Step 4.5a: repository ref used by ``remove_account`` for on-disk
+        # cache file cleanup when an Exness account is the sole user of a
+        # signature. Optional because the lifespan constructs ``RedisService``
+        # before the repository exists (consumer-group setup must run first);
+        # ``attach_mapping_cache_repository`` is called once the repo lands.
+        # FTMO removal does NOT touch the mapping cache; this stays None for
+        # FTMO-only unit tests.
+        self._mapping_cache_repository = mapping_cache_repository
+
+    def attach_mapping_cache_repository(
+        self, repository: MappingCacheRepository
+    ) -> None:
+        """Late-bind the mapping cache repository (step 4.5a).
+
+        Lifespan calls this after ``MappingCacheRepository`` is constructed.
+        Without it, ``remove_account`` still cleans the Redis-side mapping
+        keys but skips the on-disk file unlink — fine for unit tests that
+        don't seed file artefacts.
+        """
+        self._mapping_cache_repository = repository
 
     # ----- cTrader market-data credentials -----
 
@@ -851,15 +879,129 @@ class RedisService:
         ``account:*`` (balance/equity), and ``client:*`` (heartbeat).
         Does NOT touch ``order:*`` rows that reference this account —
         history is preserved; out of scope here.
+
+        Step 4.5a — Exness path also clears every mapping artefact tied to
+        the account so a re-added ``account_id`` cannot inherit a stale
+        ``mapping_status="active"`` against a broker with different
+        contract specs. Cleanup includes:
+
+          - ``mapping_status:{account_id}`` (status snapshot)
+          - ``account_to_mapping:{account_id}`` (signature pointer)
+          - ``exness_raw_symbols:{account_id}`` (ephemeral raw snapshot)
+          - ``mapping_cache:{sig}`` HASH — account removed from
+            ``used_by_accounts``; HASH deleted when the list empties
+          - on-disk ``{creator}_{signature}.json`` — deleted when the
+            HASH is deleted (sole-user case)
+
+        The on-disk unlink only fires when ``attach_mapping_cache_repository``
+        has been called (always true under the FastAPI lifespan; tests opt
+        in via the same setter). FTMO path is unchanged.
         """
         _validate_broker(broker)
         _validate_account_id(account_id)
+
+        if broker == "exness":
+            # Capture the signature pointer BEFORE the pipeline DELs remove it.
+            sig_raw = await self._redis.get(f"account_to_mapping:{account_id}")
+            signature: str | None
+            if sig_raw is None:
+                signature = None
+            elif isinstance(sig_raw, bytes):
+                signature = sig_raw.decode()
+            else:
+                signature = str(sig_raw)
+
+            pipe = self._redis.pipeline()
+            pipe.srem(f"accounts:{broker}", account_id)
+            pipe.delete(f"account_meta:{broker}:{account_id}")
+            pipe.delete(f"account:{broker}:{account_id}")
+            pipe.delete(f"client:{broker}:{account_id}")
+            pipe.delete(f"mapping_status:{account_id}")
+            pipe.delete(f"account_to_mapping:{account_id}")
+            pipe.delete(f"exness_raw_symbols:{account_id}")
+            await pipe.execute()
+
+            if signature:
+                await self._cleanup_mapping_cache_for_account(signature, account_id)
+            return
+
         pipe = self._redis.pipeline()
         pipe.srem(f"accounts:{broker}", account_id)
         pipe.delete(f"account_meta:{broker}:{account_id}")
         pipe.delete(f"account:{broker}:{account_id}")
         pipe.delete(f"client:{broker}:{account_id}")
         await pipe.execute()
+
+    async def _cleanup_mapping_cache_for_account(
+        self, signature: str, account_id: str
+    ) -> None:
+        """Remove ``account_id`` from a mapping cache's reverse index (4.5a).
+
+        Behaviour:
+          - HASH ``mapping_cache:{signature}`` absent → legacy orphan. Try
+            the on-disk delete (idempotent) and return.
+          - ``used_by_accounts`` after removal is empty → DEL the HASH and
+            the on-disk file (sole-user case).
+          - ``used_by_accounts`` still has other users → HSET the trimmed
+            JSON list back on the HASH AND rewrite the on-disk file so the
+            two views stay in sync.
+
+        Single-server Phase 4 assumption (no concurrent removals on the
+        same account); Phase 5 multi-server would need WATCH/MULTI here.
+        """
+        cache_key = f"mapping_cache:{signature}"
+        used_raw = await self._redis.hget(cache_key, "used_by_accounts")  # type: ignore[misc]
+
+        if used_raw is None:
+            # Legacy state: pointer existed but the HASH never did (or was
+            # already deleted). Still try the file unlink so a stale
+            # ``{creator}_{sig}.json`` doesn't survive.
+            if self._mapping_cache_repository is not None:
+                await self._mapping_cache_repository.delete(signature)
+            return
+
+        used_text = used_raw.decode() if isinstance(used_raw, bytes) else str(used_raw)
+        try:
+            users = json.loads(used_text)
+        except json.JSONDecodeError:
+            logger.warning(
+                "mapping_cache.used_by_accounts_corrupt signature=%s value=%r",
+                signature,
+                used_text,
+            )
+            users = []
+        if not isinstance(users, list):
+            users = []
+
+        remaining = [u for u in users if u != account_id]
+
+        if not remaining:
+            await self._redis.delete(cache_key)
+            if self._mapping_cache_repository is not None:
+                await self._mapping_cache_repository.delete(signature)
+            logger.info(
+                "remove_account.mapping_cache_sole_user_deleted "
+                "account_id=%s signature=%s",
+                account_id,
+                signature,
+            )
+            return
+
+        await self._redis.hset(  # type: ignore[misc]
+            cache_key, "used_by_accounts", json.dumps(remaining)
+        )
+        if self._mapping_cache_repository is not None:
+            cache = await self._mapping_cache_repository.read(signature)
+            if cache is not None:
+                cache.used_by_accounts = remaining
+                await self._mapping_cache_repository.write(cache)
+        logger.info(
+            "remove_account.mapping_cache_shared_updated "
+            "account_id=%s signature=%s remaining=%d",
+            account_id,
+            signature,
+            len(remaining),
+        )
 
     async def get_all_account_ids(self, broker: str) -> list[str]:
         """Return all account_ids for a broker, sorted asc.

@@ -49,11 +49,16 @@ async def _init_mapping_statuses(redis_client: Any) -> int:
     ``mapping_status:{account_id}`` Redis key.
 
     For each member of ``accounts:exness``:
-      - If a key already exists, leave it alone (covers the wizard-active
-        state that ``populate_redis_from_disk`` set up moments ago).
-      - Else, set ``active`` if ``account_to_mapping:{acc}`` resolves to
-        a known cache file, otherwise ``pending_mapping`` so the
-        AccountsTab UI surfaces the "Map Symbols" CTA on first paint.
+      - Status key already present: leave it alone (covers the
+        wizard-active state that ``populate_redis_from_disk`` set up moments
+        ago).
+      - Status key absent BUT ``account_to_mapping:{acc}`` pointer present:
+        treat as a legacy orphan from a pre-4.5a server run where
+        ``remove_account`` leaked the pointer. Delete the pointer + set
+        ``pending_mapping`` so a re-added ``account_id`` re-enters the
+        wizard from scratch instead of silently inheriting "active" against
+        a possibly-stale cache (the under-hedge bug from verify-mapping-status-leak.md).
+      - Status key absent AND no pointer: fresh account → ``pending_mapping``.
 
     Returns the number of newly-initialised keys (purely diagnostic).
     """
@@ -61,12 +66,29 @@ async def _init_mapping_statuses(redis_client: Any) -> int:
     initialized = 0
     for member in members or set():
         acc = member.decode() if isinstance(member, bytes) else str(member)
-        key = f"mapping_status:{acc}"
-        if await redis_client.exists(key):
+        status_key = f"mapping_status:{acc}"
+        pointer_key = f"account_to_mapping:{acc}"
+
+        if await redis_client.exists(status_key):
             continue
-        sig = await redis_client.get(f"account_to_mapping:{acc}")
-        status = "active" if sig else "pending_mapping"
-        await redis_client.set(key, status)
+
+        has_pointer = await redis_client.exists(pointer_key)
+        if has_pointer:
+            # Defensive: pre-4.5a ``remove_account`` left the pointer
+            # behind. Drop it + force re-mapping rather than honour the
+            # ghost signature.
+            await redis_client.delete(pointer_key)
+            await redis_client.set(status_key, "pending_mapping")
+            logger.warning(
+                "init_mapping_statuses.orphan_pointer_detected account_id=%s "
+                "deleted_pointer=true set_status=pending_mapping",
+                acc,
+            )
+            initialized += 1
+            continue
+
+        # Fresh account, no leak.
+        await redis_client.set(status_key, "pending_mapping")
         initialized += 1
     return initialized
 
@@ -148,6 +170,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "mapping_cache_repository.loaded cache_count=%d", len(loaded_caches)
     )
     app.state.mapping_cache_repository = mapping_cache_repository
+    # Step 4.5a: late-bind the repository so ``remove_account`` (Exness
+    # path) can unlink the on-disk cache file when removing the sole
+    # user of a signature.
+    redis_svc.attach_mapping_cache_repository(mapping_cache_repository)
 
     # Phase 4.A.3: AutoMatchEngine — pure logic layer, no Redis. Hints
     # config bootstrapped from the 14 archived manual entries (D-SM-12 +

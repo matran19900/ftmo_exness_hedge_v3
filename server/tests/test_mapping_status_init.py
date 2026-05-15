@@ -37,30 +37,44 @@ async def test_existing_status_left_alone(
 
 
 @pytest.mark.asyncio
-async def test_account_pointing_at_cache_gets_active(
+async def test_account_pointing_at_cache_treated_as_orphan(
     fake_redis: fakeredis.aioredis.FakeRedis,
 ) -> None:
+    """Step 4.5a (D-4.5a-1): a pointer with no status key is a legacy
+    leak from pre-4.5a ``remove_account``, not a successful wizard
+    state. The pre-4.5a fallback would have set ``mapping_status="active"``;
+    that produced the under-hedge bug documented in
+    verify-mapping-status-leak.md. The new branch deletes the pointer
+    and forces ``pending_mapping`` so a re-added account_id has to run
+    the wizard again."""
     await fake_redis.sadd("accounts:exness", "exness_001")
     await fake_redis.set("account_to_mapping:exness_001", "sig-abc")
     count = await _init_mapping_statuses(fake_redis)
     assert count == 1
-    assert await fake_redis.get("mapping_status:exness_001") == "active"
+    assert await fake_redis.get("mapping_status:exness_001") == "pending_mapping"
+    assert await fake_redis.get("account_to_mapping:exness_001") is None
 
 
 @pytest.mark.asyncio
 async def test_multiple_accounts_mixed_state(
     fake_redis: fakeredis.aioredis.FakeRedis,
 ) -> None:
+    """Step 4.5a (D-4.5a-1): exness_003 has a pointer but no status — the
+    orphan branch fires (per ``test_account_pointing_at_cache_treated_as_orphan``)
+    and ``mapping_status`` becomes ``pending_mapping`` rather than the
+    pre-4.5a ``active`` fallback."""
     await fake_redis.sadd("accounts:exness", "exness_001", "exness_002", "exness_003")
     # exness_002 already has a status — must be preserved
     await fake_redis.set("mapping_status:exness_002", "active")
-    # exness_003 has a cache pointer — should be initialised as active
+    # exness_003 has a cache pointer but no status — orphan from a
+    # pre-4.5a remove that leaked the pointer.
     await fake_redis.set("account_to_mapping:exness_003", "sig-xyz")
 
     count = await _init_mapping_statuses(fake_redis)
 
-    # exness_001 (fresh) + exness_003 (cache-pointer) → 2 inits
+    # exness_001 (fresh) + exness_003 (orphan recovered) → 2 inits
     assert count == 2
     assert await fake_redis.get("mapping_status:exness_001") == "pending_mapping"
     assert await fake_redis.get("mapping_status:exness_002") == "active"
-    assert await fake_redis.get("mapping_status:exness_003") == "active"
+    assert await fake_redis.get("mapping_status:exness_003") == "pending_mapping"
+    assert await fake_redis.get("account_to_mapping:exness_003") is None

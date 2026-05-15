@@ -160,6 +160,43 @@ class MappingCacheRepository:
                 return True
         return False
 
+    async def delete(self, signature: str) -> bool:
+        """Delete the cache file for ``signature`` if present.
+
+        Idempotent: returns ``False`` when no matching file exists or the
+        unlink races with another deleter. Used by step 4.5a's
+        ``remove_account`` cleanup to drop the on-disk artefact when the
+        last account referencing a signature is removed. Acquires the
+        per-signature lock so a concurrent ``write`` cannot resurrect a
+        half-deleted file.
+        """
+        suffix = f"_{signature}.json"
+        lock = self._lock_for(signature)
+        async with lock:
+            for filepath in self._cache_dir.glob("*.json"):
+                if filepath.name.endswith(suffix):
+                    try:
+                        filepath.unlink(missing_ok=True)
+                        logger.info(
+                            "mapping_cache.deleted",
+                            extra={
+                                "signature": signature,
+                                "filename": filepath.name,
+                            },
+                        )
+                        return True
+                    except OSError as exc:
+                        logger.error(
+                            "mapping_cache.delete_failed",
+                            extra={
+                                "signature": signature,
+                                "filename": filepath.name,
+                                "error": str(exc),
+                            },
+                        )
+                        return False
+            return False
+
     async def list_all(self) -> list[SymbolMappingCacheFile]:
         """Load and validate all cache files. Used at server startup.
 
