@@ -213,7 +213,18 @@ class ActionHandler:
                 "deviation": 20,
                 "magic": magic,
                 "type_filling": filling_mode,
-                "comment": f"hedge:{request_id}"[:31],
+                # Step 4.8b — MT5 Python SDK's actual comment-field limit
+                # is 29 user-visible chars (official docs claim 31; the
+                # real validator rejects 30+ with silent ``None`` +
+                # ``last_error == (-2, 'Invalid "comment" argument')``).
+                # Discovery: CEO REPL verification 2026-05-15 — comment
+                # of length 29 fills, 30 returns None, 31 returns None.
+                # Prefix renamed ``hedge:`` -> ``v3:`` to avoid leaking
+                # the hedging-strategy keyword into the broker server-
+                # side audit trail (prop firms may flag/ban detected
+                # hedging on a single account). 3 (``v3:``) + up to 26
+                # (request_id) = 29 max → safe.
+                "comment": f"v3:{request_id}"[:29],
             }
             try:
                 result = await _to_thread(self._mt5.order_send, request)
@@ -229,6 +240,20 @@ class ActionHandler:
                 return
 
             if result is None:
+                # Step 4.8b — capture MT5 SDK ``last_error`` so silent
+                # validation rejections surface in operator-visible logs
+                # + the published response. The (-2, 'Invalid "comment"
+                # argument') tuple was the actual D-SMOKE-2 root cause;
+                # 4.8a's filling-mode work was correct defence-in-depth
+                # but addressed the wrong symptom. Without this capture
+                # any future similar silent-None bug would also masquerade
+                # as a generic ``order_send_returned_none``.
+                last_err = await _to_thread(self._mt5.last_error)
+                logger.warning(
+                    "open.order_send_none request_id=%s attempt=%d "
+                    "last_error=%s",
+                    request_id, attempt, last_err,
+                )
                 # Step 4.8a — Exness Cent (and similar quirky brokers)
                 # silently reject unsupported filling with ``None``
                 # instead of retcode ``TRADE_RETCODE_UNSUPPORTED_FILLING``
@@ -242,11 +267,16 @@ class ActionHandler:
                         request_id, filling_modes[attempt + 1],
                     )
                     continue
+                # Surface the captured MT5 last_error in the response so
+                # the operator sees the real reason (e.g. invalid comment)
+                # instead of the opaque slug. ``reason`` stays the same
+                # for retcode_mapping consistency.
                 await self._publish_response(
                     request_id=request_id,
                     action="open",
                     status="error",
                     reason="order_send_returned_none",
+                    error_msg=f"order_send_returned_none last_error={last_err}",
                     cascade_trigger=cascade_trigger,
                 )
                 return

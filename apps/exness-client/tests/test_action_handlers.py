@@ -7,6 +7,7 @@ the contract the server's response handler (step 4.7) consumes.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import fakeredis.aioredis
@@ -954,3 +955,245 @@ async def test_open_unsupported_filling_retcode_still_advances_loop(
     assert sent[1]["type_filling"] == mt5_stub.ORDER_FILLING_FOK
     payload = await _read_one_response(fake_redis)
     assert payload["status"] == "filled"
+
+
+# ---------------------------------------------------------------------------
+# Step 4.8b — comment field 29-char limit + neutral prefix + last_error capture
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_open_comment_prefix_is_v3_not_hedge(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Step 4.8b — comment prefix must be ``v3:``, not the legacy
+    ``hedge:`` which leaks the hedging strategy keyword into the
+    broker's server-side audit trail (prop firms may flag detected
+    hedging). Operational discovery from CEO smoke 2026-05-15."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(symbol_info={"EURUSDm": sym})
+    await handler.dispatch(
+        {
+            "request_id": "abc123",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"][0]
+    assert sent["comment"].startswith("v3:")
+    assert "hedge" not in sent["comment"].lower()
+
+
+@pytest.mark.asyncio
+async def test_open_comment_length_capped_at_29(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Step 4.8b — MT5 Python SDK silently rejects comments of 30+
+    chars with ``last_error=(-2, 'Invalid "comment" argument')``.
+    The handler must truncate to ``[:29]`` so a 32-char uuid hex
+    request_id can't poison the request. Verified by CEO REPL
+    2026-05-15."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(symbol_info={"EURUSDm": sym})
+    long_request_id = "abc123def456abc123def456abc123ab"  # 32 chars
+    assert len(long_request_id) == 32
+    await handler.dispatch(
+        {
+            "request_id": long_request_id,
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"][0]
+    comment = sent["comment"]
+    assert len(comment) <= 29
+    assert len(comment) == 29  # worst case fully populated
+
+
+@pytest.mark.asyncio
+async def test_open_comment_short_request_id_under_29_chars_no_truncation(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Short request_ids produce comments shorter than 29 chars with
+    no truncation artefacts."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(symbol_info={"EURUSDm": sym})
+    await handler.dispatch(
+        {
+            "request_id": "shortid10",  # 9 chars
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"][0]
+    assert sent["comment"] == "v3:shortid10"
+    assert len(sent["comment"]) == 12
+
+
+@pytest.mark.asyncio
+async def test_open_full_comment_assembly_matches_expected_format(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Lock the comment-assembly contract: ``v3:`` + first 26 chars of
+    request_id == 29 chars total."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(symbol_info={"EURUSDm": sym})
+    request_id = "abc123def456abc123def456abc123ab"  # 32-char hex
+    await handler.dispatch(
+        {
+            "request_id": request_id,
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"][0]
+    # 3 chars prefix + 26 chars request_id slice = 29 total.
+    expected = "v3:" + request_id[:26]
+    assert sent["comment"] == expected
+    assert len(sent["comment"]) == 29
+
+
+@pytest.mark.asyncio
+async def test_open_audit_no_hedge_keyword_in_request_dict(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Regression defence: ``hedge`` must not appear anywhere in the
+    request dict shipped to ``mt5.order_send``. Stringify the whole
+    dict and assert the substring is absent."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(symbol_info={"EURUSDm": sym})
+    await handler.dispatch(
+        {
+            "request_id": "r_audit",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"][0]
+    serialized = " ".join(str(v) for v in sent.values()).lower()
+    assert "hedge" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_open_last_error_captured_on_none_return(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Step 4.8b core fix verification: when ``order_send`` returns
+    ``None``, the handler captures ``mt5.last_error()`` and surfaces
+    the tuple in both a WARNING log row AND the published response's
+    ``error_msg`` field. Pre-4.8b operators saw only the opaque
+    ``order_send_returned_none`` slug."""
+    sym = _stub_symbol(filling_mode=mt5_stub.SYMBOL_FILLING_FOK)  # single mode -> no retry
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        order_send_response=[None],
+        last_error=(-2, 'Invalid "comment" argument'),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="exness_client.action_handlers"):
+        await handler.dispatch(
+            {
+                "request_id": "r_last_err",
+                "action": "open",
+                "symbol": "EURUSDm",
+                "side": "buy",
+                "volume": "0.10",
+            }
+        )
+    payload = await _read_one_response(fake_redis)
+    assert payload["status"] == "error"
+    assert payload["reason"] == "order_send_returned_none"
+    # The captured last_error tuple appears verbatim in error_msg.
+    assert "Invalid" in payload["error_msg"]
+    assert "-2" in payload["error_msg"]
+    # And the WARNING log carried the same.
+    warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("Invalid" in msg for msg in warn_msgs)
+
+
+@pytest.mark.asyncio
+async def test_open_last_error_captured_on_silent_none_retry_advance(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the first attempt returns None but the second succeeds,
+    the WARNING log fires once (for attempt 0) and the published
+    response is ``status=filled`` (no error)."""
+    sym = _stub_symbol(filling_mode=3)
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        order_send_response=[
+            None,
+            _send_result(retcode=mt5_stub.TRADE_RETCODE_DONE),
+        ],
+        last_error=(-2, 'Invalid "comment" argument'),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="exness_client.action_handlers"):
+        await handler.dispatch(
+            {
+                "request_id": "r_retry",
+                "action": "open",
+                "symbol": "EURUSDm",
+                "side": "buy",
+                "volume": "0.10",
+            }
+        )
+    payload = await _read_one_response(fake_redis)
+    assert payload["status"] == "filled"
+    # Exactly one None-attempt's worth of WARNING for the retry advance.
+    none_warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "order_send_none" in r.getMessage()
+    ]
+    assert len(none_warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_open_last_error_not_queried_when_send_succeeds(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Performance preservation: on the happy path (no None return) the
+    handler does not waste an MT5 round-trip on ``last_error``. The stub
+    cannot observe negative space directly, so we use absence of the
+    ``open.order_send_none`` WARNING as a sufficient proxy."""
+
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        order_send_response=[_send_result(retcode=mt5_stub.TRADE_RETCODE_DONE)],
+    )
+    with caplog.at_level(
+        logging.DEBUG, logger="exness_client.action_handlers"
+    ):
+        await handler.dispatch(
+            {
+                "request_id": "r_happy",
+                "action": "open",
+                "symbol": "EURUSDm",
+                "side": "buy",
+                "volume": "0.10",
+            }
+        )
+    for rec in caplog.records:
+        assert "order_send_none" not in rec.getMessage()
