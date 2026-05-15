@@ -43,6 +43,11 @@ import uuid
 from typing import TYPE_CHECKING, Literal
 
 from app.services.redis_service import RedisService
+from app.services.volume_service import (
+    SecondaryVolumeTooLarge,
+    SecondaryVolumeTooSmall,
+    compute_secondary_volume,
+)
 
 if TYPE_CHECKING:
     from app.services.mapping_service import MappingService
@@ -88,6 +93,19 @@ class OrderService:
     network ops in ``__init__``). Holds a reference to the per-app
     ``RedisService`` injected via the FastAPI dependency.
     """
+
+    # Step 4.7a: include Phase 4 transient + terminal states so
+    # ``list_orders(status="all")`` surfaces hedge orders mid-cascade.
+    _ALL_STATUSES: tuple[str, ...] = (
+        "pending",
+        "primary_filled",
+        "filled",
+        "closed",
+        "rejected",
+        "cancelled",
+        "secondary_failed",
+        "unknown",
+    )
 
     def __init__(self, redis_service: RedisService) -> None:
         self.redis = redis_service
@@ -293,6 +311,124 @@ class OrderService:
                     error_code="invalid_tp_direction",
                 )
 
+        # ------------------------------------------------------------------
+        # Phase 4 hedge-flow validation (step 4.7a §2.3 — only fires when
+        # the pair carries a populated ``exness_account_id``). Phase 3
+        # single-leg pairs (empty / missing) fall through unchanged.
+        #
+        # Order is fixed: account-existence -> client-online -> mapping
+        # gate -> volume preflight. The HARD-BLOCK at step 12 is the
+        # canonical D-4.A.7 enforcement; a stale or never-confirmed
+        # mapping_status MUST reject at the API boundary, never silently
+        # cascade with mis-sized secondary volume (see
+        # verify-mapping-status-leak.md for the under-hedge exploit chain
+        # the 4.5a + 4.7a pair closes).
+        # ------------------------------------------------------------------
+        is_hedge_flow = bool(exness_account_id)
+        secondary_volume_lots: float | None = None
+        exness_symbol: str = ""
+        risk_ratio: float = 1.0
+
+        if is_hedge_flow:
+            # Step 10 — Exness account exists + enabled.
+            exness_meta = await self.redis.get_account_meta(
+                "exness", exness_account_id
+            )
+            if exness_meta is None:
+                raise OrderValidationError(
+                    f"exness account not found: {exness_account_id}",
+                    http_status=400,
+                    error_code="exness_account_not_found",
+                )
+            if exness_meta.get("enabled", "true").lower() == "false":
+                raise OrderValidationError(
+                    f"exness account disabled: {exness_account_id}",
+                    http_status=400,
+                    error_code="exness_account_disabled",
+                )
+
+            # Step 11 — Exness client heartbeat online.
+            exness_client_status = await self.redis.get_client_status(
+                "exness", exness_account_id
+            )
+            if exness_client_status != "online":
+                raise OrderValidationError(
+                    f"exness client offline for account {exness_account_id}",
+                    http_status=503,
+                    error_code="exness_client_offline",
+                )
+
+            # Step 12 — mapping_status="active" HARD-BLOCK (D-4.A.7).
+            # No soft-pass. Any non-active value (pending_mapping,
+            # spec_mismatch, disconnected, missing/empty) -> 400.
+            # v1 deviation D-4.7a-2 (soft-pass for pending_mapping) was
+            # rejected — this branch enforces the prompt §2.3 contract.
+            raw_status = await self.redis._redis.get(
+                f"mapping_status:{exness_account_id}"
+            )
+            if isinstance(raw_status, bytes):
+                mapping_status_value = raw_status.decode()
+            elif raw_status is None:
+                mapping_status_value = ""
+            else:
+                mapping_status_value = str(raw_status)
+
+            if mapping_status_value != "active":
+                surfaced = mapping_status_value or "missing"
+                raise OrderValidationError(
+                    f"exness account {exness_account_id} mapping_status="
+                    f"{surfaced} (expected 'active')",
+                    http_status=400,
+                    error_code="mapping_status_inactive",
+                )
+
+            # Step 13a — resolve per-pair Exness symbol via MappingService.
+            if mapping_service is None:
+                raise OrderValidationError(
+                    "mapping_service required for hedge-flow orders",
+                    http_status=500,
+                    error_code="internal_error",
+                )
+            pair_mapping = await mapping_service.get_pair_mapping(
+                pair_id, symbol
+            )
+            if pair_mapping is None:
+                raise OrderValidationError(
+                    f"no exness symbol mapping for pair {pair_id} symbol {symbol}",
+                    http_status=400,
+                    error_code="exness_symbol_mapping_missing",
+                )
+            ftmo_sym_entry, exness_sym_entry = pair_mapping
+            exness_symbol = exness_sym_entry.exness
+
+            # Step 13b — preflight compute_secondary_volume. Bound failures
+            # (E1/E2) reject BEFORE the primary FTMO command is pushed so
+            # we never ship a half-hedge that can't be sized correctly on
+            # the secondary leg.
+            risk_ratio = float(pair.get("ratio", "1.0") or "1.0")
+            try:
+                secondary_volume_lots = compute_secondary_volume(
+                    primary_volume_lots=volume_lots,
+                    ftmo_units_per_lot=ftmo_sym_entry.ftmo_units_per_lot,
+                    exness_contract_size=exness_sym_entry.contract_size,
+                    risk_ratio=risk_ratio,
+                    exness_volume_step=exness_sym_entry.exness_volume_step,
+                    exness_volume_min=exness_sym_entry.exness_volume_min,
+                    exness_volume_max=exness_sym_entry.exness_volume_max,
+                )
+            except SecondaryVolumeTooSmall as exc:
+                raise OrderValidationError(
+                    str(exc),
+                    http_status=400,
+                    error_code="secondary_volume_too_small",
+                ) from exc
+            except SecondaryVolumeTooLarge as exc:
+                raise OrderValidationError(
+                    str(exc),
+                    http_status=400,
+                    error_code="secondary_volume_too_large",
+                ) from exc
+
         # All validation passed. Mint identifiers + persist.
         order_id = f"ord_{uuid.uuid4().hex[:8]}"
         now_ms = int(time.time() * 1000)
@@ -320,10 +456,12 @@ class OrderService:
 
         # Order hash. Field names + leg-prefix convention follow
         # ``RedisService.OrderHash`` (docs/06-data-models.md §7).
-        # ``p_volume_lots`` mirrors the per-leg pattern even though
-        # Phase 3 only fills the primary (FTMO) side; ``s_status``
-        # is ``pending_phase_4`` so the response_handler in step 3.7
-        # leaves the secondary leg alone.
+        # Phase 3 single-leg: ``s_status="pending_phase_4"`` so the
+        # response_handler leaves the secondary leg alone.
+        # Phase 4 hedge-flow (step 4.7a): ``s_status="pending"`` plus the
+        # computed secondary volume, mapped Exness symbol, and risk ratio
+        # so the response_handler can dispatch the cascade open without a
+        # second mapping_service round-trip.
         order_fields: dict[str, str] = {
             "order_id": order_id,
             "pair_id": pair_id,
@@ -338,11 +476,17 @@ class OrderService:
             "status": "pending",
             "p_status": "pending",
             "p_volume_lots": str(volume_lots),
-            "s_status": "pending_phase_4",
-            "s_volume_lots": "",
             "created_at": str(now_ms),
             "updated_at": str(now_ms),
         }
+        if is_hedge_flow and secondary_volume_lots is not None:
+            order_fields["s_status"] = "pending"
+            order_fields["s_volume_lots"] = str(secondary_volume_lots)
+            order_fields["s_exness_symbol"] = exness_symbol
+            order_fields["s_risk_ratio"] = str(risk_ratio)
+        else:
+            order_fields["s_status"] = "pending_phase_4"
+            order_fields["s_volume_lots"] = ""
         await self.redis.create_order(order_id, order_fields)
 
         # Push the open command to the FTMO leg. ``push_command``
@@ -379,18 +523,6 @@ class OrderService:
         return order_id, request_id
 
     # ---------- Step 3.9 read endpoints ----------
-
-    # Status sets maintained by ``RedisService.create_order`` +
-    # ``update_order`` Lua. ``"all"`` is a synthetic alias the API
-    # exposes for convenience; we union the underlying sets.
-    _ALL_STATUSES: tuple[str, ...] = (
-        "pending",
-        "filled",
-        "closed",
-        "rejected",
-        "cancelled",
-        "unknown",
-    )
 
     async def list_orders(
         self,

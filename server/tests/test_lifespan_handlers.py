@@ -49,8 +49,12 @@ async def test_lifespan_starts_handler_tasks_per_account(
 
     captured: list[str] = []
 
-    async def fake_response_loop(_svc: Any, _bcast: Any, account_id: str) -> None:
-        captured.append(f"resp:{account_id}")
+    async def fake_response_loop(
+        _svc: Any, _bcast: Any, account_id: str, **_kwargs: Any
+    ) -> None:
+        # Step 4.7a: lifespan now passes broker= + hedge_service= kwargs.
+        broker = _kwargs.get("broker", "ftmo")
+        captured.append(f"resp:{broker}:{account_id}")
         await asyncio.Event().wait()  # block until cancelled
 
     async def fake_event_loop(_svc: Any, _bcast: Any, account_id: str) -> None:
@@ -71,8 +75,8 @@ async def test_lifespan_starts_handler_tasks_per_account(
     assert sorted(captured) == [
         "event:ftmo_001",
         "event:ftmo_002",
-        "resp:ftmo_001",
-        "resp:ftmo_002",
+        "resp:ftmo:ftmo_001",
+        "resp:ftmo:ftmo_002",
     ]
 
 
@@ -98,7 +102,7 @@ async def test_lifespan_handles_empty_account_list_gracefully(
 
     started = 0
 
-    async def fake_loop(*_args: Any) -> None:
+    async def fake_loop(*_args: Any, **_kwargs: Any) -> None:
         nonlocal started
         started += 1
         await asyncio.Event().wait()
@@ -113,6 +117,7 @@ async def test_lifespan_handles_empty_account_list_gracefully(
     # State attributes still set (empty lists).
     assert app.state.response_tasks == []
     assert app.state.event_tasks == []
+    assert app.state.exness_response_tasks == []
 
 
 @pytest.mark.asyncio
@@ -141,7 +146,7 @@ async def test_lifespan_cancels_tasks_on_shutdown(
     cancelled = 0
     started = 0
 
-    async def fake_loop_track(*_args: Any) -> None:
+    async def fake_loop_track(*_args: Any, **_kwargs: Any) -> None:
         nonlocal started
         started += 1
         try:
@@ -190,7 +195,7 @@ async def test_lifespan_task_names_include_account_id(
     svc = RedisService(fake_redis)
     await svc.add_account("ftmo", "ftmo_001", name="t")
 
-    async def fake_loop(*_args: Any) -> None:
+    async def fake_loop(*_args: Any, **_kwargs: Any) -> None:
         await asyncio.Event().wait()
 
     monkeypatch.setattr(main_module, "response_handler_loop", fake_loop)
@@ -199,7 +204,7 @@ async def test_lifespan_task_names_include_account_id(
     async with lifespan(app):
         names = {t.get_name() for t in app.state.response_tasks}
         names |= {t.get_name() for t in app.state.event_tasks}
-        assert "response_handler_ftmo_001" in names
+        assert "response_handler_ftmo_ftmo_001" in names
         assert "event_handler_ftmo_001" in names
 
 

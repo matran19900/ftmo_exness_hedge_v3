@@ -25,10 +25,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.services.broadcast import BroadcastService
 from app.services.redis_service import RedisService
+
+if TYPE_CHECKING:
+    from app.services.hedge_service import HedgeService
 
 logger = logging.getLogger(__name__)
 
@@ -49,15 +52,25 @@ async def response_handler_loop(
     broadcast: BroadcastService,
     account_id: str,
     *,
+    broker: str = "ftmo",
     block_ms: int = 1000,
     read_count: int = _READ_COUNT,
+    hedge_service: HedgeService | None = None,
 ) -> None:
-    """Run the response-consume loop for one FTMO account.
+    """Run the response-consume loop for one (broker, account) pair.
 
     The loop exits when ``asyncio.Task.cancel()`` is called on it from
     the lifespan shutdown handler. All other errors are logged and the
     loop continues — a flaky Redis or a single bad entry should not
     take down the consumer.
+
+    ``broker`` defaults to ``"ftmo"`` to preserve the Phase 3 signature.
+    Step 4.7a adds ``"exness"`` for cascade-open acks.
+
+    ``hedge_service`` is required when ``broker == "ftmo"`` to fire
+    cascade-open tasks on primary fills of hedge orders. Tests can pass
+    ``None`` and assert the non-hedge code paths; single-leg Phase 3
+    flow does not require it.
 
     ``block_ms`` is exposed so unit tests can pass a small value (or
     0) to avoid blocking. Production uses 1000 ms which is short
@@ -65,13 +78,15 @@ async def response_handler_loop(
 
     ``read_count`` is similarly tunable for tests; defaults to 10.
     """
-    stream = f"resp_stream:ftmo:{account_id}"
-    logger.info("response_handler_loop starting: stream=%s", stream)
+    stream = f"resp_stream:{broker}:{account_id}"
+    logger.info(
+        "response_handler_loop starting: broker=%s stream=%s", broker, stream
+    )
     try:
         while True:
             try:
                 entries = await redis_svc.read_responses(
-                    "ftmo", account_id, count=read_count, block_ms=block_ms
+                    broker, account_id, count=read_count, block_ms=block_ms
                 )
             except asyncio.CancelledError:
                 raise
@@ -83,7 +98,10 @@ async def response_handler_loop(
             for _stream_name, stream_entries in entries:
                 for entry_id, fields in stream_entries:
                     try:
-                        await _handle_response_entry(redis_svc, broadcast, account_id, fields)
+                        await _handle_response_entry(
+                            redis_svc, broadcast, account_id, fields,
+                            broker=broker, hedge_service=hedge_service,
+                        )
                     except Exception:
                         logger.exception(
                             "response_handler entry processing failed: entry_id=%s fields=%s",
@@ -101,7 +119,10 @@ async def response_handler_loop(
                         # so an operator can investigate.
                         logger.exception("response_handler XACK failed: entry_id=%s", entry_id)
     except asyncio.CancelledError:
-        logger.info("response_handler_loop cancelled: account_id=%s", account_id)
+        logger.info(
+            "response_handler_loop cancelled: broker=%s account_id=%s",
+            broker, account_id,
+        )
         raise
 
 
@@ -110,23 +131,28 @@ async def _handle_response_entry(
     broadcast: BroadcastService,
     account_id: str,
     fields: dict[str, str],
+    *,
+    broker: str = "ftmo",
+    hedge_service: HedgeService | None = None,
 ) -> None:
     """Route a resp_stream entry by ``action`` field.
 
-    Common shape: every entry MUST carry ``action`` + ``request_id``
-    (FTMO client guarantees this — step 3.4's ``_publish_response`` /
-    ``_publish_error`` always set both). Without ``request_id`` we
-    can't correlate back to an order row; the entry is logged and
-    silently dropped (still ACKed by caller).
+    Common shape: every entry MUST carry ``action`` + ``request_id``.
+    Without ``request_id`` we can't correlate back to an order row; the
+    entry is logged and silently dropped (still ACKed by caller).
+
+    Step 4.7a — ``broker`` parameter drives action handler selection.
+    FTMO entries get the Phase 3 handlers (with the cascade-trigger hook
+    for hedge orders). Exness entries get the new Phase 4 cascade-open
+    handler.
     """
     action = fields.get("action", "")
     request_id = fields.get("request_id", "")
 
     if not request_id:
         logger.warning(
-            "resp_stream entry missing request_id: account=%s action=%s",
-            account_id,
-            action,
+            "resp_stream entry missing request_id: broker=%s account=%s action=%s",
+            broker, account_id, action,
         )
         return
 
@@ -136,16 +162,37 @@ async def _handle_response_entry(
         # past that window simply can't be routed — the order row
         # has already been processed via reconciliation by now.
         logger.warning(
-            "resp_stream entry for unknown request_id=%s "
-            "(TTL expired? wrong account?): account=%s action=%s",
-            request_id,
-            account_id,
-            action,
+            "resp_stream entry for unknown request_id=%s broker=%s account=%s action=%s",
+            request_id, broker, account_id, action,
         )
         return
 
+    if broker == "exness":
+        if action == "open":
+            await _handle_exness_open_response(
+                redis_svc, broadcast, order_id, fields
+            )
+        elif action == "close":
+            # Cascade close handling is step 4.8 scope — for now we
+            # only log + ACK (the caller will XACK on return).
+            logger.info(
+                "exness close ack (cascade-close handling deferred to 4.8): "
+                "order_id=%s status=%s",
+                order_id, fields.get("status", ""),
+            )
+        else:
+            logger.warning(
+                "unknown action in exness resp_stream: action=%s order_id=%s",
+                action, order_id,
+            )
+        return
+
+    # FTMO broker (Phase 3 + 4.7a primary-fill cascade trigger).
     if action == "open":
-        await _handle_open_response(redis_svc, broadcast, order_id, fields)
+        await _handle_open_response(
+            redis_svc, broadcast, order_id, fields,
+            hedge_service=hedge_service,
+        )
     elif action == "close":
         await _handle_close_response(redis_svc, broadcast, order_id, fields)
     elif action == "modify_sl_tp":
@@ -164,8 +211,10 @@ async def _handle_open_response(
     broadcast: BroadcastService,
     order_id: str,
     fields: dict[str, str],
+    *,
+    hedge_service: HedgeService | None = None,
 ) -> None:
-    """Handle an ``open`` response.
+    """Handle a FTMO ``open`` response.
 
     Branches on ``status``:
       - ``"success"`` with ``fill_price`` populated → market fill;
@@ -181,8 +230,13 @@ async def _handle_open_response(
     ``sl_tp_attach_failed=true`` (market fill succeeded but the
     follow-up amend was rejected), we set ``p_sl_tp_warning=true``
     + a human-readable message so the frontend can surface a toast.
-    The position IS open at the broker — operator still needs to
-    attach SL/TP manually.
+
+    Step 4.7a — hedge-order detection: if the primary fills and the
+    order row carries ``exness_account_id``, we transition the composed
+    status to ``primary_filled`` (transient) and fire
+    ``HedgeService.cascade_secondary_open`` as a fire-and-forget
+    asyncio.Task so the reader loop is not blocked while we cascade.
+    Single-leg orders go straight to ``status=filled`` as before.
     """
     status = fields.get("status", "")
     now_ms = str(int(time.time() * 1000))
@@ -191,7 +245,22 @@ async def _handle_open_response(
         fill_price = fields.get("fill_price", "")
         broker_order_id = fields.get("broker_order_id", "")
         p_status = "filled" if fill_price else "pending"
-        order_status = "filled" if fill_price else "pending"
+
+        # Detect hedge flow from the order row. ``exness_account_id``
+        # populated -> 2-leg cascade; composed status becomes the
+        # transient ``primary_filled`` until the secondary leg lands.
+        order_row = await redis_svc.get_order(order_id)
+        is_hedge_flow = bool(
+            (order_row or {}).get("exness_account_id", "").strip()
+        )
+        # On limit/stop acceptance the broker hasn't filled yet → keep
+        # ``status="pending"`` regardless of hedge flow.
+        if not fill_price:
+            order_status = "pending"
+        elif is_hedge_flow:
+            order_status = "primary_filled"
+        else:
+            order_status = "filled"
 
         updates: dict[str, str] = {
             "p_status": p_status,
@@ -228,6 +297,28 @@ async def _handle_open_response(
                 "p_sl_tp_warning_msg": updates.get("p_sl_tp_warning_msg", ""),
             },
         )
+
+        # Phase 4 cascade: primary filled on a hedge order -> kick off
+        # the Exness leg. ``asyncio.create_task`` keeps the reader loop
+        # free; HedgeService manages its own retry budget.
+        if (
+            is_hedge_flow
+            and fill_price
+            and hedge_service is not None
+            and order_row is not None
+        ):
+            asyncio.create_task(
+                hedge_service.cascade_secondary_open(
+                    order_id, {k: str(v) for k, v in order_row.items()}
+                ),
+                name=f"cascade_secondary_open_{order_id}",
+            )
+        elif is_hedge_flow and fill_price and hedge_service is None:
+            logger.error(
+                "hedge_primary_filled.no_hedge_service order_id=%s — "
+                "cascade NOT fired; order will be stuck in primary_filled",
+                order_id,
+            )
         return
 
     if status == "error":
@@ -441,6 +532,89 @@ async def _handle_fetch_close_history_response(
                 "fetch_close_history_error_msg": fields.get("error_msg", ""),
             },
         )
+
+
+async def _handle_exness_open_response(
+    redis_svc: RedisService,
+    broadcast: BroadcastService,
+    order_id: str,
+    fields: dict[str, str],
+) -> None:
+    """Step 4.7a — handle an Exness ``open`` response.
+
+    Exness status vocab (apps/exness-client/exness_client/action_handlers.py
+    line ~22) differs from FTMO. Real values seen on cascade-open acks:
+
+      - ``"filled"``    — broker accepted + filled market order.
+      - ``"rejected"``  — pre-broker rejection (bad request, symbol not
+                          found, validation).
+      - ``"error"``     — broker-side rejection (retcode mapping).
+      - ``"requote"``   — broker counter-offer; treated as rejected for
+                          retry purposes (HedgeService re-pushes).
+
+    On filled: write secondary leg fields + transition composed status
+    ``primary_filled -> filled`` via CAS so a late-arriving exhaustion
+    failover from HedgeService can't clobber a real fill.
+
+    On rejected/error/requote: set ``s_status=rejected`` so the
+    HedgeService poller observes it and moves to the next retry.
+    ``s_error_msg`` carries the broker reason for operator-visible
+    surfacing on terminal failure.
+    """
+    status = fields.get("status", "")
+    now_ms = str(int(time.time() * 1000))
+
+    if status == "filled":
+        broker_order_id = fields.get("broker_order_id", "")
+        fill_price = fields.get("fill_price", "")
+        # ``ts_ms`` is the Exness client's response-publish wall clock;
+        # closest analogue of FTMO's ``fill_time`` available on this
+        # broker. ``filled_volume`` records the broker's actual fill
+        # (may differ from requested under partial-fill semantics —
+        # IOC + market means we expect equality).
+        await redis_svc.update_order(
+            order_id,
+            patch={
+                "s_status": "filled",
+                "s_broker_order_id": broker_order_id,
+                "s_fill_price": fill_price,
+                "s_executed_at": fields.get("ts_ms", ""),
+                "status": "filled",
+                "updated_at": now_ms,
+            },
+            old_status="primary_filled",
+        )
+        if broker_order_id:
+            await redis_svc.link_broker_order_id(
+                "s", broker_order_id, order_id
+            )
+        await broadcast.publish(
+            ORDERS_CHANNEL,
+            {
+                "type": "secondary_filled",
+                "order_id": order_id,
+                "s_broker_order_id": broker_order_id,
+                "s_fill_price": fill_price,
+            },
+        )
+        return
+
+    if status in ("rejected", "error", "requote"):
+        reason = fields.get("reason", "")
+        await redis_svc.update_order(
+            order_id,
+            patch={
+                "s_status": "rejected",
+                "s_error_msg": reason or status,
+                "updated_at": now_ms,
+            },
+        )
+        return
+
+    logger.warning(
+        "exness_open_response.unknown_status order_id=%s status=%s",
+        order_id, status,
+    )
 
 
 # Re-export for tests that want to invoke the entry-router directly

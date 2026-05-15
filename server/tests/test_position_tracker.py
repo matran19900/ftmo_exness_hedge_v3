@@ -741,10 +741,10 @@ async def test_lifespan_starts_position_tracker_per_account(
 
     started: list[str] = []
 
-    async def fake_response(*_a: Any) -> None:
+    async def fake_response(*_a: Any, **_kw: Any) -> None:
         await asyncio.Event().wait()
 
-    async def fake_event(*_a: Any) -> None:
+    async def fake_event(*_a: Any, **_kw: Any) -> None:
         await asyncio.Event().wait()
 
     async def fake_position(_svc: Any, _bcast: Any, account_id: str) -> None:
@@ -794,13 +794,13 @@ async def test_lifespan_cancels_position_tracker_on_shutdown(
     cancelled = 0
     started = 0
 
-    async def fake_noop(*_a: Any) -> None:
+    async def fake_noop(*_a: Any, **_kw: Any) -> None:
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             raise
 
-    async def fake_position(*_a: Any) -> None:
+    async def fake_position(*_a: Any, **_kw: Any) -> None:
         nonlocal started, cancelled
         started += 1
         try:

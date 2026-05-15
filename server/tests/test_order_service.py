@@ -39,9 +39,21 @@ async def _seed_pair(
     *,
     pair_id: str = "pair_001",
     ftmo_account_id: str = "ftmo_001",
-    exness_account_id: str = "exness_001",
+    exness_account_id: str = "",
     enabled: bool | None = None,
 ) -> None:
+    """Step 4.7a (§2.11): default to a Phase 3 single-leg pair
+    (``exness_account_id=""``).
+
+    Pre-4.7a this helper defaulted to ``"exness_001"`` because the
+    legacy ``is_pair_symbol_tradeable`` Phase 3 compat path soft-passed
+    pairs with an Exness account but no wizard run. The 4.7a hard-block
+    at order-time rejects those, so happy-path Phase 3 unit tests now
+    seed a true single-leg pair. Tests with explicit hedge-flow intent
+    pass ``exness_account_id="exness_001"`` and must also seed the
+    Exness account meta + heartbeat + ``mapping_status="active"`` per
+    the production prerequisite (D-4.A.7).
+    """
     fields: dict[str, str] = {
         "pair_id": pair_id,
         "name": "test-pair",
@@ -152,11 +164,14 @@ async def test_create_order_market_buy_happy_path(
     assert len(order_id) == 12  # "ord_" + 8 hex
     assert len(request_id) == 32  # uuid4 hex
 
-    # Order row exists in Redis with correct fields.
+    # Order row exists in Redis with correct fields. Step 4.7a fixture
+    # update: this is a Phase 3 single-leg happy path now (exness side
+    # cleared in ``_seed_pair`` per §2.11); hedge-flow coverage lives
+    # in test_order_service_hedge.py.
     row = await redis_client.hgetall(f"order:{order_id}")  # type: ignore[misc]
     assert row["pair_id"] == "pair_001"
     assert row["ftmo_account_id"] == "ftmo_001"
-    assert row["exness_account_id"] == "exness_001"
+    assert row["exness_account_id"] == ""
     assert row["symbol"] == "EURUSD"
     assert row["side"] == "buy"
     assert row["order_type"] == "market"
@@ -1048,18 +1063,19 @@ async def test_create_order_with_mapping_service_phase3_compat(
     redis_client: fakeredis.aioredis.FakeRedis,
     fake_redis: fakeredis.aioredis.FakeRedis,
 ) -> None:
-    """Pre-flight is wired but the wizard hasn't run for the Exness account
-    → mapping_status != active → check passes silently (Phase 3 compat,
-    D-4.A.5-2). Order goes through.
+    """Pre-flight is wired but the pair has no Exness account → single-leg
+    pair behaviour; pre-flight passes silently and the order goes through.
 
-    Note: the pre-flight queries through MappingService which is wired to
-    the autouse ``fake_redis`` (the same instance the lifespan/test app
-    state shares). The OrderService is wired to ``redis_client`` (its own
-    instance for stream/HASH writes). Both must be seeded with the pair so
-    the OrderService validation pipeline AND the pre-flight see it."""
+    Step 4.7a (§2.11): the original test exercised the Phase 3 compat
+    soft-pass at the MappingService layer (pair populated, no wizard
+    run, ``is_pair_symbol_tradeable`` returned True). The new step 12
+    hard-block at OrderService rejects that exact configuration now, so
+    this test asserts the genuinely Phase 3 single-leg pipeline runs to
+    completion. Hedge-flow coverage lives in test_order_service_hedge.py."""
     from app.main import app
 
     svc = OrderService(RedisService(fake_redis))
+    # _seed_pair defaults to exness_account_id="" — true single-leg pair.
     await _seed_happy(fake_redis)
     order_id, _ = await svc.create_order(
         pair_id="pair_001",
@@ -1080,14 +1096,28 @@ async def test_create_order_pre_flight_blocks_when_active_no_mapping(
     fake_redis: fakeredis.aioredis.FakeRedis,
 ) -> None:
     """When the wizard HAS been run (mapping_status=active) but the FTMO
-    symbol is NOT in the mapping cache, pre-flight raises with the new
-    ``symbol_not_tradeable_for_pair`` error_code."""
+    symbol is NOT in the mapping cache, pre-flight raises with the
+    ``symbol_not_tradeable_for_pair`` error_code.
+
+    Step 4.7a (§2.11): the pair is populated with ``exness_account_id``
+    AND the Exness account meta/heartbeat are seeded so the new step 10
+    + step 11 validation passes; the new step 12 also passes
+    (mapping_status="active"); but step 5b's MappingService pre-flight
+    fires first against the not-in-cache symbol and raises. This
+    preserves the original test intent under the post-4.7a hard-block.
+    """
     from app.main import app
     from app.services.order_service import OrderValidationError
 
     svc = OrderService(RedisService(fake_redis))
     await _seed_happy(fake_redis)
-    # Force the "active but symbol not mapped" branch.
+    # Hedge-flow intent: re-seed the pair with Exness account populated
+    # + seed Exness account meta + heartbeat + active mapping_status so
+    # we land in MappingService.is_pair_symbol_tradeable's enforcement
+    # branch (the only place "active but no mapping" raises).
+    await _seed_pair(fake_redis, exness_account_id="exness_001")
+    await _seed_account(fake_redis, broker="exness", account_id="exness_001")
+    await _seed_heartbeat(fake_redis, broker="exness", account_id="exness_001")
     await fake_redis.set("mapping_status:exness_001", "active")
     with pytest.raises(OrderValidationError) as exc_info:
         await svc.create_order(

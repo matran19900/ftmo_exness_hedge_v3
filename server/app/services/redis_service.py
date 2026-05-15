@@ -96,6 +96,10 @@ class OrderHash(TypedDict, total=False):
     s_close_reason: str
     s_realized_pnl: str
     s_commission: str
+    s_money_digits: str
+    # Step 4.7a — Phase 4 cascade open fields populated on hedge create.
+    s_exness_symbol: str
+    s_risk_ratio: str
     # Lifecycle
     created_at: str
     updated_at: str

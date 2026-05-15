@@ -73,12 +73,20 @@ async def _seed_order_and_link(
     p_status: str = "pending",
     extra: dict[str, str] | None = None,
 ) -> None:
-    """Create a minimal order row + request_id → order_id side index."""
+    """Create a minimal order row + request_id → order_id side index.
+
+    Step 4.7a (§2.11 fixture update): defaults to a single-leg order
+    (``exness_account_id=""``). Phase 3 tests in this file cover the
+    open / close / modify response handlers without exercising the
+    hedge cascade path; hedge-flow coverage lives in the new
+    test_hedge_cascade_open.py and test_exness_response_handler.py
+    suites where the seed is overridden with extra={"exness_account_id": ...}.
+    """
     fields: dict[str, str] = {
         "order_id": order_id,
         "pair_id": "pair_001",
         "ftmo_account_id": "ftmo_001",
-        "exness_account_id": "exness_001",
+        "exness_account_id": "",
         "symbol": "EURUSD",
         "side": "buy",
         "order_type": "market",

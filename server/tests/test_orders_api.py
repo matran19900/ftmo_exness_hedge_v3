@@ -30,16 +30,24 @@ from httpx import AsyncClient
 
 @pytest_asyncio.fixture
 async def seeded_state(fake_redis: fakeredis.aioredis.FakeRedis) -> RedisService:
-    """Seed minimum state for a valid market BUY order."""
+    """Seed minimum state for a valid market BUY order.
+
+    Step 4.7a (§2.11 fixture update): the pair carries an empty
+    ``exness_account_id`` so the Phase 3 single-leg pipeline runs
+    end-to-end without tripping the new hard-block at step 12 of
+    ``OrderService.create_order``. Hedge-flow API integration coverage
+    lives in the new test_order_service_hedge.py suite where the pair
+    is explicitly populated AND ``mapping_status="active"`` is seeded.
+    """
     rc = fake_redis
-    # Pair.
+    # Pair (Phase 3 single-leg — no Exness account).
     await rc.hset(  # type: ignore[misc]
         "pair:pair_001",
         mapping={
             "pair_id": "pair_001",
             "name": "test",
             "ftmo_account_id": "ftmo_001",
-            "exness_account_id": "exness_001",
+            "exness_account_id": "",
             "ratio": "1.0",
             "created_at": "1735000000000",
             "updated_at": "1735000000000",

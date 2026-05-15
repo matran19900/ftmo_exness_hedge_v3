@@ -33,6 +33,7 @@ from app.services.auto_match_engine import AutoMatchEngine
 from app.services.broadcast import BroadcastService
 from app.services.event_handler import event_handler_loop
 from app.services.ftmo_whitelist_service import FTMOWhitelistService
+from app.services.hedge_service import HedgeService
 from app.services.mapping_cache_repository import MappingCacheRepository
 from app.services.mapping_cache_service import MappingCacheService
 from app.services.mapping_service import MappingService
@@ -263,6 +264,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "No cTrader credentials in Redis; market-data idle. Visit /api/auth/ctrader to setup."
         )
 
+    # Step 4.7a: HedgeService is the cascade-open orchestrator. Built
+    # once and shared by every FTMO response_handler task — fires the
+    # secondary Exness leg when an FTMO hedge order's primary fills.
+    hedge_service = HedgeService(redis_svc, broadcast)
+    app.state.hedge_service = hedge_service
+    logger.info("hedge_service.initialized")
+
     # Step 3.7: per-account response + event handler tasks. We start
     # one of each per registered FTMO account so each consumer-group
     # `server` reader has a dedicated coroutine. Empty account list
@@ -275,8 +283,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     for acc in ftmo_accounts:
         response_tasks.append(
             asyncio.create_task(
-                response_handler_loop(redis_svc, broadcast, acc),
-                name=f"response_handler_{acc}",
+                response_handler_loop(
+                    redis_svc, broadcast, acc,
+                    broker="ftmo", hedge_service=hedge_service,
+                ),
+                name=f"response_handler_ftmo_{acc}",
             )
         )
         event_tasks.append(
@@ -303,6 +314,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         len(position_tracker_tasks),
     )
 
+    # Step 4.7a: per-Exness-account response_handler_loop tasks. The
+    # Exness client publishes cascade-open acks to resp_stream:exness:*;
+    # these tasks consume them and drive the order row's s_* fields.
+    exness_accounts = await redis_svc.get_all_account_ids("exness")
+    exness_response_tasks: list[asyncio.Task[None]] = []
+    for acc in exness_accounts:
+        exness_response_tasks.append(
+            asyncio.create_task(
+                response_handler_loop(
+                    redis_svc, broadcast, acc, broker="exness",
+                ),
+                name=f"response_handler_exness_{acc}",
+            )
+        )
+        logger.info(
+            "exness_response_handler_loop.started broker=exness account_id=%s",
+            acc,
+        )
+    app.state.exness_response_tasks = exness_response_tasks
+
     # Step 3.12: single global account-status broadcaster — one task
     # for all accounts (not per-account like the handler loops), since
     # each cycle re-reads the full account set from Redis and publishes
@@ -316,17 +347,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # Cancel response/event/position_tracker handlers + account
-        # status loop first so they don't try to talk to a closing
-        # Redis connection mid-flight.
+        # D-088 shutdown order: cancel ALL stream readers (FTMO + Exness)
+        # + the account-status loop BEFORE Redis closes so a mid-flight
+        # XREADGROUP / publish doesn't race the connection teardown.
         account_status_task.cancel()
-        for task in response_tasks + event_tasks + position_tracker_tasks:
+        for task in (
+            response_tasks
+            + event_tasks
+            + position_tracker_tasks
+            + exness_response_tasks
+        ):
             task.cancel()
-        if response_tasks or event_tasks or position_tracker_tasks:
+        if (
+            response_tasks
+            or event_tasks
+            or position_tracker_tasks
+            or exness_response_tasks
+        ):
             await asyncio.gather(
                 *response_tasks,
                 *event_tasks,
                 *position_tracker_tasks,
+                *exness_response_tasks,
                 return_exceptions=True,
             )
         try:
