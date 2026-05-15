@@ -252,13 +252,15 @@ async def test_exness_response_unknown_status_logs_warning(
 
 
 @pytest.mark.asyncio
-async def test_exness_close_action_logs_and_does_not_raise(
+async def test_exness_close_action_filled_stamps_s_close_fields(
     redis_svc: RedisService,
     redis_client: fakeredis.aioredis.FakeRedis,
     broadcast: _CapturingBroadcast,
 ) -> None:
-    """Cascade-close acks are deferred to step 4.8; the handler should
-    log + return without raising or mutating order state."""
+    """Step 4.8 — Exness close response handler stamps per-leg close
+    fields and broadcasts ``secondary_closed``. (Pre-4.8 the handler
+    was a log+drop placeholder; 4.8 wires the real cascade close ACK
+    path.)"""
     await _seed_primary_filled_hedge(redis_svc)
     await _handle_response_entry(
         redis_svc,
@@ -268,12 +270,19 @@ async def test_exness_close_action_logs_and_does_not_raise(
             "action": "close",
             "request_id": "req_secondary_1",
             "status": "closed",
+            "close_price": "1.08200",
+            "ts_ms": "1735000200000",
+            "reason": "request_completed",
         },
         broker="exness",
     )
     row = await redis_client.hgetall("order:ord_hedge_1")  # type: ignore[misc]
-    assert row["s_status"] == "pending_open"  # untouched
-    assert broadcast.published == []
+    assert row["s_status"] == "closed"
+    assert row["s_close_price"] == "1.08200"
+    assert row["s_closed_at"] == "1735000200000"
+    assert row["s_close_reason"] == "server_initiated"
+    types = [m.get("type") for _ch, m in broadcast.published]
+    assert "secondary_closed" in types
 
 
 @pytest.mark.asyncio

@@ -65,11 +65,17 @@ async def _seed_filled_order(
     ftmo_account_id: str = "ftmo_001",
     extra: dict[str, str] | None = None,
 ) -> None:
+    # Step 4.8 (§2.11 fixture spirit): default to a single-leg FTMO order
+    # (``exness_account_id=""``). The Phase 3 FTMO position_closed
+    # handler stamps composed ``status="closed"`` for single-leg orders;
+    # hedge orders go through cascade_close_other_leg instead. Tests
+    # exercising the legacy single-leg flow keep the default empty;
+    # hedge-flow tests override via ``extra``.
     fields: dict[str, str] = {
         "order_id": order_id,
         "pair_id": "pair_001",
         "ftmo_account_id": ftmo_account_id,
-        "exness_account_id": "exness_001",
+        "exness_account_id": "",
         "symbol": "EURUSD",
         "side": "buy",
         "order_type": "market",

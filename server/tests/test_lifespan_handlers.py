@@ -57,7 +57,10 @@ async def test_lifespan_starts_handler_tasks_per_account(
         captured.append(f"resp:{broker}:{account_id}")
         await asyncio.Event().wait()  # block until cancelled
 
-    async def fake_event_loop(_svc: Any, _bcast: Any, account_id: str) -> None:
+    async def fake_event_loop(
+        _svc: Any, _bcast: Any, account_id: str, **_kwargs: Any
+    ) -> None:
+        # Step 4.8: event_handler_loop now accepts broker/hedge_service kwargs.
         captured.append(f"event:{account_id}")
         await asyncio.Event().wait()
 

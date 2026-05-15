@@ -94,18 +94,26 @@ class OrderService:
     ``RedisService`` injected via the FastAPI dependency.
     """
 
-    # Step 4.7a: include Phase 4 transient + terminal states so
-    # ``list_orders(status="all")`` surfaces hedge orders mid-cascade.
+    # Step 4.7a + 4.8: include all Phase 4 transient + terminal states so
+    # ``list_orders(status="all")`` surfaces hedge orders at any stage.
     _ALL_STATUSES: tuple[str, ...] = (
         "pending",
-        "primary_filled",
+        "primary_filled",          # 4.7a transient (FTMO filled, awaiting cascade)
         "filled",
+        "close_pending",           # 4.8 transient (cascade close in flight)
+        "cascade_cancel_pending",  # 4.8 transient (primary closed mid-cascade-open)
         "closed",
+        "close_failed",            # 4.8 terminal (cascade close exhausted)
         "rejected",
         "cancelled",
         "secondary_failed",
         "unknown",
     )
+
+    # Step 4.8 — composed statuses that admit a new close trigger via
+    # POST /api/orders/{id}/close. Anything else (already-cascading, already
+    # terminal, never-filled) returns 400 order_not_closeable.
+    _CLOSEABLE_STATUSES: tuple[str, ...] = ("filled",)
 
     def __init__(self, redis_service: RedisService) -> None:
         self.redis = redis_service
@@ -727,6 +735,20 @@ class OrderService:
                 error_code="order_not_found",
             )
 
+        # Step 4.8 — composed status guards. Reject any non-``filled``
+        # composed state (terminal closed/close_failed/rejected/cancelled/
+        # secondary_failed, transient close_pending/cascade_cancel_pending,
+        # pre-fill pending/primary_filled). The existing Phase 3
+        # ``p_status != "filled"`` check below still fires as a defensive
+        # second pass for legacy / partial-state rows.
+        composed_status = order.get("status", "")
+        if composed_status not in self._CLOSEABLE_STATUSES:
+            raise OrderValidationError(
+                f"order not closeable: status={composed_status}",
+                http_status=400,
+                error_code="order_not_closeable",
+            )
+
         p_status = order.get("p_status", "")
         if p_status != "filled":
             raise OrderValidationError(
@@ -778,11 +800,28 @@ class OrderService:
         request_id = await self.redis.push_command("ftmo", ftmo_account_id, cmd_fields)
         await self.redis.link_request_to_order(request_id, order_id)
 
+        # Step 4.8 — Path A marker. Hedge orders write a flag on the order
+        # so ``event_handler._handle_position_closed`` can tag the
+        # cascade_lock with ``trigger_path="A"`` when the eventual
+        # ``position_closed`` event arrives. Single-leg orders skip this:
+        # no cascade fires, no audit trail needed.
+        is_hedge = bool(order.get("exness_account_id", "").strip())
+        if is_hedge:
+            await self.redis.update_order(
+                order_id,
+                {
+                    "close_trigger_initiated": "A",
+                    "close_trigger_at_ms": str(int(time.time() * 1000)),
+                },
+            )
+
         logger.info(
-            "close_order: order_id=%s broker_order_id=%s request_id=%s",
+            "close_order: order_id=%s broker_order_id=%s request_id=%s "
+            "is_hedge=%s",
             order_id,
             broker_order_id,
             request_id,
+            is_hedge,
         )
         return order_id, request_id
 

@@ -173,12 +173,8 @@ async def _handle_response_entry(
                 redis_svc, broadcast, order_id, fields
             )
         elif action == "close":
-            # Cascade close handling is step 4.8 scope — for now we
-            # only log + ACK (the caller will XACK on return).
-            logger.info(
-                "exness close ack (cascade-close handling deferred to 4.8): "
-                "order_id=%s status=%s",
-                order_id, fields.get("status", ""),
+            await _handle_exness_close_response(
+                redis_svc, broadcast, order_id, fields
             )
         else:
             logger.warning(
@@ -358,7 +354,7 @@ async def _handle_close_response(
     order_id: str,
     fields: dict[str, str],
 ) -> None:
-    """Handle a ``close`` response.
+    """Handle a FTMO ``close`` response.
 
     Success path uses ``realized_pnl`` from the FTMO client's response
     verbatim — that field is the ``deal.closePositionDetail.grossProfit``
@@ -367,36 +363,41 @@ async def _handle_close_response(
     slippage, contract-size scaling, and quote-to-deposit conversion
     internally; the broker's bookkeeping is the source of truth.
 
-    The unsolicited ``position_closed`` event that follows on the
-    event_stream carries the same ``realized_pnl`` plus the close
-    reason and the extended close-detail fields (commission, swap,
-    balance_after_close, etc.). ``event_handler`` writes those —
-    here we set only what the response gives us. If the events are
-    processed out-of-order (event before response), both writes are
-    idempotent and the final state is consistent.
+    Step 4.8 — composed status update differs by order shape:
+      - Single-leg (no ``exness_account_id``) → ``status="closed"`` (legacy
+        Phase 3 behaviour preserved).
+      - Hedge order → leave composed ``status`` alone. The cascade
+        orchestrator (event_handler -> HedgeService.cascade_close_other_leg)
+        owns the composed transition through ``close_pending`` to
+        ``closed`` / ``close_failed``. Setting ``status=closed`` here would
+        race with the cascade and short-circuit the orphan-leg cleanup.
     """
     status = fields.get("status", "")
     now_ms = str(int(time.time() * 1000))
 
     if status == "success":
-        await redis_svc.update_order(
-            order_id,
-            {
-                "p_status": "closed",
-                "status": "closed",
-                "p_close_price": fields.get("close_price", ""),
-                "p_closed_at": fields.get("close_time", ""),
-                "p_realized_pnl": fields.get("realized_pnl", ""),
-                "updated_at": now_ms,
-            },
+        order_row = await redis_svc.get_order(order_id)
+        is_hedge = bool(
+            (order_row or {}).get("exness_account_id", "").strip()
         )
+        updates: dict[str, str] = {
+            "p_status": "closed",
+            "p_close_price": fields.get("close_price", ""),
+            "p_closed_at": fields.get("close_time", ""),
+            "p_realized_pnl": fields.get("realized_pnl", ""),
+            "updated_at": now_ms,
+        }
+        if not is_hedge:
+            updates["status"] = "closed"
+        await redis_svc.update_order(order_id, updates)
         await broadcast.publish(
             ORDERS_CHANNEL,
             {
                 "type": "order_updated",
                 "order_id": order_id,
                 "p_status": "closed",
-                "status": "closed",
+                "status": updates.get("status", "")
+                or (order_row or {}).get("status", ""),
                 "p_close_price": fields.get("close_price", ""),
                 "p_realized_pnl": fields.get("realized_pnl", ""),
             },
@@ -404,6 +405,10 @@ async def _handle_close_response(
         return
 
     if status == "error":
+        # Phase 3 legacy behaviour: stamp error fields, no composed
+        # status change. The cascade orchestrator handles terminal
+        # transitions via its retry budget; a single close-cmd error
+        # is transient.
         await redis_svc.update_order(
             order_id,
             {
@@ -412,6 +417,23 @@ async def _handle_close_response(
                 "updated_at": now_ms,
             },
         )
+        # Step 4.8 — signal the HedgeService poller that this attempt
+        # failed so it can advance to the next retry. p_status flips to
+        # the transient "rejected" only for hedge orders mid-cascade
+        # (composed status == close_pending). Single-leg leaves it.
+        order_row = await redis_svc.get_order(order_id)
+        composed = (order_row or {}).get("status", "")
+        if composed == "close_pending":
+            await redis_svc.update_order(
+                order_id,
+                {
+                    "p_status": "rejected",
+                    "p_close_error_msg": fields.get(
+                        "error_msg", fields.get("error_code", "unknown")
+                    ),
+                    "updated_at": now_ms,
+                },
+            )
         await broadcast.publish(
             ORDERS_CHANNEL,
             {
@@ -613,6 +635,72 @@ async def _handle_exness_open_response(
 
     logger.warning(
         "exness_open_response.unknown_status order_id=%s status=%s",
+        order_id, status,
+    )
+
+
+async def _handle_exness_close_response(
+    redis_svc: RedisService,
+    broadcast: BroadcastService,
+    order_id: str,
+    fields: dict[str, str],
+) -> None:
+    """Step 4.8 — handle an Exness ``close`` response.
+
+    Mirror of ``_handle_exness_open_response`` for the close action.
+    Composed-status transition is owned by ``HedgeService.cascade_close_other_leg``
+    (which polls ``s_status``); this handler only stamps per-leg fields.
+
+      - ``status == "closed"`` (the Exness action handler's
+        success-on-close vocabulary; see
+        ``apps/exness-client/exness_client/action_handlers.py:339``) →
+        write ``s_status=closed`` + ``s_close_price`` +
+        ``s_closed_at=ts_ms`` + ``s_close_reason="server_initiated"``.
+        Broadcast ``secondary_closed``.
+      - ``status in ("rejected", "error", "requote")`` → write
+        ``s_status=rejected`` + ``s_close_error_msg``. The cascade
+        orchestrator's poll loop observes ``rejected`` and advances to
+        the next retry.
+    """
+    status = fields.get("status", "")
+    now_ms = str(int(time.time() * 1000))
+
+    if status == "closed":
+        await redis_svc.update_order(
+            order_id,
+            patch={
+                "s_status": "closed",
+                "s_close_price": fields.get("close_price", ""),
+                "s_closed_at": fields.get("ts_ms", ""),
+                "s_close_reason": "server_initiated",
+                "updated_at": now_ms,
+            },
+        )
+        await broadcast.publish(
+            ORDERS_CHANNEL,
+            {
+                "type": "secondary_closed",
+                "order_id": order_id,
+                "s_close_price": fields.get("close_price", ""),
+                "s_closed_at": fields.get("ts_ms", ""),
+            },
+        )
+        return
+
+    if status in ("rejected", "error", "requote"):
+        reason = fields.get("reason", "")
+        await redis_svc.update_order(
+            order_id,
+            patch={
+                "s_status": "rejected",
+                "s_close_error_msg": reason or status,
+                "updated_at": now_ms,
+            },
+        )
+        return
+
+    logger.warning(
+        "exness_close_response.unknown_status order_id=%s status=%s",
         order_id, status,
     )
 

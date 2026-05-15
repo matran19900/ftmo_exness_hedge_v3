@@ -44,6 +44,7 @@ from app.services.redis_service import RedisService
 
 if TYPE_CHECKING:
     from app.services.alert_service import AlertService
+    from app.services.hedge_service import HedgeService
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ async def event_handler_loop(
     block_ms: int = 1000,
     read_count: int = _READ_COUNT,
     alert_service: AlertService | None = None,
+    hedge_service: HedgeService | None = None,
 ) -> None:
     """Run the event-consume loop for one (broker, account) pair.
 
@@ -107,6 +109,7 @@ async def event_handler_loop(
                         await _handle_event_entry(
                             redis_svc, broadcast, account_id, fields,
                             broker=broker, alert_service=alert_service,
+                            hedge_service=hedge_service,
                         )
                     except Exception:
                         logger.exception(
@@ -135,6 +138,7 @@ async def _handle_event_entry(
     *,
     broker: str = "ftmo",
     alert_service: AlertService | None = None,
+    hedge_service: HedgeService | None = None,
 ) -> None:
     """Route an event_stream entry by ``event_type`` + ``broker``."""
     event_type = fields.get("event_type", "")
@@ -143,6 +147,7 @@ async def _handle_event_entry(
         if event_type == "position_closed_external":
             await _handle_exness_position_closed_external(
                 redis_svc, account_id, fields, alert_service,
+                hedge_service=hedge_service,
             )
         elif event_type == "position_modified":
             await _handle_exness_position_modified(
@@ -166,7 +171,10 @@ async def _handle_event_entry(
 
     # FTMO broker (Phase 3 vocabulary).
     if event_type == "position_closed":
-        await _handle_position_closed(redis_svc, broadcast, account_id, fields)
+        await _handle_position_closed(
+            redis_svc, broadcast, account_id, fields,
+            hedge_service=hedge_service,
+        )
     elif event_type == "pending_filled":
         await _handle_pending_filled(redis_svc, broadcast, account_id, fields)
     elif event_type == "position_modified":
@@ -187,6 +195,8 @@ async def _handle_position_closed(
     broadcast: BroadcastService,
     account_id: str,
     fields: dict[str, str],
+    *,
+    hedge_service: HedgeService | None = None,
 ) -> None:
     """Update order on unsolicited or reconstructed close.
 
@@ -198,6 +208,20 @@ async def _handle_position_closed(
     ``reconstructed=true`` marker (step 3.5b) is preserved on the
     order row so audit logs + UI can flag "Closed during offline
     window" rather than "Closed just now".
+
+    Step 4.8 — for hedge orders (``exness_account_id`` populated), the
+    composed status transition is NOT applied here. Instead we stamp
+    the per-leg fields and invoke
+    ``HedgeService.cascade_close_other_leg`` to drive composed status
+    through ``close_pending`` to ``closed`` / ``close_failed``. The
+    trigger_path is derived from ``close_trigger_initiated`` (Path A
+    marker written by the close endpoint) and ``close_reason`` (FTMO
+    enum sl / tp / manual / unknown):
+      - flag=="A" → trigger_path="A".
+      - close_reason in ("sl","tp") → trigger_path="D".
+      - close_reason=="manual" → trigger_path="B".
+      - close_reason=="stopout" → trigger_path="E".
+      - close_reason=="unknown" → trigger_path="B" (defensive default).
     """
     position_id = fields.get("position_id") or fields.get("broker_order_id", "")
     if not position_id:
@@ -228,10 +252,17 @@ async def _handle_position_closed(
 
     reconstructed = fields.get("reconstructed", "").lower() in ("true", "1")
     now_ms = str(int(time.time() * 1000))
+    close_reason = fields.get("close_reason", "unknown")
+
+    # Step 4.8 — hedge orders go through cascade_close_other_leg which
+    # owns the composed status transition. Stamp per-leg fields here
+    # (single-leg orders also need them), but only flip composed
+    # ``status=closed`` for single-leg orders.
+    order_row = await redis_svc.get_order(order_id)
+    is_hedge = bool((order_row or {}).get("exness_account_id", "").strip())
 
     updates: dict[str, str] = {
         "p_status": "closed",
-        "status": "closed",
         "p_close_price": fields.get("close_price", ""),
         "p_closed_at": fields.get("close_time", ""),
         # D-074: copy realized_pnl from the event verbatim; do NOT
@@ -242,9 +273,11 @@ async def _handle_position_closed(
         "p_balance_after_close": fields.get("balance_after_close", ""),
         "p_money_digits": fields.get("money_digits", ""),
         "p_closed_volume": fields.get("closed_volume", ""),
-        "p_close_reason": fields.get("close_reason", "unknown"),
+        "p_close_reason": close_reason,
         "updated_at": now_ms,
     }
+    if not is_hedge:
+        updates["status"] = "closed"
     if reconstructed:
         updates["p_reconstructed"] = "true"
 
@@ -260,10 +293,52 @@ async def _handle_position_closed(
             "close_price": fields.get("close_price", ""),
             "close_time": fields.get("close_time", ""),
             "realized_pnl": fields.get("realized_pnl", ""),
-            "close_reason": fields.get("close_reason", "unknown"),
+            "close_reason": close_reason,
             "reconstructed": reconstructed,
         },
     )
+
+    # Step 4.8 — cascade close the Exness leg for hedge orders. Trigger
+    # path classifier per docstring.
+    if is_hedge and hedge_service is not None:
+        trigger_path = _derive_cascade_trigger_path(
+            {k: str(v) for k, v in (order_row or {}).items()},
+            close_reason,
+        )
+        await hedge_service.cascade_close_other_leg(
+            order_id,
+            closed_leg="p",
+            close_reason=close_reason,
+            trigger_path=trigger_path,
+        )
+    elif is_hedge and hedge_service is None:
+        logger.error(
+            "ftmo_position_closed.no_hedge_service order_id=%s — "
+            "cascade NOT fired; Exness leg may be orphaned",
+            order_id,
+        )
+
+
+def _derive_cascade_trigger_path(
+    order_row: dict[str, str], close_reason: str
+) -> str:
+    """Step 4.8 — map the (Path A flag, FTMO close_reason) pair to the
+    cascade_lock trigger_path tag.
+
+    The flag distinguishes operator-via-API (Path A) from operator-via-
+    cTrader-UI (Path B) when both paths produce ``close_reason="manual"``
+    on the event. SL/TP hits ride the same close_reason vocabulary the
+    FTMO client publishes (``sl`` / ``tp`` / ``manual`` / ``unknown``;
+    see apps/ftmo-client/ftmo_client/event_publisher.py::_infer_close_reason).
+    """
+    if order_row.get("close_trigger_initiated") == "A":
+        return "A"
+    if close_reason in ("sl", "tp"):
+        return "D"
+    if close_reason == "stopout":
+        return "E"
+    # manual / unknown / any future slug — external bucket default.
+    return "B"
 
 
 async def _handle_pending_filled(
@@ -588,25 +663,55 @@ async def _handle_exness_position_closed_external(
     account_id: str,
     fields: dict[str, str],
     alert_service: AlertService | None,
+    *,
+    hedge_service: HedgeService | None = None,
 ) -> None:
-    """Step 4.7b — route an Exness ``position_closed_external`` event.
+    """Step 4.7b + 4.8 — route an Exness ``position_closed_external`` event.
 
     2-bucket classification (step 4.3a):
-      - ``close_reason == "server_initiated"`` → no WARNING; the
-        cascade orchestrator (step 4.8 — not in this step's scope)
-        will pick this up via its own path. Phase 4.7b: log + return.
+      - ``close_reason == "server_initiated"`` → Path C completion. The
+        Exness ticket we ourselves issued a close cmd for finally landed
+        on the broker. Step 4.8 calls ``HedgeService.complete_cascade_close``
+        to stamp the order terminal ``closed`` + release the cascade lock.
+        No WARNING fires (this is OUR cascade completing).
       - any other close_reason (``sl_hit`` / ``tp_hit`` / ``stop_out``
-        / ``manual`` / ``external``) → WARNING alert. NO cascade FTMO.
-        Operator manually decides whether to close the FTMO leg.
+        / ``manual`` / ``external``) → WARNING alert (step 4.7b). NO
+        cascade FTMO (R3 + design §1.B — secondary is passive).
     """
     ticket = fields.get("broker_position_id", "")
     close_reason = fields.get("close_reason", "external")
 
     if close_reason == "server_initiated":
-        logger.info(
-            "event.closed_external.server_initiated_passthrough "
-            "ticket=%s account=%s",
-            ticket, account_id,
+        # Path C completion. Resolve order_id from the ticket index.
+        order_id = await redis_svc.find_order_id_by_s_broker_order_id(ticket)
+        if order_id is None:
+            logger.warning(
+                "event.closed_external.server_initiated_order_not_found "
+                "ticket=%s account=%s",
+                ticket, account_id,
+            )
+            return
+        # Stamp the per-leg fields (close price / time) on the order row
+        # before invoking the cascade completion so the audit trail
+        # captures the broker-side fill data.
+        await redis_svc.update_order(
+            order_id,
+            patch={
+                "s_close_price": fields.get("close_price", ""),
+                "s_closed_at": fields.get("close_time_ms", ""),
+                "s_close_reason": "server_initiated",
+                "updated_at": str(int(time.time() * 1000)),
+            },
+        )
+        if hedge_service is None:
+            logger.error(
+                "event.closed_external.server_initiated_no_hedge_service "
+                "order_id=%s — cascade completion NOT applied",
+                order_id,
+            )
+            return
+        await hedge_service.complete_cascade_close(
+            order_id, closed_leg="s", close_reason="server_initiated",
         )
         return
 

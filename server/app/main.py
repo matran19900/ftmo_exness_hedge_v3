@@ -303,7 +303,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         event_tasks.append(
             asyncio.create_task(
-                event_handler_loop(redis_svc, broadcast, acc),
+                event_handler_loop(
+                    redis_svc, broadcast, acc,
+                    broker="ftmo", hedge_service=hedge_service,
+                ),
                 name=f"event_handler_{acc}",
             )
         )
@@ -353,7 +356,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             asyncio.create_task(
                 event_handler_loop(
                     redis_svc, broadcast, acc,
-                    broker="exness", alert_service=alert_service,
+                    broker="exness",
+                    alert_service=alert_service,
+                    hedge_service=hedge_service,
                 ),
                 name=f"event_handler_exness_{acc}",
             )

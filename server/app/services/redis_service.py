@@ -25,7 +25,7 @@ from redis.exceptions import ResponseError
 
 from app.redis_client import get_redis
 from app.services.mapping_cache_repository import MappingCacheRepository
-from app.services.redis_service_lua import UPDATE_ORDER_LUA
+from app.services.redis_service_lua import CASCADE_LOCK_LUA, UPDATE_ORDER_LUA
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,14 @@ class OrderHash(TypedDict, total=False):
     # Step 4.7a — Phase 4 cascade open fields populated on hedge create.
     s_exness_symbol: str
     s_risk_ratio: str
+    # Step 4.8 — cascade close orchestrator fields.
+    close_trigger_initiated: str   # "A" when set by POST /api/orders/{id}/close
+    close_trigger_at_ms: str
+    close_error_msg: str           # terminal error msg when status=close_failed
+    s_close_error_msg: str         # per-leg close error (Exness)
+    # NB: ``p_close_error_msg`` is declared above in the FTMO close-error
+    # block (line 123); the cascade orchestrator reuses the same field
+    # for its retry-loop signal.
     # Lifecycle
     created_at: str
     updated_at: str
@@ -174,6 +182,8 @@ class RedisService:
         # this in __init__ keeps the per-call path on the hot trading flow
         # free of branching/lazy init.
         self._update_order_script: AsyncScript = redis.register_script(UPDATE_ORDER_LUA)
+        # Step 4.8 — cascade close orchestrator single-trigger guard.
+        self._cascade_lock_script: AsyncScript = redis.register_script(CASCADE_LOCK_LUA)
         # Step 4.5a: repository ref used by ``remove_account`` for on-disk
         # cache file cleanup when an Exness account is the sole user of a
         # signature. Optional because the lifespan constructs ``RedisService``
@@ -723,6 +733,45 @@ class RedisService:
         """
         oid = await self._redis.get(f"s_broker_order_id_to_order:{broker_order_id}")
         return oid if oid else None
+
+    # ----- Cascade close orchestrator lock (step 4.8) -----
+
+    async def acquire_cascade_lock(
+        self,
+        order_id: str,
+        trigger_path: str,
+        ttl_seconds: int = 30,
+    ) -> bool:
+        """Step 4.8 — claim the per-order cascade lock atomically.
+
+        Returns ``True`` when the caller wins and may proceed with the
+        cascade orchestration, ``False`` when another trigger already
+        holds the lock (idempotent abort). ``trigger_path`` is stored as
+        the lock's value for audit (``GET cascade_lock:{order_id}`` after
+        the fact reveals which path advanced).
+
+        ``ttl_seconds`` is a safeguard: if HedgeService crashes mid-cascade
+        the lock auto-releases so a future re-trigger isn't permanently
+        starved. Callers that finish the cascade cleanly call
+        ``release_cascade_lock`` so a re-trigger doesn't have to wait the
+        TTL window.
+        """
+        result = await self._cascade_lock_script(
+            keys=[f"cascade_lock:{order_id}"],
+            args=[trigger_path, str(ttl_seconds)],
+        )
+        return int(result) == 1
+
+    async def release_cascade_lock(self, order_id: str) -> None:
+        """Release the per-order cascade lock. Idempotent: no-op if the
+        key is already gone (e.g. TTL expired)."""
+        await self._redis.delete(f"cascade_lock:{order_id}")
+
+    async def read_cascade_lock(self, order_id: str) -> str | None:
+        """Inspect which trigger_path currently holds the cascade lock.
+        ``None`` when the lock is not held. Used by tests + audit."""
+        val = await self._redis.get(f"cascade_lock:{order_id}")
+        return val if val else None
 
     async def unlink_broker_order_id(self, leg: LegPrefix, broker_order_id: str) -> None:
         """Drop the ``{leg}_broker_order_id_to_order:{id}`` side-index entry.

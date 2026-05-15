@@ -135,11 +135,13 @@ async def test_close_pending_order_returns_400(
     authed_client: AsyncClient,
     fake_redis: fakeredis.aioredis.FakeRedis,
 ) -> None:
+    """Step 4.8 — composed-status guard fires before the per-leg check;
+    error_code is the more specific ``order_not_closeable``."""
     await _seed_order(fake_redis, status="pending")
     await _seed_heartbeat(fake_redis)
     resp = await authed_client.post("/api/orders/ord_a/close")
     assert resp.status_code == 400
-    assert resp.json()["detail"]["error_code"] == "invalid_state"
+    assert resp.json()["detail"]["error_code"] == "order_not_closeable"
 
 
 @pytest.mark.asyncio

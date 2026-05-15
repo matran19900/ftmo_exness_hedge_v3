@@ -420,13 +420,17 @@ async def test_close_order_not_found_raises_404(svc: OrderService) -> None:
 
 
 @pytest.mark.asyncio
-async def test_close_order_pending_raises_invalid_state(
+async def test_close_order_pending_raises_not_closeable(
     svc: OrderService, redis_client: fakeredis.aioredis.FakeRedis
 ) -> None:
+    """Step 4.8 — composed-status guard fires before the per-leg
+    ``p_status != filled`` check. A pending order rejects with the new
+    ``order_not_closeable`` error_code (more specific than the legacy
+    ``invalid_state`` slug, per acceptance criterion §3 #35)."""
     await _seed_order(redis_client, status="pending")
     with pytest.raises(OrderValidationError) as exc_info:
         await svc.close_order("ord_a")
-    assert exc_info.value.error_code == "invalid_state"
+    assert exc_info.value.error_code == "order_not_closeable"
     assert exc_info.value.http_status == 400
 
 
