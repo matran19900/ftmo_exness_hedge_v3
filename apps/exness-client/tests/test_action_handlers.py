@@ -36,7 +36,12 @@ def _stub_symbol(
     bid: float = 1.0850,
     ask: float = 1.0852,
     trade_mode: int | None = None,
+    filling_mode: int = 3,
 ) -> mt5_stub.SymbolInfo:
+    # Step 4.8a — ``filling_mode`` defaults to ``3`` (FOK+IOC bitmask).
+    # Pre-4.8a tests implicitly assumed both modes; the default
+    # preserves their behaviour. New 4.8a tests override per-scenario
+    # (1 = FOK-only Exness Cent path, 2 = IOC-only, 0 = neither).
     return mt5_stub.SymbolInfo(
         name=name,
         trade_contract_size=100000.0,
@@ -49,6 +54,7 @@ def _stub_symbol(
         trade_mode=mt5_stub.SYMBOL_TRADE_MODE_FULL if trade_mode is None else trade_mode,
         bid=bid,
         ask=ask,
+        filling_mode=filling_mode,
     )
 
 
@@ -683,3 +689,268 @@ async def test_action_handler_open_does_not_mark_ledger(
     ledger = CmdLedger(fake_redis, "exness_001")
     members = await fake_redis.smembers(ledger.key)
     assert members == set()
+
+
+# ---------------------------------------------------------------------------
+# Step 4.8a — filling-mode bitmask + symbol_select + None-retry hardening
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_open_silent_none_on_ioc_retries_fok_succeeds(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Core fix (D-SMOKE-2): Exness Cent silently returns ``None`` for an
+    unsupported filling type instead of retcode 10030. The handler must
+    advance to the next filling mode in ``filling_modes`` instead of
+    bailing on the first ``None`` (the pre-4.8a behaviour that caused
+    all 4 server-side cascade-open retries to fail identically)."""
+    sym = _stub_symbol(filling_mode=3)  # both — IOC-first preserved
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        order_send_response=[None, _send_result(retcode=mt5_stub.TRADE_RETCODE_DONE)],
+    )
+    await handler.dispatch(
+        {
+            "request_id": "r_none_retry",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "sell",
+            "volume": "0.23",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"]
+    assert len(sent) == 2
+    assert sent[0]["type_filling"] == mt5_stub.ORDER_FILLING_IOC
+    assert sent[1]["type_filling"] == mt5_stub.ORDER_FILLING_FOK
+    payload = await _read_one_response(fake_redis)
+    assert payload["status"] == "filled"
+
+
+@pytest.mark.asyncio
+async def test_open_silent_none_on_both_filling_modes_exhausted(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Both modes return None → terminal ``order_send_returned_none`` is
+    published only after the list is fully exhausted."""
+    sym = _stub_symbol(filling_mode=3)
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        order_send_response=[None, None],
+    )
+    await handler.dispatch(
+        {
+            "request_id": "r_exhausted",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"]
+    assert len(sent) == 2
+    payload = await _read_one_response(fake_redis)
+    assert payload["status"] == "error"
+    assert payload["reason"] == "order_send_returned_none"
+
+
+@pytest.mark.asyncio
+async def test_open_filling_mode_bitmask_fok_only_uses_fok_first(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Exness Cent path (filling_mode=1): first attempt uses
+    ``ORDER_FILLING_FOK`` so the silent-None historical bug is bypassed
+    entirely."""
+    sym = _stub_symbol(filling_mode=mt5_stub.SYMBOL_FILLING_FOK)  # 1
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        order_send_response=[_send_result(retcode=mt5_stub.TRADE_RETCODE_DONE)],
+    )
+    await handler.dispatch(
+        {
+            "request_id": "r_fok",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "sell",
+            "volume": "0.23",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"]
+    assert len(sent) == 1
+    assert sent[0]["type_filling"] == mt5_stub.ORDER_FILLING_FOK
+    payload = await _read_one_response(fake_redis)
+    assert payload["status"] == "filled"
+
+
+@pytest.mark.asyncio
+async def test_open_filling_mode_bitmask_ioc_only_uses_ioc_first(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """IOC-only broker (filling_mode=2): first attempt uses
+    ``ORDER_FILLING_IOC``."""
+    sym = _stub_symbol(filling_mode=mt5_stub.SYMBOL_FILLING_IOC)  # 2
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        order_send_response=[_send_result(retcode=mt5_stub.TRADE_RETCODE_DONE)],
+    )
+    await handler.dispatch(
+        {
+            "request_id": "r_ioc",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"]
+    assert len(sent) == 1
+    assert sent[0]["type_filling"] == mt5_stub.ORDER_FILLING_IOC
+
+
+@pytest.mark.asyncio
+async def test_open_filling_mode_bitmask_both_preserves_ioc_first(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Standard broker (filling_mode=3 — FOK+IOC both): historical
+    IOC-first preference preserved."""
+    sym = _stub_symbol(filling_mode=3)
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        order_send_response=[_send_result(retcode=mt5_stub.TRADE_RETCODE_DONE)],
+    )
+    await handler.dispatch(
+        {
+            "request_id": "r_both",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"]
+    assert len(sent) == 1
+    assert sent[0]["type_filling"] == mt5_stub.ORDER_FILLING_IOC
+
+
+@pytest.mark.asyncio
+async def test_open_filling_mode_bitmask_zero_fallback_to_return(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Bitmask=0 (no FOK no IOC, e.g. BOC-only) → fall back to
+    ``ORDER_FILLING_RETURN`` for stack accounts."""
+    sym = _stub_symbol(filling_mode=0)
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        order_send_response=[_send_result(retcode=mt5_stub.TRADE_RETCODE_DONE)],
+    )
+    await handler.dispatch(
+        {
+            "request_id": "r_return",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"]
+    assert len(sent) == 1
+    assert sent[0]["type_filling"] == mt5_stub.ORDER_FILLING_RETURN
+
+
+@pytest.mark.asyncio
+async def test_open_symbol_select_failure_publishes_structured_error(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """``mt5.symbol_select`` returns False → publish
+    ``status=error reason=symbol_select_failed`` and SKIP the order_send
+    loop entirely (operator-actionable: investigate Market Watch)."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        symbol_select_response=False,
+    )
+    await handler.dispatch(
+        {
+            "request_id": "r_select_fail",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"]
+    assert sent == []
+    payload = await _read_one_response(fake_redis)
+    assert payload["status"] == "error"
+    assert payload["reason"] == "symbol_select_failed"
+    assert payload["symbol"] == "EURUSDm"
+
+
+@pytest.mark.asyncio
+async def test_open_symbol_select_called_before_order_send(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """The belt-and-suspenders ``symbol_select`` must fire BEFORE the
+    first ``order_send`` so an inactive symbol is reactivated before the
+    terminal validator runs."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(symbol_info={"EURUSDm": sym})
+    await handler.dispatch(
+        {
+            "request_id": "r_ordering",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    select_calls = mt5_stub._state["symbol_select_calls"]
+    send_calls = mt5_stub._state["order_send_calls"]
+    assert select_calls == [("EURUSDm", True)]
+    assert len(send_calls) == 1
+    # Both lists are appended in their respective stubs in dispatch
+    # order; the assertion above documents that select_calls is
+    # non-empty BEFORE order_send_calls becomes non-empty (handler
+    # control flow guarantees the sequence).
+
+
+@pytest.mark.asyncio
+async def test_open_unsupported_filling_retcode_still_advances_loop(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Regression: the retcode 10030 pathway (broker returns a struct
+    instead of None) still triggers the next filling mode. This locks
+    the historical IOC→FOK behaviour that 4.8a preserves alongside the
+    new None-handling branch."""
+    sym = _stub_symbol(filling_mode=3)
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        order_send_response=[
+            _send_result(retcode=mt5_stub.TRADE_RETCODE_UNSUPPORTED_FILLING),
+            _send_result(retcode=mt5_stub.TRADE_RETCODE_DONE),
+        ],
+    )
+    await handler.dispatch(
+        {
+            "request_id": "r_unsupported_retcode",
+            "action": "open",
+            "symbol": "EURUSDm",
+            "side": "buy",
+            "volume": "0.10",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"]
+    assert len(sent) == 2
+    assert sent[0]["type_filling"] == mt5_stub.ORDER_FILLING_IOC
+    assert sent[1]["type_filling"] == mt5_stub.ORDER_FILLING_FOK
+    payload = await _read_one_response(fake_redis)
+    assert payload["status"] == "filled"

@@ -44,10 +44,22 @@ TRADE_ACTION_SLTP = 6  # for completeness — not exercised in 4.2
 ORDER_TYPE_BUY = 0
 ORDER_TYPE_SELL = 1
 
-# Filling mode (IOC tried first, FOK as fallback per IOC→FOK retry).
+# Filling mode (request-side: ORDER_FILLING_*). Step 4.8a: the action
+# handler now picks one from this list based on the symbol's
+# ``filling_mode`` bitmask, then falls through alternates on retry.
 ORDER_FILLING_FOK = 0
 ORDER_FILLING_IOC = 1
 ORDER_FILLING_RETURN = 2
+
+# Symbol-side ``filling_mode`` bitmask values (returned by
+# ``symbol_info(name).filling_mode``). Step 4.8a uses these to query
+# which filling types the broker supports for a given symbol before
+# issuing an order — Exness Cent reports ``1`` (FOK only) on many
+# symbols, which makes our historical IOC-first request silently
+# rejected with ``None`` (not retcode 10030 UNSUPPORTED_FILLING).
+SYMBOL_FILLING_FOK = 1
+SYMBOL_FILLING_IOC = 2
+SYMBOL_FILLING_BOC = 4  # Book-Or-Cancel (passive); not used by market DEALs
 
 # Position direction (mirrors order side semantics for opened positions).
 POSITION_TYPE_BUY = 0
@@ -134,6 +146,10 @@ class SymbolInfo(NamedTuple):
     trade_mode: int
     bid: float
     ask: float
+    # Step 4.8a — broker-side supported filling bitmask (1=FOK, 2=IOC,
+    # 3=both, 4=BOC, …). Default ``3`` preserves pre-4.8a tests that
+    # implicitly assumed both modes were supported.
+    filling_mode: int = 3
 
 
 class OrderSendResult(NamedTuple):
@@ -221,6 +237,9 @@ _state: dict[str, Any] = {
     "symbols_get": (),               # tuple[SymbolInfo, ...]
     "symbol_info": {},               # dict[str, SymbolInfo]
     "symbol_select_calls": [],       # list[tuple[str, bool]] for assertions
+    # Step 4.8a — failure-path control for the symbol_select belt-and-
+    # suspenders call. Default True preserves all pre-4.8a behaviour.
+    "symbol_select_response": True,  # bool
     "order_send_response": None,     # OrderSendResult | Callable | list[OrderSendResult]
     "order_send_calls": [],          # list[dict] for assertions
     "order_send_raises": None,       # Exception to raise instead of returning
@@ -305,10 +324,13 @@ def symbol_info(name: str) -> SymbolInfo | None:
 
 
 def symbol_select(name: str, enable: bool = True) -> bool:
-    """Mirror of ``mt5.symbol_select(name, enable)`` — returns True on
-    success. Test-side records every call for assertions."""
+    """Mirror of ``mt5.symbol_select(name, enable)``.
+
+    Step 4.8a — tests can flip ``symbol_select_response`` to False to
+    exercise the failure path (`reason="symbol_select_failed"`).
+    Default True preserves pre-4.8a behaviour."""
     _state["symbol_select_calls"].append((name, enable))
-    return True
+    return bool(_state["symbol_select_response"])
 
 
 def order_send(request: dict[str, Any]) -> OrderSendResult | None:
@@ -407,6 +429,7 @@ def reset_state_for_tests() -> None:
     _state["symbols_get"] = ()
     _state["symbol_info"] = {}
     _state["symbol_select_calls"] = []
+    _state["symbol_select_response"] = True
     _state["order_send_response"] = None
     _state["order_send_calls"] = []
     _state["order_send_raises"] = None

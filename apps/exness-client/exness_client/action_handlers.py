@@ -54,10 +54,18 @@ from .symbol_sync import SymbolSyncPublisher
 logger = logging.getLogger(__name__)
 
 # Phase 4.2 IOC→FOK retry deviation isn't a permanent retry budget — we
-# only retry the filling-mode branch once (IOC then FOK). Cap explicitly
+# only retry the filling-mode branch once per alternate. Cap explicitly
 # so a future refactor can't accidentally turn this into an unbounded
-# loop on a misbehaving broker.
+# loop on a misbehaving broker. Step 4.8a query the symbol's filling
+# bitmask first, so the list of modes the loop walks is at most 2 entries
+# (preferred + alternate) — the cap stays at 2.
 _MAX_FILLING_RETRIES = 2
+
+# Step 4.8a — symbol-side bitmask values for ``info.filling_mode``.
+# Duplicated from ``mt5_stub`` so production code can compare without
+# pulling in the stub-or-real selection logic.
+SYMBOL_FILLING_FOK = 1
+SYMBOL_FILLING_IOC = 2
 
 
 class ActionHandler:
@@ -140,12 +148,60 @@ class ActionHandler:
             return
         price = info.ask if side == "buy" else info.bid
 
-        # IOC first; if the broker rejects with UNSUPPORTED_FILLING we
-        # retry once with FOK. Any other outcome is final.
-        filling_modes = [
-            self._mt5.ORDER_FILLING_IOC,
-            self._mt5.ORDER_FILLING_FOK,
-        ]
+        # Step 4.8a — belt-and-suspenders ``symbol_select`` per order.
+        # The initial sync (``main.py:113``) calls this once, but a
+        # silent skip during per-symbol iteration (or a terminal-side
+        # deselect after sync) can leave the symbol missing from Market
+        # Watch — in which case ``order_send`` returns ``None`` with no
+        # retcode. Re-asserting selection here is idempotent on the real
+        # MT5 lib for already-selected symbols (D-SMOKE-2).
+        selected = await _to_thread(self._mt5.symbol_select, symbol, True)
+        if not selected:
+            await self._publish_response(
+                request_id=request_id,
+                action="open",
+                status="error",
+                reason="symbol_select_failed",
+                cascade_trigger=cascade_trigger,
+                symbol=symbol,
+            )
+            return
+
+        # Step 4.8a — pick the filling mode the broker actually supports.
+        # Exness Cent reports ``info.filling_mode=1`` (FOK only) on many
+        # symbols including EURUSDm; an IOC submission is silently
+        # rejected with ``None`` (not retcode 10030
+        # UNSUPPORTED_FILLING) by the terminal-side validator. The
+        # historical hardcoded ``[IOC, FOK]`` list never advanced past
+        # the silent-None first attempt — see ``verify-exness-order-send-
+        # none-diagnosis.md`` for the field evidence + D-SMOKE-2.
+        supported = info.filling_mode
+        if (
+            supported & SYMBOL_FILLING_FOK
+            and supported & SYMBOL_FILLING_IOC
+        ):
+            # Both supported — preserve historical IOC-first preference.
+            filling_modes = [
+                self._mt5.ORDER_FILLING_IOC,
+                self._mt5.ORDER_FILLING_FOK,
+            ]
+        elif supported & SYMBOL_FILLING_FOK:
+            # FOK-only broker (Exness Cent path). Try FOK first, IOC
+            # as a defensive fallback in case the bitmask is stale.
+            filling_modes = [
+                self._mt5.ORDER_FILLING_FOK,
+                self._mt5.ORDER_FILLING_IOC,
+            ]
+        elif supported & SYMBOL_FILLING_IOC:
+            filling_modes = [
+                self._mt5.ORDER_FILLING_IOC,
+                self._mt5.ORDER_FILLING_FOK,
+            ]
+        else:
+            # Bitmask reports neither FOK nor IOC (rare; e.g. BOC-only
+            # passive symbol). Fall back to RETURN for stack accounts;
+            # the broker will reject with a retcode we then publish.
+            filling_modes = [self._mt5.ORDER_FILLING_RETURN]
         last_result = None
         for attempt, filling_mode in enumerate(filling_modes):
             request = {
@@ -173,6 +229,19 @@ class ActionHandler:
                 return
 
             if result is None:
+                # Step 4.8a — Exness Cent (and similar quirky brokers)
+                # silently reject unsupported filling with ``None``
+                # instead of retcode ``TRADE_RETCODE_UNSUPPORTED_FILLING``
+                # (10030). Treat ``None`` as a filling miss and advance
+                # to the next mode in ``filling_modes`` before publishing
+                # the terminal error.
+                if attempt + 1 < len(filling_modes):
+                    logger.info(
+                        "open.silent_none_retry_alternate_filling "
+                        "request_id=%s next_mode=%s",
+                        request_id, filling_modes[attempt + 1],
+                    )
+                    continue
                 await self._publish_response(
                     request_id=request_id,
                     action="open",
