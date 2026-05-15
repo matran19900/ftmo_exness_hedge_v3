@@ -715,6 +715,15 @@ class RedisService:
         oid = await self._redis.get(f"p_broker_order_id_to_order:{broker_order_id}")
         return oid if oid else None
 
+    async def find_order_id_by_s_broker_order_id(self, broker_order_id: str) -> str | None:
+        """Step 4.7b — secondary-leg variant of
+        ``find_order_id_by_p_broker_order_id``. Used by the Exness event
+        handler to map a ``position_closed_external`` / ``position_modified``
+        event's ``broker_position_id`` back to the originating hedge order.
+        """
+        oid = await self._redis.get(f"s_broker_order_id_to_order:{broker_order_id}")
+        return oid if oid else None
+
     async def unlink_broker_order_id(self, leg: LegPrefix, broker_order_id: str) -> None:
         """Drop the ``{leg}_broker_order_id_to_order:{id}`` side-index entry.
 

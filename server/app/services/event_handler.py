@@ -37,9 +37,13 @@ import asyncio
 import json
 import logging
 import time
+from typing import TYPE_CHECKING
 
 from app.services.broadcast import BroadcastService
 from app.services.redis_service import RedisService
+
+if TYPE_CHECKING:
+    from app.services.alert_service import AlertService
 
 logger = logging.getLogger(__name__)
 
@@ -55,25 +59,40 @@ async def event_handler_loop(
     broadcast: BroadcastService,
     account_id: str,
     *,
+    broker: str = "ftmo",
     block_ms: int = 1000,
     read_count: int = _READ_COUNT,
+    alert_service: AlertService | None = None,
 ) -> None:
-    """Run the event-consume loop for one FTMO account.
+    """Run the event-consume loop for one (broker, account) pair.
 
     Lifespan cancels via ``Task.cancel()``; all other exceptions are
     logged and the loop continues. ACK policy matches
     ``response_handler``: only ACK after successful handle.
 
+    Step 4.7b — ``broker`` parameter drives handler selection:
+      - ``"ftmo"`` (default, Phase 3): the legacy 5-branch dispatcher
+        for position_closed / pending_filled / position_modified /
+        order_cancelled / reconcile_snapshot.
+      - ``"exness"``: the new dispatcher for
+        ``position_closed_external`` / ``position_modified`` (Exness
+        position_monitor's vocabulary, distinct from FTMO's).
+
+    ``alert_service`` is required when ``broker == "exness"`` for the
+    WARNING-routing branches; FTMO Phase 3 handlers do not use it.
+
     ``block_ms`` defaults to 1000ms — short enough for prompt
     shutdown, long enough to avoid CPU-burn on an idle stream.
     """
-    stream = f"event_stream:ftmo:{account_id}"
-    logger.info("event_handler_loop starting: stream=%s", stream)
+    stream = f"event_stream:{broker}:{account_id}"
+    logger.info(
+        "event_handler_loop starting: broker=%s stream=%s", broker, stream
+    )
     try:
         while True:
             try:
                 entries = await redis_svc.read_events(
-                    "ftmo", account_id, count=read_count, block_ms=block_ms
+                    broker, account_id, count=read_count, block_ms=block_ms
                 )
             except asyncio.CancelledError:
                 raise
@@ -85,7 +104,10 @@ async def event_handler_loop(
             for _stream_name, stream_entries in entries:
                 for entry_id, fields in stream_entries:
                     try:
-                        await _handle_event_entry(redis_svc, broadcast, account_id, fields)
+                        await _handle_event_entry(
+                            redis_svc, broadcast, account_id, fields,
+                            broker=broker, alert_service=alert_service,
+                        )
                     except Exception:
                         logger.exception(
                             "event_handler entry processing failed: entry_id=%s fields=%s",
@@ -98,7 +120,10 @@ async def event_handler_loop(
                     except Exception:
                         logger.exception("event_handler XACK failed: entry_id=%s", entry_id)
     except asyncio.CancelledError:
-        logger.info("event_handler_loop cancelled: account_id=%s", account_id)
+        logger.info(
+            "event_handler_loop cancelled: broker=%s account_id=%s",
+            broker, account_id,
+        )
         raise
 
 
@@ -107,10 +132,39 @@ async def _handle_event_entry(
     broadcast: BroadcastService,
     account_id: str,
     fields: dict[str, str],
+    *,
+    broker: str = "ftmo",
+    alert_service: AlertService | None = None,
 ) -> None:
-    """Route an event_stream entry by ``event_type``."""
+    """Route an event_stream entry by ``event_type`` + ``broker``."""
     event_type = fields.get("event_type", "")
 
+    if broker == "exness":
+        if event_type == "position_closed_external":
+            await _handle_exness_position_closed_external(
+                redis_svc, account_id, fields, alert_service,
+            )
+        elif event_type == "position_modified":
+            await _handle_exness_position_modified(
+                redis_svc, account_id, fields, alert_service,
+            )
+        elif event_type == "position_new":
+            # position_new is informational on the Exness side — the
+            # cascade orchestrator (step 4.7a HedgeService) issued the
+            # open; this event just confirms the broker saw it. Phase
+            # 4.7b: log + ACK. Future step 4.8 may use it for cascade
+            # close re-correlation.
+            logger.debug(
+                "exness.position_new ticket=%s account=%s",
+                fields.get("broker_position_id", ""), account_id,
+            )
+        else:
+            logger.warning(
+                "unknown exness event_type: %s account=%s", event_type, account_id
+            )
+        return
+
+    # FTMO broker (Phase 3 vocabulary).
     if event_type == "position_closed":
         await _handle_position_closed(redis_svc, broadcast, account_id, fields)
     elif event_type == "pending_filled":
@@ -494,3 +548,222 @@ async def _handle_reconcile_snapshot(
         dispatched_close_history,
         marked_unknown,
     )
+
+
+# ---------- step 4.7b: Exness event handlers ----------
+
+
+_EXTERNAL_CLOSE_REASONS = {
+    # 2-bucket classifier per step 4.3a + design §1.B:
+    # ``server_initiated`` is the only "cascade FTMO" trigger; all
+    # other values fall into the external bucket and surface as
+    # WARNING alerts here. The explicit allowlist is defensive — a
+    # future position_monitor enrichment that adds a new slug will
+    # default into the external WARNING path (safer than silent drop).
+    "external",
+    "sl_hit",
+    "tp_hit",
+    "stop_out",
+    "manual",
+}
+
+
+async def _resolve_pair_name(
+    redis_svc: RedisService, pair_id: str
+) -> str:
+    """Best-effort pair name lookup for alert templates. Returns the
+    pair name when present, else the raw pair_id, else "unknown".
+    Orphan-order safe: deleted pair surfaces as pair_id.
+    """
+    if not pair_id:
+        return "unknown"
+    pair = await redis_svc.get_pair(pair_id)
+    if pair and pair.get("name"):
+        return pair["name"]
+    return pair_id
+
+
+async def _handle_exness_position_closed_external(
+    redis_svc: RedisService,
+    account_id: str,
+    fields: dict[str, str],
+    alert_service: AlertService | None,
+) -> None:
+    """Step 4.7b — route an Exness ``position_closed_external`` event.
+
+    2-bucket classification (step 4.3a):
+      - ``close_reason == "server_initiated"`` → no WARNING; the
+        cascade orchestrator (step 4.8 — not in this step's scope)
+        will pick this up via its own path. Phase 4.7b: log + return.
+      - any other close_reason (``sl_hit`` / ``tp_hit`` / ``stop_out``
+        / ``manual`` / ``external``) → WARNING alert. NO cascade FTMO.
+        Operator manually decides whether to close the FTMO leg.
+    """
+    ticket = fields.get("broker_position_id", "")
+    close_reason = fields.get("close_reason", "external")
+
+    if close_reason == "server_initiated":
+        logger.info(
+            "event.closed_external.server_initiated_passthrough "
+            "ticket=%s account=%s",
+            ticket, account_id,
+        )
+        return
+
+    if close_reason not in _EXTERNAL_CLOSE_REASONS:
+        logger.warning(
+            "event.closed_external.unknown_close_reason "
+            "ticket=%s account=%s close_reason=%s — defaulting to external bucket",
+            ticket, account_id, close_reason,
+        )
+
+    order_id = await redis_svc.find_order_id_by_s_broker_order_id(ticket)
+    if order_id is None:
+        logger.warning(
+            "event.closed_external.order_not_found ticket=%s account=%s "
+            "close_reason=%s",
+            ticket, account_id, close_reason,
+        )
+        return
+
+    if alert_service is None:
+        logger.error(
+            "event.closed_external.no_alert_service ticket=%s account=%s "
+            "— WARNING NOT emitted",
+            ticket, account_id,
+        )
+        return
+
+    order = await redis_svc.get_order(order_id) or {}
+    pair_id = order.get("pair_id", "")
+    pair_name = await _resolve_pair_name(redis_svc, pair_id)
+    close_price = fields.get("close_price", "")
+
+    title_vi = "⚠️ Lệnh Exness đóng ngoài hệ thống"
+    body_vi = (
+        f"Order {order_id} ({pair_name}): Exness leg ticket {ticket} "
+        f"đã đóng với lý do '{close_reason}' (giá đóng {close_price}). "
+        f"FTMO leg vẫn mở — cần kiểm tra thủ công."
+    )
+
+    await alert_service.emit(
+        alert_type="hedge_leg_external_close_warning",
+        cooldown_key=order_id,
+        title_vi=title_vi,
+        body_vi=body_vi,
+        context={
+            "order_id": order_id,
+            "pair_id": pair_id,
+            "exness_account_id": account_id,
+            "exness_ticket": ticket,
+            "close_reason": close_reason,
+            "close_price": close_price,
+            "close_time_ms": fields.get("close_time_ms", ""),
+        },
+    )
+    # NO cascade FTMO. Operator action required. Step 4.8 will wire the
+    # server_initiated cascade Path B/C/D/E; external bucket stays
+    # WARNING-only by design (R3 + design §1.B).
+
+
+async def _handle_exness_position_modified(
+    redis_svc: RedisService,
+    account_id: str,
+    fields: dict[str, str],
+    alert_service: AlertService | None,
+) -> None:
+    """Step 4.7b — route an Exness ``position_modified`` event.
+
+    Filter on ``changed_fields`` (a comma-separated string from
+    position_monitor):
+      - ``["volume"]`` only → silent ignore. Phase 4 has no partial-close
+        support so a volume-only change is operator-side bookkeeping
+        beyond our state machine; DEBUG log + return.
+      - SL or TP changed (with or without volume) → WARNING alert with
+        the SL/TP delta in ``body_vi``. NO modify FTMO (R3 forbids
+        server-issued modify on Exness).
+      - Unknown change_fields → log warning + drop.
+    """
+    ticket = fields.get("broker_position_id", "")
+    changed_raw = fields.get("changed_fields", "")
+    changed_fields = [c.strip() for c in changed_raw.split(",") if c.strip()]
+
+    if changed_fields == ["volume"]:
+        logger.debug(
+            "event.modified.volume_only_ignored ticket=%s account=%s "
+            "old=%s new=%s",
+            ticket, account_id,
+            fields.get("old_volume", ""), fields.get("new_volume", ""),
+        )
+        return
+
+    has_sl = "sl" in changed_fields
+    has_tp = "tp" in changed_fields
+
+    if not (has_sl or has_tp):
+        logger.warning(
+            "event.modified.unknown_change_fields ticket=%s account=%s fields=%s",
+            ticket, account_id, changed_fields,
+        )
+        return
+
+    order_id = await redis_svc.find_order_id_by_s_broker_order_id(ticket)
+    if order_id is None:
+        logger.warning(
+            "event.modified.order_not_found ticket=%s account=%s fields=%s",
+            ticket, account_id, changed_fields,
+        )
+        return
+
+    if alert_service is None:
+        logger.error(
+            "event.modified.no_alert_service ticket=%s account=%s "
+            "— WARNING NOT emitted",
+            ticket, account_id,
+        )
+        return
+
+    order = await redis_svc.get_order(order_id) or {}
+    pair_id = order.get("pair_id", "")
+    pair_name = await _resolve_pair_name(redis_svc, pair_id)
+
+    old_sl = fields.get("old_sl", "?")
+    new_sl = fields.get("new_sl", "?")
+    old_tp = fields.get("old_tp", "?")
+    new_tp = fields.get("new_tp", "?")
+    sl_part = f"SL {old_sl}→{new_sl}" if has_sl else ""
+    tp_part = f"TP {old_tp}→{new_tp}" if has_tp else ""
+    changes_summary = ", ".join(p for p in (sl_part, tp_part) if p)
+
+    title_vi = "⚠️ Lệnh Exness bị sửa SL/TP ngoài hệ thống"
+    body_vi = (
+        f"Order {order_id} ({pair_name}): Exness leg ticket {ticket} "
+        f"có thay đổi: {changes_summary}. Phase 4 không tự revert; "
+        f"kiểm tra MT5 thủ công."
+    )
+
+    # Cooldown key includes sorted SL/TP signal so an SL-only change
+    # followed by a separate TP change in the same window emits BOTH
+    # alerts (different keys), rather than the second one being
+    # suppressed by the first.
+    signal = ",".join(sorted(f for f in (("sl" if has_sl else ""), ("tp" if has_tp else "")) if f))
+
+    await alert_service.emit(
+        alert_type="hedge_leg_external_modify_warning",
+        cooldown_key=f"{order_id}:{signal}",
+        title_vi=title_vi,
+        body_vi=body_vi,
+        context={
+            "order_id": order_id,
+            "pair_id": pair_id,
+            "exness_account_id": account_id,
+            "exness_ticket": ticket,
+            "changed_fields": json.dumps(changed_fields),
+            "old_sl": old_sl,
+            "new_sl": new_sl,
+            "old_tp": old_tp,
+            "new_tp": new_tp,
+        },
+    )
+    # NO modify cmd published to cmd_stream:exness. Phase 4 R3 explicitly
+    # forbids server-issued modify on the Exness hedge leg.

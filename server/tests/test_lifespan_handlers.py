@@ -118,6 +118,9 @@ async def test_lifespan_handles_empty_account_list_gracefully(
     assert app.state.response_tasks == []
     assert app.state.event_tasks == []
     assert app.state.exness_response_tasks == []
+    # Step 4.7b: Exness event_handler tasks list is also empty when no
+    # Exness accounts are registered.
+    assert app.state.exness_event_tasks == []
 
 
 @pytest.mark.asyncio

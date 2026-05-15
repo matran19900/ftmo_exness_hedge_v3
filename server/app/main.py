@@ -29,6 +29,7 @@ from app.api.ws import router as ws_router
 from app.config import get_settings
 from app.redis_client import close_redis, get_redis, init_redis
 from app.services.account_status import account_status_loop
+from app.services.alert_service import ALERT_TYPES, AlertService
 from app.services.auto_match_engine import AutoMatchEngine
 from app.services.broadcast import BroadcastService
 from app.services.event_handler import event_handler_loop
@@ -271,6 +272,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.hedge_service = hedge_service
     logger.info("hedge_service.initialized")
 
+    # Step 4.7b: AlertService is the publish-only WARNING router. Built
+    # once and shared by the per-Exness-account event_handler tasks; no
+    # background loops (publish-only contract — Telegram delivery is
+    # step 4.11).
+    alert_service = AlertService(redis_svc, broadcast)
+    app.state.alert_service = alert_service
+    logger.info(
+        "alert_service.initialized types_registered=%d", len(ALERT_TYPES)
+    )
+
     # Step 3.7: per-account response + event handler tasks. We start
     # one of each per registered FTMO account so each consumer-group
     # `server` reader has a dedicated coroutine. Empty account list
@@ -317,8 +328,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Step 4.7a: per-Exness-account response_handler_loop tasks. The
     # Exness client publishes cascade-open acks to resp_stream:exness:*;
     # these tasks consume them and drive the order row's s_* fields.
+    #
+    # Step 4.7b: per-Exness-account event_handler_loop tasks. The Exness
+    # position_monitor publishes ``position_closed_external`` /
+    # ``position_modified`` events that the AlertService-aware handler
+    # routes to WARNING alerts (no cascade FTMO, no auto-modify).
     exness_accounts = await redis_svc.get_all_account_ids("exness")
     exness_response_tasks: list[asyncio.Task[None]] = []
+    exness_event_tasks: list[asyncio.Task[None]] = []
     for acc in exness_accounts:
         exness_response_tasks.append(
             asyncio.create_task(
@@ -332,7 +349,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "exness_response_handler_loop.started broker=exness account_id=%s",
             acc,
         )
+        exness_event_tasks.append(
+            asyncio.create_task(
+                event_handler_loop(
+                    redis_svc, broadcast, acc,
+                    broker="exness", alert_service=alert_service,
+                ),
+                name=f"event_handler_exness_{acc}",
+            )
+        )
+        logger.info(
+            "exness_event_handler_loop.started broker=exness account_id=%s",
+            acc,
+        )
     app.state.exness_response_tasks = exness_response_tasks
+    app.state.exness_event_tasks = exness_event_tasks
 
     # Step 3.12: single global account-status broadcaster — one task
     # for all accounts (not per-account like the handler loops), since
@@ -356,6 +387,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             + event_tasks
             + position_tracker_tasks
             + exness_response_tasks
+            + exness_event_tasks
         ):
             task.cancel()
         if (
@@ -363,12 +395,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             or event_tasks
             or position_tracker_tasks
             or exness_response_tasks
+            or exness_event_tasks
         ):
             await asyncio.gather(
                 *response_tasks,
                 *event_tasks,
                 *position_tracker_tasks,
                 *exness_response_tasks,
+                *exness_event_tasks,
                 return_exceptions=True,
             )
         try:
