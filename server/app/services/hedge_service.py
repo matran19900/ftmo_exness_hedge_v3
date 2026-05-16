@@ -325,22 +325,40 @@ class HedgeService:
                 )
                 return
 
-            # Step 4.8e — belt-and-suspenders short-circuit when the
-            # secondary leg is already closed but the composed status
-            # hasn't flipped yet (out-of-order event delivery during a
-            # concurrent operator-click-Close + external-close race).
-            # The 4.8e external-close stamp in event_handler writes
-            # ``s_status=closed`` + composed ``status=closed`` together
-            # via a single ``update_order`` patch, so under normal
-            # conditions the composed_status check above already
-            # short-circuits this case. This check guards the narrow
-            # window between the two writes if a third party (or a
-            # future code path) ever splits them.
+            # Step 4.8f Option C — orphan-close finalization. The
+            # secondary leg closed externally and its s_status was
+            # stamped by event_handler's external-close branch
+            # (state-only stamp; composed kept at "filled" to preserve
+            # the row + the UI close path). The operator (or SL/TP) then
+            # closed the FTMO leg, p_status flipped to "closed" via
+            # response_handler + event_handler, and we landed here.
+            # Both legs are now closed at the broker — finalize composed
+            # ``status="closed"`` + broadcast ``hedge_closed`` so the
+            # frontend drops the orphan row from the Open tab via the
+            # useWebSocket.ts:169 status==="closed" filter. Skip the
+            # Exness cmd push: the secondary position is already gone,
+            # so a close cmd would just generate a position_not_found
+            # rejection and burn the retry budget.
             if closed_leg == "p" and order.get("s_status") == "closed":
                 logger.info(
-                    "cascade_close.no_op_secondary_already_closed "
-                    "order_id=%s s_status=closed trigger=%s",
+                    "cascade_close.orphan_close_finalize "
+                    "order_id=%s trigger=%s",
                     order_id, trigger_path,
+                )
+                await self.redis.update_order(
+                    order_id,
+                    patch={
+                        "status": "closed",
+                        "updated_at": str(int(time.time() * 1000)),
+                    },
+                )
+                await self.broadcast.publish(
+                    ORDERS_CHANNEL,
+                    {
+                        "type": "hedge_closed",
+                        "order_id": order_id,
+                        "outcome": "orphan_close_finalized",
+                    },
                 )
                 return
 

@@ -699,31 +699,41 @@ async def test_close_initiated_broadcast_includes_trigger_path(
 
 
 # ---------------------------------------------------------------------------
-# Step 4.8e — belt-and-suspenders s_status pre-check
+# Step 4.8e + 4.8f Option C — orphan-close finalization short-circuit
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_cascade_close_no_op_when_s_status_closed_composed_still_filled(
+async def test_cascade_close_orphan_finalization_when_s_status_closed(
     redis_client: fakeredis.aioredis.FakeRedis,
     redis_svc: RedisService,
     hedge_svc: HedgeService,
     broadcast: _CapturingBroadcast,
 ) -> None:
-    """Step 4.8e — belt-and-suspenders. If the secondary leg already
-    landed ``s_status="closed"`` (e.g. via the 4.8e external-close
-    stamp written by event_handler) but the composed ``status`` still
-    reads "filled" (out-of-order event delivery race), the cascade
-    orchestrator MUST short-circuit BEFORE pushing a duplicate close
-    cmd that the broker would reject with ``position_not_found``.
+    """Step 4.8f Option C — orphan-close finalization. The secondary
+    leg closed externally and its ``s_status="closed"`` was stamped by
+    event_handler's external-close branch (composed kept at
+    ``"filled"`` so the operator's Close button stays available). The
+    operator then clicks Close, the FTMO leg closes, and we land here.
 
-    Pre-4.8e this check did not exist — the composed-status-only
-    guard at hedge_service.py:317-326 missed this race window.
+    The cascade orchestrator MUST:
+      1. Detect ``s_status="closed"`` (the Exness position is gone).
+      2. SKIP the Exness cmd push (would 400 with
+         ``position_not_found``).
+      3. Stamp composed ``status="closed"``.
+      4. Broadcast ``hedge_closed`` with
+         ``outcome="orphan_close_finalized"`` so the frontend drops
+         the row from the Open tab.
+      5. Release the cascade lock cleanly.
+
+    Inverted from the original 4.8e test which only asserted the bare
+    no-op return — 4.8f extends the short-circuit to also finalize the
+    composed-status transition + broadcast, since under Option C
+    composed is the ONLY signal the frontend uses to drop the row.
     """
     await _seed_filled_hedge(redis_svc)
-    # Simulate the partial-write race: s_status flipped to closed, but
-    # the composed status update lost the race (extremely narrow window
-    # under Option A's single-patch write; documented edge case).
+    # Simulate the 4.8e + 4.8f Option C external-close stamp:
+    # s_status=closed lands, composed stays "filled".
     await redis_svc.update_order(
         "ord_hedge_1", patch={"s_status": "closed"}
     )
@@ -733,15 +743,27 @@ async def test_cascade_close_no_op_when_s_status_closed_composed_still_filled(
         closed_leg="p", close_reason="manual", trigger_path="B",
     )
 
-    # No Exness cmd pushed — the belt-and-suspenders check fires.
+    # 1+2. No Exness cmd pushed — short-circuit fires.
     entries = await redis_client.xrange(
         "cmd_stream:exness:exness_001", "-", "+"
     )
     assert entries == []
-    # No close_initiated broadcast either (the cascade never advanced).
+    # No close_initiated broadcast (the cascade never advanced into the
+    # retry loop that emits close_initiated).
     types = [m.get("type") for _ch, m in broadcast.published]
     assert "close_initiated" not in types
-    # Lock released cleanly.
+
+    # 3. Composed status flipped to "closed" by the finalization branch.
+    row = await redis_client.hgetall("order:ord_hedge_1")  # type: ignore[misc]
+    assert row["status"] == "closed"
+    # 4. hedge_closed broadcast with outcome=orphan_close_finalized.
+    hedge_closed_msgs = [
+        m for _ch, m in broadcast.published if m.get("type") == "hedge_closed"
+    ]
+    assert len(hedge_closed_msgs) == 1
+    assert hedge_closed_msgs[0]["order_id"] == "ord_hedge_1"
+    assert hedge_closed_msgs[0]["outcome"] == "orphan_close_finalized"
+    # 5. Lock released cleanly.
     assert await redis_svc.read_cascade_lock("ord_hedge_1") is None
 
 

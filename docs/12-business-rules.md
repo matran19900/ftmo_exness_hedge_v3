@@ -53,13 +53,28 @@ Bất kỳ event nào đóng primary (TP, SL, manual cTrader, manual app, extern
 ### R10 — Cascade on secondary close (NEW v2)
 Nếu secondary bị đóng externally (margin call MT5, manual MT5 UI) → `position_monitor_loop` detect → server cascade close primary.
 
-#### Phase 4 implementation note (step 4.7b + 4.8e — secondary-passive lock)
-Phase 4 implements R10 as **WARNING-only**, NOT auto-cascade. Per CEO policy + design §1.B (secondary leg always passive), when `position_monitor` detects an external Exness close, the server:
-1. Stamps the order HASH: `s_status="closed"`, composed `status="closed"`, `s_close_price` / `s_closed_at` / `s_close_reason` / `s_realized_pnl` / `s_commission` from the event payload (step 4.8e — state sync only).
-2. Emits a `hedge_leg_external_close_warning` alert (step 4.7b — `⚠️ Lệnh Exness đóng ngoài hệ thống`, body explicitly tells the operator the FTMO leg is still open).
-3. Does **NOT** auto-close the FTMO leg. `p_status` stays `filled` (FTMO orphan); operator manually closes the FTMO leg via cTrader UI.
+#### Phase 4 implementation note (step 4.7b + 4.8e + 4.8f — secondary-passive lock + Option C)
 
-Net behaviour: the state-sync in (1) prevents the pre-4.8e double-close hazard (operator clicks Close → API rejects with `order_not_closeable` because composed status is already `closed`) and the phantom-open row in the PositionList. The WARNING in (2) surfaces the orphan condition. Auto-cascade per R10's literal wording is deferred — Phase 5 backlog item could add a server-side "force-close FTMO orphan" endpoint if the manual workflow proves friction-heavy.
+Phase 4 implements R10 as **WARNING + state-sync only**, NOT auto-cascade. Per CEO policy + design §1.B (secondary leg always passive), when `position_monitor` detects an external Exness close, the server:
+
+1. Stamps the order HASH: `s_status="closed"`, `s_close_price`, `s_closed_at`, `s_close_reason` (verbatim), `s_realized_pnl`, `s_commission` from the event payload (step 4.8e — state sync). **Composed `status` stays `"filled"`** (step 4.8f Option C — keep the row in the Open tab so the operator has a UI close path).
+2. Emits a `hedge_leg_external_close_warning` alert (step 4.7b — title `⚠️ Lệnh Exness đóng ngoài hệ thống`, body explicitly tells the operator the FTMO leg is still open).
+3. Does **NOT** auto-close the FTMO leg.
+
+When the operator clicks Close on the orphan row:
+
+4. API endpoint accepts (composed `status="filled"` passes `_CLOSEABLE_STATUSES`).
+5. FTMO close cmd pushed; FTMO leg closes.
+6. `event_handler.position_closed` invokes `cascade_close_other_leg`.
+7. `cascade_close_other_leg` orphan-close finalization fires (step 4.8f): `s_status` is already `"closed"` + `closed_leg="p"` → skip the Exness cmd push (the secondary position is already gone) + stamp composed `status="closed"` + broadcast `hedge_closed` with `outcome="orphan_close_finalized"`.
+8. Frontend drops the now-closed row from the Open tab via `useWebSocket.ts:169` `status==="closed"` filter; the next history REST refresh pulls the close-detail fields.
+
+Net behaviour: external-close hazards prevented:
+- **No phantom-open row** (operator sees the row, can act).
+- **No double-close hazard** (cascade short-circuit skips the gone Exness position; no `position_not_found` rejection burns the retry budget).
+- **No orphan UX trap** (clean recovery path via the same Close button — step 4.8e Option A originally dropped the row + rejected `close_order` with `order_not_closeable`; step 4.8f Option C corrects that).
+
+Phase 5 backlog: optional orphan-leg badge in the PositionList Open tab (read `s_status==="closed" && status==="filled"` → render warning chip) + optional server-side "force-close FTMO orphan" endpoint if the manual workflow proves friction-heavy.
 
 ## 2. SL/TP rules (R11–R20)
 

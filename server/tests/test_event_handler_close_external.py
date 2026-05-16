@@ -136,13 +136,15 @@ async def test_external_close_reason_emits_warning(
 ) -> None:
     """Criteria #9-13: all 5 external-bucket reasons emit one WARNING.
 
-    Step 4.8e amendment — the WARNING emit now follows a HASH stamp
-    that flips ``s_status`` and composed ``status`` to ``closed``.
-    Asserting the WARNING + the new stamp side-by-side locks the
-    contract that BOTH happen for every external close_reason value.
-    Dedicated 4.8e tests (``test_external_close_stamps_order_hash_*``
-    + ``test_external_close_stamp_records_verbatim_close_reason``)
-    cover the stamp shape in detail."""
+    Step 4.8e + 4.8f Option C — the WARNING emit follows a HASH stamp
+    that flips ``s_status`` to ``closed`` but leaves composed
+    ``status="filled"`` so the frontend keeps the row in the Open tab
+    and the operator's Close button stays available. Asserting the
+    WARNING + the new stamp side-by-side locks the contract that BOTH
+    happen for every external close_reason value. Dedicated 4.8e tests
+    (``test_external_close_stamps_order_hash_*`` +
+    ``test_external_close_stamp_records_verbatim_close_reason``) cover
+    the stamp shape in detail."""
     await _seed_hedge_order(redis_svc)
 
     await _handle_event_entry(
@@ -163,11 +165,13 @@ async def test_external_close_reason_emits_warning(
         "cmd_stream:ftmo:ftmo_001", "-", "+"
     )
     assert ftmo_entries == []
-    # Step 4.8e — order HASH stamped to composed status=closed for
-    # every external close_reason value.
+    # Step 4.8e + 4.8f — order HASH stamped: s_status flips to "closed"
+    # for every external close_reason value, but composed ``status``
+    # stays ``"filled"`` (4.8f Option C) so the operator can still
+    # click Close via the API.
     order_row = await redis_client.hgetall("order:ord_hedge_1")  # type: ignore[misc]
     assert order_row["s_status"] == "closed"
-    assert order_row["status"] == "closed"
+    assert order_row["status"] == "filled"
     assert order_row["s_close_reason"] == close_reason
 
 
@@ -361,7 +365,7 @@ async def test_missing_alert_service_logs_error_no_crash(
 
 
 # ---------------------------------------------------------------------------
-# Step 4.8e — order HASH state-sync on external close (Option A)
+# Step 4.8e + 4.8f — order HASH state-sync on external close (Option C)
 # ---------------------------------------------------------------------------
 
 
@@ -372,11 +376,14 @@ async def test_external_close_stamps_order_hash_then_emits_warning(
     alert_svc: AlertService,
     broadcast: _CapturingBroadcast,
 ) -> None:
-    """Step 4.8e core fix — external Exness close now stamps the order
-    HASH (``s_status=closed`` + composed ``status=closed`` + ``s_close_*``)
-    BEFORE emitting the 4.7b WARNING. Pre-4.8e the handler emitted the
-    alert and returned without HASH update, leaving the order in a
-    phantom-open state that allowed double-close hazard."""
+    """Step 4.8e + 4.8f Option C — external Exness close stamps the
+    order HASH (``s_status=closed`` + ``s_close_*``) BEFORE emitting
+    the 4.7b WARNING. Composed ``status`` STAYS ``"filled"`` (4.8f
+    Option C) so the row remains in the Open tab and the operator's
+    Close button stays available. Pre-4.8e the handler emitted the
+    alert and returned without HASH update — both legs looked open
+    even though Exness was gone (phantom-open + double-close
+    hazard)."""
     await _seed_hedge_order(redis_svc)
     await _handle_event_entry(
         redis_svc, broadcast, "exness_001",
@@ -385,9 +392,9 @@ async def test_external_close_stamps_order_hash_then_emits_warning(
     )
     row = await redis_client.hgetall("order:ord_hedge_1")  # type: ignore[misc]
 
-    # HASH stamp landed.
+    # HASH stamp landed (s_status + s_close_*); composed UNCHANGED.
     assert row["s_status"] == "closed"
-    assert row["status"] == "closed"
+    assert row["status"] == "filled"
     assert row["s_close_price"] == "1.08425"
     assert row["s_closed_at"] == "1735000100000"
     assert row["s_close_reason"] == "manual"
@@ -466,31 +473,60 @@ async def test_external_close_idempotent_skip_on_existing_closed(
 
 
 @pytest.mark.asyncio
-async def test_external_close_then_close_endpoint_rejects_double_close(
+async def test_external_close_then_close_endpoint_accepts_orphan_close(
     redis_client: fakeredis.aioredis.FakeRedis,
     redis_svc: RedisService,
     alert_svc: AlertService,
     broadcast: _CapturingBroadcast,
 ) -> None:
-    """Double-close hazard regression: after an external close stamp,
-    the OrderService.close_order pre-check (``_CLOSEABLE_STATUSES =
-    ("filled",)``) MUST reject a follow-up close attempt with
-    ``order_not_closeable`` (400). Pre-4.8e the composed status stayed
-    "filled" so a re-close would have advanced into the cascade
-    orchestrator and burned the 4-attempt retry budget for nothing."""
-    from app.services.order_service import OrderService, OrderValidationError
+    """Step 4.8f Option C regression — orphan-close path. After an
+    external Exness close stamp, the operator clicks Close on the
+    still-visible row to close the FTMO orphan. The API endpoint MUST
+    accept the close (composed stays ``"filled"`` ∈
+    ``_CLOSEABLE_STATUSES``) and push the FTMO close cmd so the
+    orphan-leg cleanup proceeds via the cascade chain.
+
+    Inverted from the original 4.8e
+    ``test_external_close_then_close_endpoint_rejects_double_close``
+    semantics: 4.8e Option A flipped composed to ``"closed"`` and
+    rejected with ``order_not_closeable``, leaving the operator with
+    no UI close path. 4.8f Option C corrects that — the close
+    endpoint accepts; the cascade short-circuit (see
+    ``test_option_c_cascade_short_circuit_broadcasts_hedge_closed``)
+    finalizes composed=closed once the FTMO close completes."""
+    from app.services.order_service import OrderService
     await _seed_hedge_order(redis_svc)
+    # close_order needs p_broker_order_id + an online FTMO client.
+    await redis_svc.update_order(
+        "ord_hedge_1",
+        patch={"p_broker_order_id": "p_ticket_1", "p_volume_lots": "0.10"},
+    )
+    await redis_client.set("client:ftmo:ftmo_001", "1", ex=30)
+
     await _handle_event_entry(
         redis_svc, broadcast, "exness_001",
         _exness_close_event(close_reason="manual"),
         broker="exness", alert_service=alert_svc,
     )
-    # Composed status is now "closed".
+    # Composed status is still "filled"; s_status="closed".
+    row = await redis_client.hgetall("order:ord_hedge_1")  # type: ignore[misc]
+    assert row["status"] == "filled"
+    assert row["s_status"] == "closed"
+
     order_service = OrderService(redis_svc)
-    with pytest.raises(OrderValidationError) as exc_info:
-        await order_service.close_order("ord_hedge_1")
-    assert exc_info.value.error_code == "order_not_closeable"
-    assert exc_info.value.http_status == 400
+    order_id_out, request_id = await order_service.close_order("ord_hedge_1")
+    assert order_id_out == "ord_hedge_1"
+    assert request_id  # non-empty request_id minted
+
+    # FTMO close cmd was pushed.
+    ftmo_entries = await redis_client.xrange(
+        "cmd_stream:ftmo:ftmo_001", "-", "+"
+    )
+    assert len(ftmo_entries) == 1
+    _entry_id, cmd_fields = ftmo_entries[0]
+    assert cmd_fields["action"] == "close"
+    assert cmd_fields["broker_order_id"] == "p_ticket_1"
+    assert cmd_fields["order_id"] == "ord_hedge_1"
 
 
 @pytest.mark.asyncio
@@ -549,8 +585,9 @@ async def test_external_close_handles_missing_optional_fields(
         broker="exness", alert_service=alert_svc,
     )
     row = await redis_client.hgetall("order:ord_hedge_1")  # type: ignore[misc]
+    # 4.8f Option C — composed stays "filled"; s_status flips to "closed".
     assert row["s_status"] == "closed"
-    assert row["status"] == "closed"
+    assert row["status"] == "filled"
     assert row["s_close_price"] == ""
     assert row["s_realized_pnl"] == ""
     assert row["s_commission"] == ""
@@ -589,3 +626,227 @@ async def test_external_close_server_initiated_branch_unchanged(
     # No 4.7b WARNING for the server-initiated path.
     alert_keys = [k async for k in redis_client.scan_iter(match="alert:*")]
     assert alert_keys == []
+
+
+# ---------------------------------------------------------------------------
+# Step 4.8f Option C — orphan-close behaviour (new tests)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_option_c_external_close_does_not_drop_row(
+    redis_client: fakeredis.aioredis.FakeRedis,
+    redis_svc: RedisService,
+    alert_svc: AlertService,
+    broadcast: _CapturingBroadcast,
+) -> None:
+    """Step 4.8f Option C — the external-close stamp MUST NOT flip
+    composed ``status="closed"``. Frontend ``useWebSocket.ts:169`` drops
+    the row from the Open tab when ``msg.data.status === "closed"`` OR
+    ``msg.data.p_status === "closed"``; under Option C neither is true
+    after the external-close stamp, so the row stays visible and the
+    operator's Close button stays available.
+
+    The handler also MUST NOT publish to ``ORDERS_CHANNEL`` from the
+    external branch — only the alerts channel WARNING fires. (Any
+    ``order_updated`` broadcast carrying ``status="closed"`` would
+    trigger the same frontend drop.)"""
+    await _seed_hedge_order(redis_svc)
+    await _handle_event_entry(
+        redis_svc, broadcast, "exness_001",
+        _exness_close_event(close_reason="manual"),
+        broker="exness", alert_service=alert_svc,
+    )
+    row = await redis_client.hgetall("order:ord_hedge_1")  # type: ignore[misc]
+    # Composed stays "filled"; p_status untouched.
+    assert row["status"] == "filled"
+    assert row["p_status"] == "filled"
+    # No order_updated broadcast carrying status="closed" was emitted
+    # from the external-close handler.
+    closed_broadcasts = [
+        m for _ch, m in broadcast.published
+        if m.get("status") == "closed" or m.get("p_status") == "closed"
+    ]
+    assert closed_broadcasts == []
+
+
+@pytest.mark.asyncio
+async def test_option_c_close_endpoint_accepts_orphan_order(
+    redis_client: fakeredis.aioredis.FakeRedis,
+    redis_svc: RedisService,
+) -> None:
+    """Step 4.8f Option C — close_order endpoint accepts an order whose
+    secondary leg already closed externally (s_status="closed",
+    composed="filled"). The composed-status gate
+    ``_CLOSEABLE_STATUSES=("filled",)`` accepts because composed is
+    untouched by the external-close stamp. No external-close event is
+    triggered here; we just exercise the endpoint against the orphan
+    state directly."""
+    from app.services.order_service import OrderService
+    await _seed_hedge_order(redis_svc)
+    # Manually arrange orphan state: s_status=closed, composed=filled,
+    # p_broker_order_id + client online for close_order to proceed.
+    await redis_svc.update_order(
+        "ord_hedge_1",
+        patch={
+            "s_status": "closed",
+            "p_broker_order_id": "p_ticket_1",
+            "p_volume_lots": "0.10",
+        },
+    )
+    await redis_client.set("client:ftmo:ftmo_001", "1", ex=30)
+
+    order_service = OrderService(redis_svc)
+    order_id_out, request_id = await order_service.close_order("ord_hedge_1")
+    assert order_id_out == "ord_hedge_1"
+    assert request_id
+    # FTMO close cmd present on the stream.
+    ftmo_entries = await redis_client.xrange(
+        "cmd_stream:ftmo:ftmo_001", "-", "+"
+    )
+    assert len(ftmo_entries) == 1
+
+
+@pytest.mark.asyncio
+async def test_option_c_orphan_close_full_flow_via_api(
+    redis_client: fakeredis.aioredis.FakeRedis,
+    redis_svc: RedisService,
+    alert_svc: AlertService,
+    broadcast: _CapturingBroadcast,
+) -> None:
+    """Step 4.8f Option C — end-to-end orphan close.
+
+    1. Seed hedge order (both legs filled).
+    2. External Exness close event lands -> 4.8e + 4.8f stamp:
+       s_status=closed, composed stays "filled".
+    3. Operator calls OrderService.close_order -> accepted, FTMO close
+       cmd pushed.
+    4. Simulate the FTMO position_closed event (event_handler stamps
+       p_status=closed + invokes cascade_close_other_leg).
+    5. cascade_close_other_leg fires the 4.8f orphan-close
+       finalization: composed -> "closed", broadcast hedge_closed{
+       outcome:"orphan_close_finalized"}, NO Exness cmd pushed.
+
+    Final order HASH: status=closed, p_status=closed, s_status=closed,
+    p_close_*, s_close_* populated.
+    """
+    from app.services.hedge_service import HedgeService
+    from app.services.order_service import OrderService
+
+    await _seed_hedge_order(redis_svc)
+    await redis_svc.update_order(
+        "ord_hedge_1",
+        patch={"p_broker_order_id": "p_ticket_1", "p_volume_lots": "0.10"},
+    )
+    await redis_client.set("client:ftmo:ftmo_001", "1", ex=30)
+    # FTMO side-index so event_handler can resolve the position_closed
+    # event back to ord_hedge_1.
+    await redis_svc.link_broker_order_id("p", "p_ticket_1", "ord_hedge_1")
+
+    # 2. External Exness close lands.
+    await _handle_event_entry(
+        redis_svc, broadcast, "exness_001",
+        _exness_close_event(close_reason="manual"),
+        broker="exness", alert_service=alert_svc,
+    )
+    row = await redis_client.hgetall("order:ord_hedge_1")  # type: ignore[misc]
+    assert row["s_status"] == "closed"
+    assert row["status"] == "filled"
+
+    # 3. Operator clicks Close -> close_order accepts.
+    order_service = OrderService(redis_svc)
+    await order_service.close_order("ord_hedge_1")
+
+    # 4. Simulate FTMO position_closed event (skip the actual close
+    # response — just deliver the event the orchestrator listens on).
+    hedge_svc = HedgeService(redis_svc, broadcast)
+    ftmo_close_event = {
+        "event_type": "position_closed",
+        "position_id": "p_ticket_1",
+        "close_price": "1.08400",
+        "close_time": "1735000200000",
+        "realized_pnl": "10.0",
+        "commission": "0.5",
+        "swap": "0",
+        "close_reason": "manual",
+    }
+    await _handle_event_entry(
+        redis_svc, broadcast, "ftmo_001",
+        ftmo_close_event,
+        broker="ftmo",
+        hedge_service=hedge_svc,
+    )
+
+    # 5. Final order state. Composed=closed via cascade short-circuit.
+    final = await redis_client.hgetall("order:ord_hedge_1")  # type: ignore[misc]
+    assert final["status"] == "closed"
+    assert final["p_status"] == "closed"
+    assert final["s_status"] == "closed"
+    assert final["p_close_price"] == "1.08400"
+    assert final["s_close_price"] == "1.08425"
+
+    # NO Exness cmd pushed in step (5) — short-circuit skipped it.
+    exness_entries = await redis_client.xrange(
+        "cmd_stream:exness:exness_001", "-", "+"
+    )
+    assert exness_entries == []
+
+    # hedge_closed broadcast with orphan_close_finalized fired.
+    finalized = [
+        m for _ch, m in broadcast.published
+        if m.get("type") == "hedge_closed"
+        and m.get("outcome") == "orphan_close_finalized"
+    ]
+    assert len(finalized) == 1
+    assert finalized[0]["order_id"] == "ord_hedge_1"
+
+
+@pytest.mark.asyncio
+async def test_option_c_cascade_short_circuit_broadcasts_hedge_closed(
+    redis_client: fakeredis.aioredis.FakeRedis,
+    redis_svc: RedisService,
+    broadcast: _CapturingBroadcast,
+) -> None:
+    """Step 4.8f Option C — direct unit test on the cascade short-
+    circuit branch. Pre-condition: s_status="closed", composed="filled"
+    (i.e. the post-external-close orphan state). Invoke
+    ``cascade_close_other_leg`` directly. Assertions on the broadcast
+    payload + composed-status finalization.
+
+    Decoupled from the end-to-end full-flow test so a regression in
+    the short-circuit's broadcast payload fails this test cleanly
+    rather than hiding inside the orchestration chain."""
+    from app.services.hedge_service import HedgeService
+
+    await _seed_hedge_order(redis_svc)
+    await redis_svc.update_order(
+        "ord_hedge_1", patch={"s_status": "closed"}
+    )
+    hedge_svc = HedgeService(redis_svc, broadcast)
+
+    await hedge_svc.cascade_close_other_leg(
+        "ord_hedge_1",
+        closed_leg="p", close_reason="manual", trigger_path="A",
+    )
+
+    # Composed status finalized.
+    row = await redis_client.hgetall("order:ord_hedge_1")  # type: ignore[misc]
+    assert row["status"] == "closed"
+
+    # Broadcast payload exact-match assertion.
+    hedge_closed = [
+        m for _ch, m in broadcast.published if m.get("type") == "hedge_closed"
+    ]
+    assert hedge_closed == [
+        {
+            "type": "hedge_closed",
+            "order_id": "ord_hedge_1",
+            "outcome": "orphan_close_finalized",
+        }
+    ]
+
+    # No Exness cmd pushed.
+    entries = await redis_client.xrange(
+        "cmd_stream:exness:exness_001", "-", "+"
+    )
+    assert entries == []

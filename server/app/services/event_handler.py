@@ -744,21 +744,36 @@ async def _handle_exness_position_closed_external(
     pair_name = await _resolve_pair_name(redis_svc, pair_id)
     close_price = fields.get("close_price", "")
 
-    # Step 4.8e — stamp the order HASH so composed status reflects broker
-    # truth BEFORE emitting the WARNING. Pre-4.8e this branch only fired
-    # the alert; ``s_status`` stayed "filled" while the broker had already
-    # closed the position, producing two knock-on bugs:
-    #   1. Phantom open row in PositionList (frontend drops via
-    #      useWebSocket.ts:169 when status==="closed").
-    #   2. Double-close hazard: API endpoint _CLOSEABLE_STATUSES rejects
-    #      a second close attempt with order_not_closeable.
-    # NO cascade FTMO is triggered (R3 + design §1.B — secondary passive
-    # policy). The FTMO leg stays open as an orphan and the WARNING
-    # below tells the operator to clean it up manually.
+    # Step 4.8e + 4.8f — stamp the order HASH so the secondary leg's
+    # broker-side state is reflected in Redis BEFORE emitting the
+    # WARNING. We stamp s_status + the s_close_* fields ONLY; composed
+    # ``status`` stays ``"filled"`` (4.8f Option C correction of 4.8e
+    # Option A). The operator clicks Close to flip composed via the
+    # cascade chain — when the FTMO close completes, the cascade
+    # orchestrator's orphan-close finalization in
+    # ``HedgeService.cascade_close_other_leg`` detects
+    # s_status="closed", skips the Exness cmd push (the position is
+    # already gone), stamps composed="closed", and broadcasts
+    # hedge_closed{orphan_close_finalized} so the frontend drops the
+    # row from the Open tab.
     #
-    # Idempotent: a duplicate event (e.g. reconcile_state replay) finds
-    # s_status == "closed" already and skips the stamp. The alert
-    # cooldown_key=order_id suppresses the duplicate WARNING separately.
+    # Why Option C (state-only) over Option A (state + composed flip):
+    # Option A produced an orphan UX trap — composed=closed dropped the
+    # row from Open tab AND rejected close_order with
+    # order_not_closeable (composed not in _CLOSEABLE_STATUSES). The
+    # FTMO leg was left open with no UI close path; operator had to
+    # close via cTrader UI manually. Option C keeps the row visible
+    # and the API path open. See docs/12-business-rules.md R10
+    # Phase 4 implementation note.
+    #
+    # NO cascade FTMO is triggered (R3 + design §1.B — secondary
+    # passive policy). The FTMO leg stays open as an orphan and the
+    # WARNING below tells the operator to act manually.
+    #
+    # Idempotent: a duplicate event (e.g. reconcile_state replay)
+    # finds s_status == "closed" already and skips the stamp. The
+    # alert cooldown_key=order_id suppresses the duplicate WARNING
+    # separately.
     if order.get("s_status") != "closed":
         await redis_svc.update_order(
             order_id,
@@ -769,7 +784,6 @@ async def _handle_exness_position_closed_external(
                 "s_close_reason": close_reason,
                 "s_realized_pnl": fields.get("realized_profit", ""),
                 "s_commission": fields.get("commission", ""),
-                "status": "closed",
                 "updated_at": str(int(time.time() * 1000)),
             },
         )
