@@ -788,28 +788,51 @@ async def _handle_exness_position_closed_external(
             },
         )
 
-    title_vi = "⚠️ Lệnh Exness đóng ngoài hệ thống"
-    body_vi = (
-        f"Order {order_id} ({pair_name}): Exness leg ticket {ticket} "
-        f"đã đóng với lý do '{close_reason}' (giá đóng {close_price}). "
-        f"FTMO leg vẫn mở — cần kiểm tra thủ công."
-    )
+    # Step 4.11: split the external bucket on close_reason. Stop-out is
+    # a broker-initiated liquidation — operator must close the FTMO leg
+    # IMMEDIATELY (CRITICAL severity, no cooldown). All other external
+    # reasons (manual / external / sl_hit / tp_hit) keep the original
+    # 4.7b WARNING path so the existing template + cooldown behaviour
+    # is unchanged.
+    common_context = {
+        "order_id": order_id,
+        "pair_id": pair_id,
+        "exness_account_id": account_id,
+        "exness_ticket": ticket,
+        "close_reason": close_reason,
+        "close_price": close_price,
+        "close_time_ms": fields.get("close_time_ms", ""),
+    }
 
-    await alert_service.emit(
-        alert_type="hedge_leg_external_close_warning",
-        cooldown_key=order_id,
-        title_vi=title_vi,
-        body_vi=body_vi,
-        context={
-            "order_id": order_id,
-            "pair_id": pair_id,
-            "exness_account_id": account_id,
-            "exness_ticket": ticket,
-            "close_reason": close_reason,
-            "close_price": close_price,
-            "close_time_ms": fields.get("close_time_ms", ""),
-        },
-    )
+    if close_reason == "stop_out":
+        s_pnl = fields.get("realized_profit", "")
+        title_vi = "🚨 Exness leg bị stop-out (liquidation)"
+        body_vi = (
+            f"Order {order_id} ({pair_name}): Exness leg ticket {ticket} "
+            f"đã bị stop-out (P&L ${s_pnl}, giá đóng {close_price}). "
+            f"FTMO leg vẫn mở — đóng ngay để tránh one-sided exposure."
+        )
+        await alert_service.emit(
+            alert_type="secondary_liquidation",
+            cooldown_key=order_id,
+            title_vi=title_vi,
+            body_vi=body_vi,
+            context=common_context,
+        )
+    else:
+        title_vi = "⚠️ Lệnh Exness đóng ngoài hệ thống"
+        body_vi = (
+            f"Order {order_id} ({pair_name}): Exness leg ticket {ticket} "
+            f"đã đóng với lý do '{close_reason}' (giá đóng {close_price}). "
+            f"FTMO leg vẫn mở — cần kiểm tra thủ công."
+        )
+        await alert_service.emit(
+            alert_type="hedge_leg_external_close_warning",
+            cooldown_key=order_id,
+            title_vi=title_vi,
+            body_vi=body_vi,
+            context=common_context,
+        )
     # NO cascade FTMO. R3 + design §1.B — secondary passive policy means
     # the server does NOT auto-close the FTMO leg to mirror an external
     # Exness close. Operator manually closes the FTMO orphan via the

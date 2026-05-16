@@ -125,7 +125,12 @@ def _exness_close_event(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "close_reason",
-    ["external", "sl_hit", "tp_hit", "stop_out", "manual"],
+    # Step 4.11 split: ``stop_out`` now emits ``secondary_liquidation``
+    # CRITICAL instead of the generic WARNING (asserted in the
+    # dedicated test_stop_out_emits_secondary_liquidation_critical test
+    # below). The remaining 4 external close_reasons keep the 4.7b
+    # WARNING contract verbatim.
+    ["external", "sl_hit", "tp_hit", "manual"],
 )
 async def test_external_close_reason_emits_warning(
     redis_client: fakeredis.aioredis.FakeRedis,
@@ -134,7 +139,8 @@ async def test_external_close_reason_emits_warning(
     broadcast: _CapturingBroadcast,
     close_reason: str,
 ) -> None:
-    """Criteria #9-13: all 5 external-bucket reasons emit one WARNING.
+    """Criteria #9-13: the 4 non-liquidation external bucket reasons
+    each emit one WARNING.
 
     Step 4.8e + 4.8f Option C — the WARNING emit follows a HASH stamp
     that flips ``s_status`` to ``closed`` but leaves composed
@@ -173,6 +179,51 @@ async def test_external_close_reason_emits_warning(
     assert order_row["s_status"] == "closed"
     assert order_row["status"] == "filled"
     assert order_row["s_close_reason"] == close_reason
+
+
+# ---------- step 4.11: stop_out -> secondary_liquidation CRITICAL ----------
+
+
+@pytest.mark.asyncio
+async def test_stop_out_emits_secondary_liquidation_critical(
+    redis_client: fakeredis.aioredis.FakeRedis,
+    redis_svc: RedisService,
+    alert_svc: AlertService,
+    broadcast: _CapturingBroadcast,
+) -> None:
+    """Step 4.11 split: ``close_reason="stop_out"`` no longer falls
+    under the generic WARN bucket — it surfaces a CRITICAL
+    ``secondary_liquidation`` alert that names the liquidation
+    explicitly. The existing 4.7b ``hedge_leg_external_close_warning``
+    alert must NOT also fire for this event (one alert per event)."""
+    await _seed_hedge_order(redis_svc)
+    await _handle_event_entry(
+        redis_svc, broadcast, "exness_001",
+        _exness_close_event(close_reason="stop_out", close_price="1.07000"),
+        broker="exness", alert_service=alert_svc,
+    )
+    keys = [k async for k in redis_client.scan_iter(match="alert:*")]
+    assert len(keys) == 1
+    row = await redis_client.hgetall(keys[0])  # type: ignore[misc]
+    assert row["alert_type"] == "secondary_liquidation"
+    assert row["severity"] == "CRITICAL"
+    assert row["emoji"] == "🚨"
+    # Body names the liquidation + the close price + the realized P&L
+    # from the event payload (12.5 in the canned fixture).
+    assert "stop-out" in row["body_vi"]
+    assert "12.5" in row["body_vi"]
+    # State-only stamp (4.8f Option C) still applies: composed status
+    # stays at "filled" so the operator can click Close.
+    order_row = await redis_client.hgetall("order:ord_hedge_1")  # type: ignore[misc]
+    assert order_row["s_status"] == "closed"
+    assert order_row["status"] == "filled"
+    # The 4.7b warning type did NOT fire alongside.
+    cooldown_keys = [
+        k async for k in redis_client.scan_iter(match="alert_cooldown:*")
+    ]
+    assert not any(
+        "hedge_leg_external_close_warning" in k for k in cooldown_keys
+    )
 
 
 # ---------- server_initiated -> passthrough (criterion #14) ----------

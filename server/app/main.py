@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
+import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -265,22 +266,45 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "No cTrader credentials in Redis; market-data idle. Visit /api/auth/ctrader to setup."
         )
 
-    # Step 4.7a: HedgeService is the cascade-open orchestrator. Built
-    # once and shared by every FTMO response_handler task — fires the
-    # secondary Exness leg when an FTMO hedge order's primary fills.
-    hedge_service = HedgeService(redis_svc, broadcast)
-    app.state.hedge_service = hedge_service
-    logger.info("hedge_service.initialized")
+    # Step 4.11: dedicated httpx.AsyncClient for AlertService Telegram
+    # delivery. Owned by the lifespan so connection pooling is shared
+    # across all emits and the client is closed cleanly on shutdown.
+    # Built unconditionally so disabled-Telegram envs (CI / dev) still
+    # have a valid client reference — the dispatch helper short-circuits
+    # on ``telegram_enabled=False`` before touching it.
+    alert_http_client = httpx.AsyncClient()
+    app.state.alert_http_client = alert_http_client
 
-    # Step 4.7b: AlertService is the publish-only WARNING router. Built
-    # once and shared by the per-Exness-account event_handler tasks; no
-    # background loops (publish-only contract — Telegram delivery is
-    # step 4.11).
-    alert_service = AlertService(redis_svc, broadcast)
+    # Step 4.7b + 4.11: AlertService is the publish + Telegram-dispatch
+    # router. Built once and shared by the per-Exness-account
+    # event_handler tasks AND HedgeService (step 4.11 wires
+    # hedge_closed / leg_orphaned alerts at cascade success +
+    # secondary_failed sites). No background loops.
+    alert_service = AlertService(
+        redis_svc,
+        broadcast,
+        http_client=alert_http_client,
+        telegram_bot_token=settings.telegram_alert_bot_token,
+        telegram_chat_id=settings.telegram_alert_chat_id,
+        telegram_enabled=settings.telegram_alert_enabled,
+    )
     app.state.alert_service = alert_service
     logger.info(
-        "alert_service.initialized types_registered=%d", len(ALERT_TYPES)
+        "alert_service.initialized types_registered=%d telegram_enabled=%s",
+        len(ALERT_TYPES), settings.telegram_alert_enabled,
     )
+
+    # Step 4.7a + 4.11: HedgeService is the cascade-open + cascade-close
+    # orchestrator. Built once and shared by every FTMO response_handler
+    # task — fires the secondary Exness leg when an FTMO hedge order's
+    # primary fills. Step 4.11 injects ``alert_service`` so the cascade
+    # terminal paths (hedge_closed success, secondary_failed orphan) can
+    # surface operator alerts alongside the existing WS broadcasts.
+    hedge_service = HedgeService(
+        redis_svc, broadcast, alert_service=alert_service
+    )
+    app.state.hedge_service = hedge_service
+    logger.info("hedge_service.initialized")
 
     # Step 3.7: per-account response + event handler tasks. We start
     # one of each per registered FTMO account so each consumer-group
@@ -420,6 +444,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await md.stop()
             except Exception:
                 logger.exception("Error during MarketDataService shutdown")
+        # Step 4.11: close the shared httpx client before tearing down
+        # Redis. ``aclose`` is idempotent + handles outstanding requests.
+        try:
+            await alert_http_client.aclose()
+        except Exception:
+            logger.exception("Error during alert_http_client.aclose")
         await close_redis()
         logger.info("Server shutdown complete")
 

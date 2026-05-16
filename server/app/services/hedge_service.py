@@ -32,6 +32,7 @@ import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from app.services.alert_service import AlertService
     from app.services.broadcast import BroadcastService
     from app.services.redis_service import RedisService
 
@@ -65,9 +66,17 @@ class HedgeService:
         self,
         redis_svc: RedisService,
         broadcast: BroadcastService,
+        *,
+        alert_service: AlertService | None = None,
     ) -> None:
         self.redis = redis_svc
         self.broadcast = broadcast
+        # Step 4.11: optional AlertService for terminal-event operator
+        # notifications (hedge_closed INFO + leg_orphaned CRITICAL).
+        # Optional so existing test fixtures that build HedgeService
+        # without the alert wire keep working — the new emits no-op
+        # under ``alert_service is None``.
+        self._alert_service = alert_service
 
     async def cascade_secondary_open(
         self,
@@ -243,6 +252,107 @@ class HedgeService:
             "cascade_secondary_open.exhausted order_id=%s last_error=%s",
             order_id, error,
         )
+        # Step 4.11: leg_orphaned CRITICAL alert. Operator must intervene
+        # manually to close the FTMO primary leg — the secondary cascade
+        # exhausted its retry budget and the primary leg is now an
+        # unhedged one-sided position.
+        await self._emit_leg_orphaned_alert(order_id, error)
+
+    async def _emit_hedge_closed_alert(
+        self, order_id: str, outcome: str
+    ) -> None:
+        """Step 4.11: emit the INFO operator alert for a completed
+        cascade. Called from each of the 4 terminal ``hedge_closed`` WS
+        broadcast sites (orphan_close_finalize, cascade_completed,
+        complete_cascade_close Path C, primary_only_close).
+
+        Reads the fresh order row to enrich the body with pair name +
+        side + volume. Best-effort — missing fields fall through to
+        sensible defaults, and the emit itself swallows failures so
+        the broadcast above remains the system-of-record.
+        """
+        if self._alert_service is None:
+            return
+        order = await self.redis.get_order(order_id) or {}
+        symbol = order.get("symbol", "")
+        side = order.get("side", "")
+        volume = order.get("p_volume_lots", "") or order.get(
+            "s_volume_lots", ""
+        )
+        pair_name = await self._resolve_pair_name(order.get("pair_id", ""))
+        title_vi = "✅ Lệnh hedge đã đóng"
+        body_vi = (
+            f"Order {order_id} ({pair_name}) {side} {volume} {symbol}: "
+            f"đã đóng cả 2 chân (outcome={outcome})."
+        )
+        await self._alert_service.emit(
+            alert_type="hedge_closed",
+            cooldown_key=order_id,
+            title_vi=title_vi,
+            body_vi=body_vi,
+            context={
+                "order_id": order_id,
+                "pair_name": pair_name,
+                "symbol": symbol,
+                "side": side,
+                "volume": volume,
+                "outcome": outcome,
+            },
+        )
+
+    async def _emit_leg_orphaned_alert(
+        self, order_id: str, failure_reason: str
+    ) -> None:
+        """Step 4.11: emit the CRITICAL operator alert for a leg orphan.
+
+        Called once from ``_finalize_failure`` after the secondary
+        cascade-open retry budget is exhausted. The FTMO primary leg
+        is left open as a one-sided position; operator must close it
+        manually via the cTrader UI (Phase 5 backlog has a server-side
+        force-close endpoint).
+        """
+        if self._alert_service is None:
+            return
+        order = await self.redis.get_order(order_id) or {}
+        symbol = order.get("symbol", "")
+        side = order.get("side", "")
+        volume = order.get("p_volume_lots", "") or order.get(
+            "s_volume_lots", ""
+        )
+        pair_name = await self._resolve_pair_name(order.get("pair_id", ""))
+        title_vi = "🚨 Hedge leg orphan — cascade thất bại"
+        body_vi = (
+            f"Order {order_id} ({pair_name}) {side} {volume} {symbol}: "
+            f"FTMO primary đã fill nhưng cascade secondary thất bại sau "
+            f"3 lần retry. Lý do: {failure_reason}. Cần đóng FTMO leg "
+            f"thủ công."
+        )
+        await self._alert_service.emit(
+            alert_type="leg_orphaned",
+            cooldown_key=order_id,
+            title_vi=title_vi,
+            body_vi=body_vi,
+            context={
+                "order_id": order_id,
+                "pair_name": pair_name,
+                "symbol": symbol,
+                "side": side,
+                "volume": volume,
+                "failure_reason": failure_reason,
+            },
+        )
+
+    async def _resolve_pair_name(self, pair_id: str) -> str:
+        """Lookup the pair display name; fall back to pair_id (or empty
+        string if neither is available). Mirrors the same helper in
+        ``event_handler`` — duplicated rather than imported to keep
+        the cross-module dependency direction one-way."""
+        if not pair_id:
+            return ""
+        pair = await self.redis.get_pair(pair_id)
+        if pair and pair.get("name"):
+            return pair["name"]
+        return pair_id
 
     # ----- step 4.8: cascade close orchestrator -----
 
@@ -360,6 +470,12 @@ class HedgeService:
                         "outcome": "orphan_close_finalized",
                     },
                 )
+                # Step 4.11: operator notification — Option C orphan
+                # close completed (secondary closed externally, primary
+                # closed via cascade).
+                await self._emit_hedge_closed_alert(
+                    order_id, "orphan_close_finalized"
+                )
                 return
 
             if closed_leg == "p":
@@ -463,6 +579,11 @@ class HedgeService:
                             "outcome": "cascade_completed",
                         },
                     )
+                    # Step 4.11: operator notification — normal cascade
+                    # close completion on this leg's outcome poll.
+                    await self._emit_hedge_closed_alert(
+                        order_id, "cascade_completed"
+                    )
                     return
                 if outcome == "rejected":
                     last_error = await self._read_close_error(
@@ -535,6 +656,10 @@ class HedgeService:
                 "outcome": "cascade_completed",
             },
         )
+        # Step 4.11: Path C completion (our server-initiated Exness close
+        # landed via position_closed_external). Same alert as the normal
+        # cascade success above — both paths end with the order terminal.
+        await self._emit_hedge_closed_alert(order_id, "cascade_completed")
         await self.redis.release_cascade_lock(order_id)
 
     # ----- step 4.8: cascade_cancel_pending race handling -----
@@ -617,6 +742,12 @@ class HedgeService:
                 "outcome": "primary_only_close",
             },
         )
+        # Step 4.11: cascade_cancel_pending resolution — primary closed
+        # externally while secondary never filled, so the order ends as
+        # a primary-only outcome. Still a "hedge_closed" event for the
+        # operator (the order row is terminal); the alert body's
+        # outcome field distinguishes it from the cascade success path.
+        await self._emit_hedge_closed_alert(order_id, "primary_only_close")
 
     # ----- step 4.8: helpers -----
 

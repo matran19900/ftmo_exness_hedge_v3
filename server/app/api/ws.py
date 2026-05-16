@@ -43,6 +43,10 @@ VALID_CHANNEL_PREFIXES = (
     "accounts",
     "agents",
     "mapping_status:",  # Phase 4.A.4 — per-Exness-account wizard state (D-4.A.0-9)
+    "alerts",  # Step 4.11 — AlertService.broadcast.publish target; the
+               # frontend Settings UI tab (deferred 4.11c) will subscribe
+               # here for live alert toasts. Whitelisted now so the WS
+               # plumbing is ready when the UI lands.
 )
 HEARTBEAT_INTERVAL_SECONDS = 30
 WS_CLOSE_INVALID_TOKEN = 4401

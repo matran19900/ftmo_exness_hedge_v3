@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # This file lives at <repo>/server/app/config.py; the .env file lives at <repo>/.env.
@@ -55,6 +55,20 @@ class Settings(BaseSettings):
     ctrader_port: int = 5035
     ctrader_redirect_uri: str = "http://localhost:8000/api/auth/ctrader/callback"
 
+    # Phase 4 step 4.11: Telegram operator alerts. Uses a DEDICATED chat
+    # separate from ``scripts/notify_telegram.sh`` (the Claude Code
+    # self-check delivery) per phase-4-design.md §2.E.1 / §2.E.4 — the
+    # production channel must stay quiet so each notification is
+    # actionable. The ``_ALERT`` prefix on the env names guards against
+    # accidental cross-firing if the operator imports the host
+    # ``~/.config/hedger-sandbox/telegram.env`` into the server's
+    # environment.
+    telegram_alert_bot_token: str | None = None
+    telegram_alert_chat_id: str | None = None
+    # Default False so dev / CI without Telegram secrets keeps the
+    # Redis + WS publish path live and silently skips the HTTP POST.
+    telegram_alert_enabled: bool = False
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_cors(cls, v: object) -> object:
@@ -80,6 +94,21 @@ class Settings(BaseSettings):
         if not v.startswith(("$2a$", "$2b$", "$2y$")):
             raise ValueError("ADMIN_PASSWORD_HASH must be a bcrypt hash (starts with $2a/$2b/$2y$)")
         return v
+
+    @model_validator(mode="after")
+    def _telegram_alert_requires_token_when_enabled(self) -> Settings:
+        # Fail fast at boot: an operator who flips
+        # ``TELEGRAM_ALERT_ENABLED=true`` but forgets the token/chat
+        # would otherwise get a silent WARN every emit. Make the misconfig
+        # impossible to ship.
+        if self.telegram_alert_enabled and not (
+            self.telegram_alert_bot_token and self.telegram_alert_chat_id
+        ):
+            raise ValueError(
+                "TELEGRAM_ALERT_ENABLED=true requires both "
+                "TELEGRAM_ALERT_BOT_TOKEN and TELEGRAM_ALERT_CHAT_ID"
+            )
+        return self
 
 
 @lru_cache(maxsize=1)
