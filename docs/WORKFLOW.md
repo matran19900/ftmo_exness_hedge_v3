@@ -302,7 +302,42 @@ Mọi prompt phải có đủ 6 phần (theo thứ tự):
 
 ---
 
-## 10. Cuts vs keeps — bảng quyết định cho scale <10 user
+## 10. Bug-class fix: audit sibling handlers
+
+Khi fix một class of bug ở 1 site, pre-read step BẮT BUỘC grep cho cùng pattern trên các module liên quan TRƯỚC khi declare scope complete. Fix author phải enumerate tất cả sibling sites (kể cả những site dự kiến không bị ảnh hưởng) và confirm từng cái.
+
+**Rationale**: Step 4.8b fix `_handle_open` comment 29-char limit (D-167) ĐÁNG LẼ phải catch `_handle_close` có cùng bug; missing this audit gây step 4.8d mirror work + production smoke break (D-SMOKE-10). Pattern "fix một site, để site sister vẫn còn bug" là failure mode điển hình khi sub-fix narrow theo error report mà không expand context.
+
+**Pre-read checklist cho bug-class fixes**:
+
+1. **Grep cho bug pattern across module(s)**. Ví dụ 4.8b: `grep -rn "comment=" apps/exness-client/exness_client/` để liệt kê tất cả comment-building sites.
+2. **Enumerate tất cả sibling sites** — handlers (`_handle_*`), helpers, parallel paths (open/close/modify), test fixtures, doc snippets.
+3. **Document mỗi site**: `applicable` / `not-applicable` / `fix-required`. Lý do mỗi quyết định ghi rõ.
+4. **Nếu có nhiều fix-required sites** → expand step scope HOẶC ship `NEEDS_CTO_REVIEW` với audit table inline trong self-check.
+
+**Self-check section bắt buộc**:
+
+Self-check report cho mỗi bug-class fix step phải có một section riêng `## Sibling audit` (or equivalent) với:
+
+- Bug pattern: 1-line description (e.g. "comment field truncation at MT5 SDK 29-char boundary").
+- Grep command used (verbatim).
+- Sites enumerated: bullet list with verdict per site.
+- Fix scope rationale: "fixed sites X, Y, Z; sites W, V are not-applicable because <reason>".
+
+**Reference**: D-173 (Phase 4 step 4.8d codification); `docs/mt5-execution-events.md` §6.c (lesson narrative).
+
+**Examples of bug classes**:
+
+- SDK string-length limits (comment, label, magic) — affect every cmd-building site.
+- Retcode / error-code interpretation (MT5 `last_error`, cTrader OAuth status) — affect every response-handling site.
+- Field naming drift across REST + WS payloads (D-147 row_to_entry was a Phase 3 precedent) — affect every payload-shape site.
+- Channel whitelist (`VALID_CHANNEL_PREFIXES`) — affect every server-side broadcast that wants a frontend subscriber.
+
+Khi không chắc bug có phải class hay site-specific, default treat as class — grep cost rẻ, missed-sibling cost cao.
+
+---
+
+## 11. Cuts vs keeps — bảng quyết định cho scale <10 user
 
 | Hạng mục | Quyết định | Ghi chú |
 | --- | --- | --- |
@@ -326,7 +361,7 @@ Mọi prompt phải có đủ 6 phần (theo thứ tự):
 
 ---
 
-## 11. Compliance & legal disclaimer
+## 12. Compliance & legal disclaimer
 
 - Tool chỉ hỗ trợ kỹ thuật. KHÔNG tư vấn legality của hedge FTMO.
 - CEO chịu trách nhiệm đọc FTMO ToS và quyết định có dùng hay không.
@@ -334,7 +369,8 @@ Mọi prompt phải có đủ 6 phần (theo thứ tự):
 
 ---
 
-## 12. Document version
+## 13. Document version
 
 - **v1.0** — 2026-05-04 — CEO + CTO chốt khởi đầu rebuild.
+- **v1.1** — 2026-05-16 — Step 4.12 phase-4-docs-sync. Inserted new §10 "Bug-class fix: audit sibling handlers" per D-173 lesson + D-SMOKE-10 incident (Phase 4). Existing §10/§11/§12 renumbered to §11/§12/§13. Cross-references in `MASTER_PLAN_v2.md` §5 step ledger, `PHASE_4_REPORT.md`, `DECISIONS.md`, `PROJECT_STATE.md` updated to point to the new §10.
 - Mọi update file này sau đây phải có entry mới ở mục này, ghi rõ lý do.

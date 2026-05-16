@@ -506,3 +506,174 @@ OrderForm 3-tier ftmoBlockMessage priority: no account > all disabled > offline.
 
 ### D-149 (3.13a) — Function-local imports break circular dependency accounts ↔ account_helpers
 Function-local imports in accounts.py to break circular dependency accounts ↔ account_helpers. Codebase convention from ws.py. Phase 5 cleanup: extract schemas to dedicated module.
+
+## Phase 4 (Hedge + Cascade Close)
+
+Steps 4.0–4.12 (5 main + 8 sub-fix + 1 alert backend + 8 symbol-mapping + 1 docs sync). Symbol-mapping sub-phase decisions live in `SYMBOL_MAPPING_DECISIONS.md` (D-SM-N namespace). Smoke discoveries kept under `D-SMOKE-N` prefix.
+
+### D-150 (4.5a) — mapping_status orphan-pointer detection on lifespan
+`_init_mapping_statuses` lifespan sweep treats Exness accounts with `account_to_mapping:{id}` pointer but no `mapping_status:{id}` key as legacy orphans — deletes the pointer + sets `pending_mapping`. Pre-4.5a, the same case auto-stamped `active` and silently inherited a possibly-stale cache (verify-mapping-status-leak.md T2(a)). Updated tests document the new orphan-detection contract.
+
+### D-151 (4.5a) — `_cleanup_mapping_cache_for_account` lives on RedisService
+The cleanup helper attaches to `RedisService` (orchestration entry point) rather than `MappingCacheService` to avoid a circular construction order (RedisService is built in lifespan before MappingCacheService for consumer-group setup). RedisService accepts an optional `MappingCacheRepository` via `attach_mapping_cache_repository(repo)` setter. Trade-off: RedisService imports MappingCacheRepository (one new module dep) but avoids pulling in AutoMatchEngine + FTMOWhitelistService + BroadcastService transitively.
+
+### D-152 (4.5a) — `MappingCacheRepository.delete(signature)` idempotent
+Returns `True` on successful unlink, `False` when no file matches or unlink fails. Idempotent via the per-signature lock already used by `read`/`write`. Logs INFO on success, ERROR on `OSError`.
+
+### D-153 (4.5a) — Single-server concurrency Phase 4
+`_cleanup_mapping_cache_for_account` documented as code-comment-only single-server safe. No WATCH/MULTI/Lua added — Phase 4 is single-server per D-006/D-008. Phase 5 multi-server deploy will need explicit concurrency guard.
+
+### D-154 (4.7a v2) — Server cascade open Path A primary→secondary 3-retry
+`HedgeService.cascade_secondary_open` orchestrates the cascade when FTMO primary fills: push Exness open cmd → poll `s_status` for outcome → on rejected/timeout, retry up to 3× with exponential backoff `(0.5, 1.0, 2.0)s`. Total 4 attempts. Exhausted → `_finalize_failure` stamps `s_status="secondary_failed"` + composed `status="secondary_failed"` + broadcasts `secondary_failed` WS. Primary FTMO leg is intentionally left open (operator-managed orphan; D-180 + leg_orphaned alert).
+
+### D-155 (4.7a v2) — `cascade_cancel_pending` transient status
+Race: primary closes externally while secondary cascade-open is still in flight (operator SL hit mid-retry). Server transitions composed status to `cascade_cancel_pending` + waits 2s for the secondary leg to either fill (late arrival) or terminal-fail. Late-fill → recursive `cascade_close_other_leg` with `trigger_path="cancel_late_fill"`. No-fill → mark `closed` with `s_status="never_filled"` (primary-only outcome).
+
+### D-156 (4.7a v2) — `mapping_status="active"` HARD-BLOCK at order-time
+4.7a v1 was REJECTED for soft-passing `pending_mapping`. v2 enforces hard-block at the OrderService boundary: any pair whose Exness account has `mapping_status != "active"` (including `pending_mapping` / `spec_mismatch` / `disconnected`) rejects with 400 + `mapping_status_inactive` error_code. No silent degrade to single-leg per design §1.B passive-secondary policy. Phase 4 frontend (4.A.7) also blocks the submit button with `isWizardNotRun` banner.
+
+### D-157 (4.7b) — AlertService publish-only contract (pre-Telegram)
+Step 4.7b ships AlertService with publish-only contract: `SET NX EX` cooldown claim → Redis HASH `alert:{id}` with TTL → WS broadcast on the `alerts` channel. No Telegram delivery (step 4.11). Frontend toast can subscribe to the WS channel (channel whitelist added at 4.11). The contract returns `alert_id` on first emit per cooldown window; subsequent emits return `None` until TTL expires.
+
+### D-158 (4.7b) — Two WARN alert types: hedge_leg_external_close_warning + hedge_leg_external_modify_warning
+4.7b registry covers two operational surfaces: (a) Exness leg position_closed_external (any non-server-initiated close_reason — sl_hit/tp_hit/stop_out/manual/external), and (b) Exness leg position_modified_external (SL or TP changed via MT5 UI). Both WARN severity, 300s cooldown per (alert_type, cooldown_key=order_id), 7-day Redis TTL. The 4.11 split (D-189) later carved `stop_out` off into a CRITICAL `secondary_liquidation` alert; manual/external/sl_hit/tp_hit remained on this type.
+
+### D-159 (4.7b) — Cooldown via `SET NX EX` atomic, 300s default
+Per-type cooldown: `SET alert_cooldown:{type}:{key} "1" NX EX 300`. Atomic against concurrent emits — exactly one writer wins. Different `cooldown_key` values (e.g. distinct `order_id`s) do not collide. Different `alert_type`s with the same key also don't collide (namespace included in the key). Cooldown key auto-evicts on TTL; no periodic cleanup needed.
+
+### D-160 (4.8) — `cascade_lock` Lua SET-NX-EX serializing 5 trigger paths
+Cascade close has 5 distinct trigger paths (A: UI close FTMO leg, B: UI close Exness leg, C: manual MT5 close, D: SL/TP hit FTMO, E: manual MT5 / margin call / stopout). All 5 funnel through `HedgeService.cascade_close_other_leg`, gated by a `cascade_lock:{order_id}` Lua-acquired SET-NX-EX with 60s TTL. Lock CONTENTION → caller logs `cascade_close.lock_contention` and returns early (idempotent no-op). Lock OWNER drives the cmd push + retry loop + terminal stamp; lock released in `finally`.
+
+### D-161 (4.8) — 3-retry × 0.5/1/2s exponential backoff for cascade close cmd
+Matches cascade open retry budget (D-154). Total 4 attempts (initial + 3 retry). Each attempt: push close cmd → poll `{other_leg}_status` for outcome → on `rejected` capture `s_error_msg` + continue; on `timeout` after `SECONDARY_OUTCOME_TIMEOUT=15s` continue. Exhausted → `_mark_close_failed` stamps composed `status="close_failed"` + releases the lock. Operator must reconcile manually.
+
+### D-162 (4.8) — `close_trigger_initiated` marker on event_stream
+For audit + downstream cascade discrimination, when a Path A close completes (FTMO leg closes from server-issued cmd), the event_handler stamps `cascade_trigger="true"` on the event_stream entry forwarded to the response_handler. Path C completion uses this marker to distinguish "our cascade landed" from "external close" — branches to `complete_cascade_close` instead of the external-close WARNING path.
+
+### D-163 (4.8) — `_CLOSEABLE_STATUSES = ("filled",)` gate at API endpoint
+`POST /api/orders/{id}/close` rejects with 400 + `order_not_closeable` for any composed `status` not in `_CLOSEABLE_STATUSES`. Phase 4 single-element tuple `("filled",)` excludes terminal states (`closed`, `close_failed`, `secondary_failed`, `rejected`) plus transient (`close_pending`, `cascade_cancel_pending`). Defense against double-close + a UI close click on a half-closed orphan that the cascade would reject downstream.
+
+### D-164 (4.8a) — Exness filling_mode bitmask vs ORDER_FILLING_* enum
+MT5 SDK `SymbolInfoInteger.filling_mode` returns a bitmask, not an enum. Bits: bit 0 = `ORDER_FILLING_RETURN` (fallback / no flag), bit 1 = `ORDER_FILLING_FOK`, bit 2 = `ORDER_FILLING_IOC`, bit 4 = `ORDER_FILLING_BOC`. Pre-4.8a code assumed enum and stuck symbols accepting only IOC (mask=0b110) with FOK requests → silent reject. Phase 4 reads the bitmask + iterates allowed modes per symbol.
+
+### D-165 (4.8a) — 4-attempt retry loop with fallback modes per bitmask
+For each open/close cmd, ActionHandler iterates allowed filling modes from the symbol's bitmask in preference order (FOK > IOC > BOC > RETURN), retrying on `TRADE_RETCODE_INVALID_FILL` (10030). Up to 4 attempts total. Each attempt logs the mode tried + retcode; on exhaustion the resp_stream entry carries the last_error + last filling_mode for operator diagnostic.
+
+### D-166 (4.8a) — `symbol_select` belt-and-suspenders on every order_send
+`mt5.symbol_select(symbol, True)` called immediately before every `order_send` (open + close). Pre-4.8a, symbol-select was once-on-connect; if the broker deselected the symbol mid-session (e.g. via watchlist edit) the next order_send returned None silently. Belt-and-suspenders pattern eliminates the silent-None surface entirely; tiny latency cost (1 extra MT5 lib call per cmd).
+
+### D-167 (4.8b) — MT5 SDK comment field actual 29-character limit
+SDK docs claim 31 characters; production smoke (D-SMOKE-2) discovered the actual limit is 29. Comments >29 chars cause `order_send` to return None **without raising an exception or returning a retcode**. Phase 4 ActionHandler clamps every comment to `[:29]` before send + adds a defensive log when truncation triggers. Locked the silent-None failure mode that consumed 4 hours of debugging before the bisect identified the comment field.
+
+### D-168 (4.8b) — Comment prefix `v3:` neutral (renamed from `hedge:`)
+The Phase 4 initial comment prefix was `hedge:` which leaks strategy intent to anyone reading the broker UI's "Comment" column. Renamed to `v3:` (tool version, not strategy) per CEO concern about FTMO compliance scrutiny. Applied uniformly to open + close + amend paths.
+
+### D-169 (4.8b) — `mt5.last_error()` capture after order_send None return
+When `order_send` returns None (no retcode, no exception), `ActionHandler` now captures `mt5.last_error()` immediately and surfaces the tuple `(code, message)` in the resp_stream response's `error_msg` field. Pre-4.8b, the response was a bare "order_send returned None" with no further diagnostic. Operator (or test reader) now sees the actual MT5 error code which is the primary triage signal.
+
+### D-170 (4.8c) — FTMO solicited close paths also publish position_closed event
+Pre-4.8c, only **manual** (unsolicited) FTMO closes published `position_closed` on event_stream. Server-issued (solicited) closes only wrote the response on resp_stream + relied on order_id ↔ broker_order_id index for state update. Result: when operator closed an FTMO leg from the UI, server cascade orchestrator never saw the event and the Exness leg stayed open as an unintended one-sided orphan. Fix: extracted `_publish_position_closed_from_fill` helper called from BOTH fast-path and slow-path post-fill-parse (single source of truth, not from `_on_message` which is OAuth response router). Resolves **D-SMOKE-9**.
+
+### D-171 (4.8d) — Pre-read caught prompt assumption "hedge:" prefix in _handle_close
+Prompt assumed Exness `_handle_close` used `hedge:` prefix. Pre-read found actual was `close:`. Renamed to `v3:` (mirror of 4.8b D-168) for symmetry across the action surface. Highlights the value of pre-read step — prompt assumptions often drift from current code by 1 commit.
+
+### D-172 (4.8d) — `docs/mt5-execution-events.md` doc-append per D-069 pattern
+The `mt5-execution-events.md` knowledge doc already existed as a Phase 4.0 skeleton. Step 4.8d appended (not created) per the D-069 append-only mid-phase docs pattern from Phase 3. New §6.c lesson section documents the bug-class fix audit rule (D-173).
+
+### D-173 (4.8d) — "Bug-class fix MUST audit all sibling handlers" lesson
+Step 4.8b fixing `_handle_open` comment 29-char limit (D-167) should have caught `_handle_close` having the same bug; missing this audit caused step 4.8d mirror work + production smoke break (D-SMOKE-10). Codified as a WORKFLOW.md §10 rule: pre-read step must grep for the same pattern across the relevant module(s) before declaring scope complete. Enumerate all sibling sites (handlers, helpers, parallel paths) and confirm each.
+
+### D-174 (4.8e) — External Exness close Option A (initial): stamp composed `status="closed"`
+4.8e initial design: on external Exness close (any non-server-initiated close_reason), stamp the order HASH `s_status="closed"` + composed `status="closed"` so frontend Open tab drops the row. This was REVISED at 4.8f after smoke discovered the orphan UX trap — see D-179.
+
+### D-175 (4.8e) — `s_status="closed"` slug (no new enum like "closed_external")
+Reuses the existing `"closed"` slug rather than introducing a new value. Rationale: the per-leg status fields already encode close direction; adding a new value `closed_external` would have rippled to every order-state-machine test + the cascade orchestrator's terminal checks. The full distinction (server-initiated vs external close) lives in `s_close_reason` already.
+
+### D-176 (4.8e) — Belt-and-suspenders cascade pre-check `closed_leg="p"` only
+The Option C orphan-close finalize path (D-179) is guarded by `closed_leg == "p" AND order.get("s_status") == "closed"` to only fire when the FTMO leg closes second AND the Exness leg was previously stamped external-closed. Defense against the `closed_leg="s"` case landing in this branch by accident — that case is Path C completion (D-180 / `complete_cascade_close`) which uses a different code path.
+
+### D-177 (4.8e) — `docs/12-business-rules.md` R10 doc-append target
+External-close behaviour documented at `docs/12-business-rules.md` R10 (existing rule, appended sub-section per D-069 pattern). 4.8f later **revised** the same R10 (not append) — same site, different semantics. D-178 covers the parametrize test pattern.
+
+### D-178 (4.8e) — Parametrize test over 5 close_reason variants
+`test_external_close_reason_emits_warning` parametrized over `["external", "sl_hit", "tp_hit", "stop_out", "manual"]`. Each instance verifies WARNING emits + HASH stamp lands. 4.11 D-189 later removed `stop_out` from this parametrize (CRITICAL split) + added a dedicated `test_stop_out_emits_secondary_liquidation_critical` test.
+
+### D-179 (4.8f) — Server external close state sync Option A → Option C revision
+Smoke 2026-05-16 discovered Option A's orphan UX trap: stamping composed `status="closed"` made the row vanish from Open tab (frontend filter on `status==="closed"`) AND the `_CLOSEABLE_STATUSES` gate (D-163) then rejected the `POST /close` call with `order_not_closeable` 400. Operator had to close the FTMO orphan via cTrader UI manually. **Option C** correction: composed `status` STAYS `"filled"` on external Exness close; only the per-leg `s_status="closed"` is stamped. Cascade orchestrator detects on subsequent FTMO close (`closed_leg="p" AND s_status="closed"`) and finalizes composed `status="closed"` via short-circuit (no redundant Exness cmd push — the position is already gone). Resolves **D-SMOKE-11**.
+
+### D-180 (4.8f) — Comment-to-code ratio 1:13 deliberate
+The Option C branch is ~10 LOC of executable code wrapped by ~130 LOC of comment block explaining (a) the Option A trap, (b) the Option C revision rationale, (c) the short-circuit's skip-Exness-cmd justification, (d) the cooldown_key idempotency. Defensible because the next reader who "simplifies" this branch by reverting to Option A re-introduces the production bug. The comment block IS the production safeguard.
+
+### D-181 (4.8f) — Log rename `no_op_secondary_already_closed` → `orphan_close_finalize`
+Pre-4.8f the same code site logged `cascade_close.no_op_secondary_already_closed` (Option A bare-defensive). Post-4.8f it does real work — finalize composed status + broadcast `hedge_closed{outcome=orphan_close_finalized}` — so the log rename reflects intent: this is no longer a no-op, it's the orphan-close finalize path.
+
+### D-182 (4.8f) — R10 sub-section REVISE (not append)
+Step 4.8e appended a R10 sub-section. Step 4.8f **revised** the same sub-section (replaced Option A description with Option C). Same site, different semantics — second consecutive doc-edit. Documented for future readers so they don't re-introduce the appended-but-revised stratification.
+
+### D-183 (4.8f) — Test count delta +4 (renames + flips preserve count slots)
+4.8f changed 4 tests inline (renamed + flipped assertions for Option A → Option C semantics) and added 4 new tests with `test_option_c_*` prefix. Test count delta is +4 net, not the +8 that "added 4 new" would suggest, because the 4 renamed-and-flipped tests stay in the same parametrize/file slot.
+
+### D-184 (4.8f) — Mixed naming: test_option_c_* prefix for NEW tests + section-aligned renames
+NEW tests use `test_option_c_*` prefix for grep-ability + section-alignment. Renamed-and-flipped tests use `test_external_close_*` to align with the section they assert against (existing 4.7b/4.8e section). Mixed naming is deliberate — the prefix tells future readers "this is Option C revision work" vs "this is the original external-close section".
+
+### D-185 (4.8g) — `AccountStatusEntry.broker` is the canonical field name (not `broker_type`)
+Step 4.8g plan referenced `broker_type === "exness"` for the Exness-id filter. Actual field on `AccountStatusEntry` (`web/src/api/client.ts:466-481`) and pre-existing usage at `AccountsTab.tsx:55` is `broker`. Used `a.broker === 'exness'` to match the real type + pre-existing pattern. Documented as a §4 acceptance-criterion deviation.
+
+### D-186 (4.8g) — Skip integration test #3 (banner clears after seed)
+Plan §2.6 listed 3 test ideas (#1 required, #2 + #3 nice-to-have). Shipped #1 (hook invoked with correct exnessIds) + a variant of #2 (empty-Exness-IDs no-op). Skipped #3 (banner clears after mount seed) because rendering `<HedgeOrderForm>` un-stubbed would have pulled in many unrelated mocks; the hook-invocation assertion already proves the seed wire and downstream banner removal is a property of the untouched HedgeOrderForm logic.
+
+### D-187 (4.11) — AlertService extended with httpx Telegram dispatch
+`AlertService.__init__` accepts optional `http_client: httpx.AsyncClient | None`, `telegram_bot_token: str | None`, `telegram_chat_id: str | None`, `telegram_enabled: bool = False`. Lifespan owns the `httpx.AsyncClient` (one pool, closed on shutdown). `_dispatch_telegram` POSTs `https://api.telegram.org/bot{token}/sendMessage` plain-text (no parse_mode) per design §2.E.4. Errors are logged WARNING + swallowed — Redis HASH + WS broadcast remain source of truth (design §2.B.4 no-retry).
+
+### D-188 (4.11) — `bypass_cooldown` parameter on emit (default False)
+`AlertService.emit(*, ..., bypass_cooldown: bool = False)` — recovery alerts (4b_recovery / 4c_recovery per design §2.A.3) will use `True` so a recovery message lands even within the original outage alert's cooldown window. Default `False` preserves the 4.7b contract verbatim — no existing call site changes behaviour. Wired now even though no recovery caller exists yet (Phase 5).
+
+### D-189 (4.11) — Stop-out split into CRITICAL `secondary_liquidation`
+Pre-4.11, all external close_reasons (manual/external/sl_hit/tp_hit/stop_out) emitted the WARN `hedge_leg_external_close_warning`. Stop-out is a broker-initiated liquidation — operator must close the FTMO leg IMMEDIATELY to avoid one-sided exposure. 4.11 carves it off into a CRITICAL `secondary_liquidation` alert with cooldown=0 (one-shot per order; upstream guarantees no duplicate). The 4 non-stop_out reasons still emit `hedge_leg_external_close_warning` (no rename to avoid breaking 4.7b call sites; Phase 5 docs cleanup may rename to design §2.A canonical `secondary_close_manual`).
+
+### D-190 (4.11) — `cooldown_seconds=0` short-circuits SET NX EX
+Redis `SET ... EX 0` is invalid. The 3 new alert types (`hedge_closed`, `leg_orphaned`, `secondary_liquidation`) use `cooldown_seconds=0` semantically meaning "no cooldown, upstream guarantees one-shot per cooldown_key". Implemented as a short-circuit at the top of `emit`: `if not bypass_cooldown and spec["cooldown_seconds"] > 0` → only then attempt the SET NX EX gate. Same path as `bypass_cooldown=True`.
+
+### D-191 (4.11) — `_format_telegram_text` renders title verbatim (no double-emoji prepend)
+Original `_format_telegram_text` prepended `payload.emoji` ahead of `title_vi`. The 4.7b convention already embeds the emoji at the head of `title_vi` (`"⚠️ Lệnh Exness..."`), so prepending again produced double-emoji output. Helper now renders `title_vi` verbatim + body + key:value lines. Plain-text only — no Markdown / HTML parse_mode so special chars (`*`, `_`, `[`, `]`, Vietnamese diacritics) carry through verbatim.
+
+### D-192 (4.11) — `hedge_leg_external_close_warning` naming preserved (Phase 5 rename)
+Design §2.A canonical name for the operator-on-MT5-manual-close case is `secondary_close_manual`. 4.11 keeps the 4.7b name `hedge_leg_external_close_warning` to avoid breaking call sites + tests mid-phase. Rename deferred to Phase 5 docs cleanup along with the deferred alert types (server_error, client_offline + recovery, broker_disconnect + recovery).
+
+## Phase 4 production smoke discoveries (D-SMOKE-N)
+
+D-SMOKE-N entries are operational discoveries from production smoke runs (2026-05-15..16). Distinct namespace from D-NNN (design decisions) to keep the source clear: smoke discoveries are *observations*, design decisions are *commitments*. Some D-SMOKE-N entries triggered Phase 4 sub-fix steps (resolved); the remainder are Phase 5 hardening backlog.
+
+### D-SMOKE-1 — Frontend balance display Exness Standard renders 9.99 instead of 998.77
+Phase 5 backlog. money_digits mismatch on Exness Standard account. Frontend divides by `10**money_digits` at the render boundary (D-108); something in the Exness Standard payload reports `money_digits=4` (cents+) instead of `money_digits=2`. Needs broker-side verification.
+
+### D-SMOKE-2 — RESOLVED via 4.8a + 4.8b: MT5 comment 29-char silent None rejection
+See D-167 + D-168 + D-169. Originally a Phase 4.2 silent-failure mode; resolved at 4.8b. The 4.8a filling_mode bitmask work caught the adjacent ORDER_FILLING_INVALID retcode that was hiding behind the same silent-None until comment ≤29 was applied.
+
+### D-SMOKE-3 — Frontend PositionList Open tab non-filled status render gap
+Phase 5 backlog. The Open tab filters on `status==="filled"`; intermediate states (`close_pending`, `cascade_cancel_pending`) leave rows in a render limbo. Phase 5 should add a "Pending" sub-tab or pill on the existing tabs.
+
+### D-SMOKE-5 — Server lifespan `setup_consumer_groups` runs once on boot
+Phase 5 backlog (Account CRUD API). `SADD accounts:exness {new}` post-boot doesn't create the corresponding consumer group; the new account's cmd_stream sits unacknowledged → cascade-open timeouts. Phase 5 ships POST /api/accounts that creates the consumer group dynamically. Workaround during Phase 4 smoke: server restart after adding any account.
+
+### D-SMOKE-6 — order_id / pair_id / alert_id sequential schema
+Phase 5 backlog. Current schema uses random UUIDs everywhere. CEO request for human-orderable sequential IDs for ops triage. Affects 3 areas; design choice (per-broker counter vs server-wide) deferred to Phase 5 plan.
+
+### D-SMOKE-7 — Frontend Open tab PAIR column shows "—" instead of pair.name
+Phase 5 backlog. PairRow lookup fails for pairs newly added since boot (frontend pairs cache is mount-once via D-131). Symptom-equivalent to D-SMOKE-3 + 4.8g (boot-time fetch gating); fix is in the same shape (subscribe to pair changes or re-fetch on Settings save).
+
+### D-SMOKE-8 — PENDING — Cascade retry safety redesign proposal
+CEO proposal: replace current 3×(0.5,1,2)s with 1×5s + pre-write `cmd_ledger:{request_id}` BEFORE `order_send`. Rationale: the current retry could race against a slow broker fill where attempt N's response arrives during attempt N+1's send window. Pre-writing the ledger gives the response_handler a way to short-circuit duplicate sends. Deferred to Phase 5; design pending.
+
+### D-SMOKE-9 — RESOLVED via 4.8c: FTMO solicited close paths missing unsolicited event publish
+See D-170.
+
+### D-SMOKE-10 — RESOLVED via 4.8d: Exness `_handle_close` mirror 4.8b comment 29-char limit
+See D-171 + D-172 + D-173. The sibling-handler audit lesson codified as WORKFLOW §10.
+
+### D-SMOKE-11 — RESOLVED via 4.8e + 4.8f combo: External close state sync Option A → Option C
+See D-174..D-184.
+
+### D-SMOKE-12 — RESOLVED via 4.8g: Frontend mapping_status boot seed
+See D-185 + D-186.
+

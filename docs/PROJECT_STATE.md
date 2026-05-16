@@ -1,138 +1,98 @@
 # PROJECT_STATE — Live snapshot
 
-> Cập nhật lần cuối: 2026-05-12 — Claude Code (step 3.14a phase-3-docs-sync-core)
+> Cập nhật lần cuối: 2026-05-16 — Claude Code (step 4.12 phase-4-docs-sync)
 > ĐỌC FILE NÀY ĐẦU TIÊN khi mở phiên CTO chat mới.
 
 ## Vị trí hiện tại
-- **Phase**: 3 — Single-leg Trading (FTMO only) — HOÀN THÀNH
-- **Step vừa hoàn thành**: 3.14a — phase-3-docs-sync-core (chính step này)
-- **Step kế tiếp**: 3.14b — phase-3-docs-sync-tech (tech reference docs: 05-redis-protocol, 06-data-models, 07-server-services, 08-server-api, 09-frontend; README; RUNBOOK)
-- **Phase tiếp theo**: 4 — Hedge + Cascade Close (Exness leg)
-- **Blocker**: không (CEO cần Exness MT5 credentials + máy Windows trước step 4.1; xem Phase 4 prerequisites trong MASTER_PLAN_v2 §5)
+- **Phase**: 4 — Hedge + Cascade Close (Exness leg) — HOÀN THÀNH
+- **Step vừa hoàn thành**: 4.12 — phase-end docs sync (chính step này)
+- **Step kế tiếp**: 5.0 — Phase 5 plan drafting (CTO sẽ ship design doc)
+- **Phase tiếp theo**: 5 — Hardening + Deploy
+- **Blocker**: không. Phase 4 acceptance pass, smoke 2026-05-16 verified 5 paths.
 
-## Tóm tắt Phase 3
+## Tóm tắt Phase 4
 
-30 step actions trong 29 commit substantive (13 step chính 3.1–3.13 + 16 sub-fix) + 1 docs sync (3.14, split 2 parts: 3.14a + 3.14b). Tag dự kiến: `step-3.x` per step + `phase-3-complete` (CEO tag thủ công sau khi merge 3.14b).
+20 step actions trong ~32 commit substantive (5 step chính 4.1–4.5 + 8 sub-fix 4.5a/4.7a/4.7b/4.8/4.8a–g + 1 alert backend 4.11 + 8 symbol-mapping 4.A.0–7 + 1 docs sync 4.12). Tag dự kiến: `step-4.x` per step + `phase-4-complete` (CEO tag thủ công sau khi merge 4.12).
 
-**Server (Phase 3 add)**:
-- RedisService đầy đủ CRUD: orders (với Lua CAS), accounts, pairs, streams, heartbeat, position cache, settings.
-- Lifespan `setup_consumer_groups()` idempotent, init account script `scripts/ops_init_account.py`.
-- POST /api/orders endpoint với OrderService validation pipeline (pair → account → client → symbol → tick → SL/TP direction). Phase 3 full close only (D-100).
-- response_handler + event_handler background loops (consumer group "server", XREADGROUP BLOCK 1000ms). Reconciliation infrastructure (reconcile_state stream + DealList history).
-- position_tracker_loop 1s poll: unrealized P&L formula với USD conversion (JPY via USDJPY, cross via USD/QUOTE direct hoặc inverse).
-- REST surface Phase 3: GET /api/orders (list), GET /api/orders/{id}, GET /api/positions, GET /api/history, POST /api/orders/{id}/close (202), POST /api/orders/{id}/modify (202). Plus step 3.12: GET /api/accounts. Plus step 3.13: PATCH /api/accounts/{broker}/{id}, DELETE /api/pairs guards.
-- 6 WS channels: ticks:*, candles:*, positions (exact-match), orders, accounts, agents (Phase 1 legacy).
-- BroadcastService coalesces partial cTrader delta ticks (3.11b root cause fix).
-- account_status_loop 5s broadcast → header AccountStatusBar.
-- **473 server test pass**, mypy strict clean.
+**Server (Phase 4 add)**:
+- Exness account & pairs CRUD extension (step 4.5): hedge pairs (FTMO leg + Exness leg + risk_ratio), accounts:exness SET, mapping_status:{account_id} per-account state.
+- HedgeService cascade orchestrator (step 4.7a + 4.8): cascade open Path A primary→secondary 3-retry exponential backoff, cascade close 5 trigger paths (A/B/C/D/E) with cascade_lock Lua SET-NX-EX serialization, cascade_cancel_pending transient state for primary-closed-mid-secondary-open race.
+- AlertService publish-only + Telegram dispatch (steps 4.7b + 4.11): Redis HASH alert:{id} + WS `alerts` channel + 5-type registry (`hedge_leg_external_close_warning`, `hedge_leg_external_modify_warning`, `hedge_closed`, `leg_orphaned`, `secondary_liquidation`) + httpx POST sendMessage plain-text + bypass_cooldown param.
+- Server external-close state sync Option C (steps 4.8e + 4.8f): external Exness close stamps `s_status="closed"` on order HASH but keeps composed `status="filled"` so operator UI close path stays available; cascade orchestrator detects orphan-close on subsequent FTMO close and finalizes composed `status="closed"` via short-circuit (no redundant cmd push).
+- Symbol mapping cache + wizard backend (steps 4.A.0–5): per-Exness-account mapping cache files (file=truth, Redis=working cache), AutoMatchEngine 3-tier (whitelist/fuzzy/manual hints), mapping_status state machine (pending_mapping/active/spec_mismatch/disconnected), wizard REST surface.
+- Frontend mapping_status boot seed (step 4.8g): `useMappingStatusSubscription` hoisted from `<AccountsTab>` to `<MainPage>` so REST seed + WS subscribe run at app boot, not gated on opening Settings → Accounts.
+- ws.py whitelist: +`mapping_status:*` (step 4.A.4) + `alerts` (step 4.11).
+- **940 server tests pass**, mypy strict + ruff clean.
 
-**FTMO client (Phase 3 new)**:
-- Twisted bridge connect cTrader Open API + OAuth (`hedger-shared`).
-- Action handlers: open (market với post-fill amend D-058, limit, stop), close (2-event sequence D-066), modify_sl_tp.
-- Unsolicited execution events → event_stream (position_closed, pending_filled, position_modified, order_cancelled).
-- account_info_loop publish `account:ftmo:{acc}` HASH mỗi 30s.
-- Reconciliation infrastructure: ReconcileReq + DealListByPositionIdReq + fetch_close_history.
-- 177 test pass, mypy strict clean.
+**Exness client (Phase 4 NEW)**:
+- MT5 Python lib bridge (Windows-only per D-010) — Redis + heartbeat + symbol sync + position monitor poll 2s + reconciliation.
+- ActionHandler full open/close with **filling-mode bitmask** retry loop (FOK → IOC → BOC → RETURN fallback per symbol-specific bitmask).
+- Comment field 29-char SDK limit (D-167) + `v3:` prefix neutral (was leaking strategy intent) + last_error capture on order_send None.
+- Position monitor persistent snapshot + cmd ledger (4.3a) for restart resilience.
+- account_info_loop publish `account:exness:{acc}` HASH mỗi 30s.
+- 197 exness-client tests pass.
 
-**Web (Phase 3 add)**:
-- HedgeOrderForm submit `POST /api/orders` real với 3 layer preflight (pair/symbol/volume, Entry-vs-SL, bid/ask direction). Order type selector Market/Limit/Stop (3.12b). Market mode auto-entry từ throttled tick (5s).
-- PositionList Open + History tabs với PositionRow + OrderRow, Pair column từ pairs cache (3.12a). Modify modal + Close confirm.
-- AccountStatusBar header với 5s WS broadcast (3.12) — dot + balance/equity per account.
-- Settings modal (3.13): Pairs CRUD + Accounts enable/disable toggle.
-- useWebSocket hook hoisted MainPage (3.10): single shared connection, 6 channels subscribed.
-- VolumeCalculator state machine với `refreshing` variant giữ prev result trong recalc (3.12c — no flicker).
-- Bundle: 463.91 kB JS / 147.11 kB gzip.
+**FTMO client (Phase 4 add)**:
+- Step 4.8c: solicited close paths also publish `position_closed` event so server can see operator-issued FTMO close (was only fast-path slow-path discrepancy). Single helper `_publish_position_closed_from_fill` reused by both paths.
+- 181 ftmo-client tests pass.
 
-**Infra (Phase 3)**:
-- WS VALID_CHANNEL_PREFIXES = (ticks:, candles:, positions, orders, accounts, agents).
-- Step 3.13a: row_to_entry helper centralized cho REST + WS payload single source of truth.
-- 6 router include trong main.py (auth, auth_ctrader, charts, health, history, orders, pairs, positions, symbols, accounts, ws).
+**Web (Phase 4 add)**:
+- Symbol mapping wizard UI (step 4.A.6) — full Settings → Accounts integration with raw-symbols / auto-match / spec-mismatch resolve / save flows; per-account mapping_status dot + Map / Edit / Re-sync / Resolve buttons gated by status.
+- HedgeOrderForm pair-aware validation (step 4.A.7) — `isWizardNotRun` banner block when pair's Exness account has mapping_status ≠ "active"; `checkPairSymbol` pre-flight against `/api/pairs/{id}/check-symbol/{symbol}` before submit.
+- Step 4.8g: mapping_status REST seed + WS subscribe hoisted to MainPage (boot-level) → wizard-not-run banner no longer false-fires on browser refresh.
+- 77 web tests pass.
+
+**Infra (Phase 4)**:
+- Step 4.4a + 4.4b: vendor cTrader OAuth helper into ftmo-client tree + delete legacy hedger_shared directory (CPR consolidation).
+- WS channel whitelist now 9 entries: ticks:*, candles:*, positions, orders, accounts, agents, mapping_status:*, alerts (4.11), + transitional.
+- Tag plan: `step-4.X` per step, `phase-4-complete` after merge.
 
 ## Active context (state runtime để smoke)
 - Backend chạy ở `http://localhost:8000`.
 - Frontend dev server ở `http://localhost:5173` với Vite proxy `/api` + `/ws` → backend.
 - Default credentials: `admin` / `admin`.
-- FTMO cTrader OAuth done qua `GET /api/auth/ctrader/ftmo` (CEO setup 1 lần ở Phase 3).
+- FTMO cTrader OAuth done qua `GET /api/auth/ctrader/ftmo` (CEO setup 1 lần ở Phase 3, persisted).
 - FTMO live account: ctid_trader_account_id=47247733 (CEO free trial).
-- 117 symbol mapped (whitelist) → ~91 match cTrader broker.
-- 473 server tests + 177 ftmo-client tests passing, mọi build check (typecheck/lint/format/build) đều green.
+- Exness MT5: demo 433590363 + Windows máy #2 demo Standard (CEO smoke 2026-05-15..16).
+- Symbol mapping per-Exness-account files at `server/data/symbol_mapping_cache/{signature}.json`; signature = sha256 sorted raw symbol names (D-SM-03).
+- 940 server + 181 ftmo-client + 197 exness-client + 77 web = **1395 tests** passing, mọi build check (typecheck/lint/format/build) đều green.
+- Telegram production alert channel: gated by `TELEGRAM_ALERT_ENABLED=true` + `TELEGRAM_ALERT_BOT_TOKEN` + `TELEGRAM_ALERT_CHAT_ID` in `.env`. CEO chuẩn bị channel mới trước khi enable production.
 
-## Known issues — hoãn cho Phase 5 hardening
+## Recent decisions (top 5 Phase 4, full list trong DECISIONS.md)
 
-Backlog tổng Phase 1 + 2 + 3 (chi tiết trong PHASE_3_REPORT.md §Phase 5 hardening backlog):
-
-**Server**:
-- Per-account/per-pair SET index cho orders (list performance ở scale lớn).
-- Idempotency-Key header cho POST endpoints.
-- Dead-letter sweeper cho stuck consumer group PEL.
-- Migrate Phase 2 pair rows: set enabled=true explicitly (D-085).
-- pyproject.toml pythonpath consolidation; fix pre-existing test_config.py mypy errors.
-- p_money_digits fallback từ account:ftmo:{acc}.money_digits.
-- sync_symbols persist contract_size + quote_currency cho non-FX symbols.
-- Auto-subscribe USD-cross tick streams khi first position open.
-- Consolidate position:{id} JSON với position_cache:{id} HASH.
-- count_orders_by_pair: thay O(N) scan bằng pair_orders:{pair_id} SET index.
-
-**FTMO client**:
-- Protocol-level disconnect trước TCP close (shutdown order).
-- disconnect() cancel _pending_executions với timeout.
-- Retry amend sau POSITION_LOCKED transient error.
-- closePositionDetail.moneyDigits vs account-level reconcile.
-- ProtoOAMarginCallTriggerEvent cho stopout close_reason.
-- Pending orders reconciliation full handling.
-- hasMore pagination DealListByPositionIdRes.
-
-**Frontend**:
-- Vitest + React Testing Library setup.
-- Custom ConfirmModal thay window.confirm.
-- Typed API client với conversion layer (giảm cast bool/str).
-- Optimistic UI cho Close + Modify.
-- History pagination UI.
-- WS tick dedup nếu bandwidth concern.
-- Multi-draft order form (multiple tabs).
-- PairPicker toast on stale re-select (silent today).
-- Row click selection + chart overlay (entry/SL/TP overlay cho selected order — backlog kế thừa từ Phase 2 + 3).
-- Banker's rounding cho exotic symbols (D-122 mở rộng).
-- Memoize Map<order_id, Order> selector (D-133 join performance).
-- Hybrid UUID display first-4+last-4 (D-132 mở rộng).
-- Reactive pairs cache refresh sau CRUD (3.12a chỉ mount-once fetch).
-- Initial-state observability: one-shot WARN per (symbol, process) khi tickThrottled lần đầu null.
-- TTL refresh on tick cache stale prev edge (3.11b root cause hardening).
-- entryPrice subscriber memoization nếu widgets mở rộng (3.12b).
-- Distance-from-market sanity check broker-aware (3.12b limit/stop validation hardening).
-
-**Operations**:
-- Document `uvicorn --reload` flag trong RUNBOOK (3.14b).
-- Document FTMO client restart workflow (3.14b).
-- Browser hard refresh checklist sau frontend merge.
-- Multi-FTMO mixed-state OrderForm message refinement (3.13a hiện 3-tier; mixed state Phase 5).
-- Extract Pydantic schemas sang `app/api/schemas/` để break D-149 function-local imports.
-
-## Recent decisions (top 5, full list trong DECISIONS.md)
-
-1. **D-149 (3.13a)**: Function-local imports trong accounts.py để break circular dependency accounts ↔ account_helpers. Codebase convention từ ws.py. Phase 5 cleanup: extract schemas sang dedicated module.
-2. **D-148 (3.13a)**: OrderForm 3-tier ftmoBlockMessage priority (no account > all disabled > offline). Mỗi message actionable (configure / Settings / investigate process).
-3. **D-147 (3.13a)**: row_to_entry helper centralized trong app/services/account_helpers.py. Single source of truth cho REST + WS payload conversion. Pre-3.13a regression Boolean("false") === true fixed permanently.
-4. **D-146 (3.13)**: FTMO account create UI defer Phase 5 (OAuth flow integration). Bootstrap path qua FTMO client first-time write.
-5. **D-145 (3.13)**: Phase 3 Exness account dropdown defer — text input free-form. Phase 4 widens to <select> khi accounts:exness SET populated.
+1. **D-181 (4.8f)**: Server external close state sync revised Option A → Option C. Composed `status` stays `"filled"` on external Exness close; orphan stays visible on Open tab + API close path open. Cascade orchestrator detects on subsequent FTMO close and finalizes via short-circuit. Locks the orphan UX trap that 4.8e Option A introduced (row vanish + 400 not_closeable reject).
+2. **D-167 (4.8b)**: MT5 SDK comment field actual 29-character limit (SDK docs claim 31). Comments >29 chars cause `order_send` to silent-fail with None return + no exception. Phase 4 ActionHandler now clamps to `[:29]` + captures `mt5.last_error()` for diagnostic surface.
+3. **D-170 (4.8c)**: FTMO client solicited close paths also publish `position_closed` unsolicited event via single shared helper `_publish_position_closed_from_fill`. Pre-4.8c only manual closes published; server cascade couldn't detect operator-triggered FTMO close. Single source of truth: helper called from both fast-path + slow-path post-fill-parse.
+4. **D-187..D-192 (4.11)**: AlertService extended with httpx Telegram dispatch + `bypass_cooldown` parameter + 3 new types (`hedge_closed` INFO, `leg_orphaned` + `secondary_liquidation` CRITICAL). 4.7b 2 WARN types preserved verbatim. Telegram errors are best-effort (logged WARNING, swallowed) so Redis + WS remain source of truth.
+5. **D-185..D-186 (4.8g)**: Frontend `mappingStatusByAccount` boot seed hoisted from `<AccountsTab>` to `<MainPage>` via `useMappingStatusSubscription(exnessIds)` so REST seed + WS subscribe run at app boot. Pre-4.8g the "Hedge leg blocked — wizard not run" banner false-fired on every browser refresh because the seed was gated on opening Settings → Accounts.
 
 ## Pending items / TODO
 
-- 3.14b: Cập nhật tech reference docs (05-redis-protocol, 06-data-models, 07-server-services, 08-server-api, 09-frontend) + README + RUNBOOK với deltas Phase 3.
-- Phase 4: CEO chuẩn bị Exness MT5 credentials + máy Windows local trước step 4.1 (MT5 lib Windows-only).
-- Phase 4: Symbol mapping JSON có entry FTMO ↔ Exness cho test pair (vd EURUSD ↔ EURUSDm).
-- Phase 5 backlog: Telegram wrapper rewrite, drag price line, missing toasts, sync_symbols 24h cache, ratio per pair, plus Phase 3 hardening items liệt kê ở Known Issues.
+- Phase 5 plan (step-5.0): CTO drafts design doc covering D-SMOKE-1, 3, 5, 6, 7, 8 + deferred alerts (server_error, client_offline/online, broker_disconnect/reconnect) + Settings API for alert toggles + alert templates module + frontend toggle UI + orphan_sweep module + MT5 multi-account hardening + cTrader market-data 24h cache + deploy Windows Server 2022 + Tailscale mesh.
+- CEO: provision dedicated Telegram alert chat (separate from self-check chat per D-4.0-spec §2.E.1) + set `TELEGRAM_ALERT_ENABLED=true` in `.env` to go live with operator alerts.
+- CEO: archive Phase 4 self-check files (`step-4.*-selfcheck.md` in repo root) sau khi tag `phase-4-complete` per WORKFLOW §6.1.
+
+## Phase 5 hardening backlog summary
+
+Xem `docs/PHASE_4_REPORT.md` §9 cho full ~30 items danh sách. Highlights:
+
+- **Safety / correctness**: D-SMOKE-8 cascade retry redesign (1×5s pre-write cmd_ledger vs 3×0.5/1/2 stricter ledger semantics), force-close FTMO orphan endpoint, orphan_sweep module, alert_templates module extraction.
+- **Operations**: D-SMOKE-5 consumer groups runtime API (Account CRUD POST creates group dynamically; current lifespan-only setup requires server restart), D-SMOKE-6 sequential ID schema (order_id, pair_id, alert_id), MT5 multi-account on single Windows host.
+- **Frontend**: D-SMOKE-1 balance display bug Exness Standard (renders 9.99 instead of 998.77 — money_digits mismatch), D-SMOKE-3 PositionList Open tab non-filled status render gap, D-SMOKE-7 pair column "—" instead of pair.name.
+- **Alerts system**: 5 deferred types (`server_error`, `client_offline`, `client_online`, `broker_disconnect`, `broker_reconnect`) + Settings API `GET/PUT /api/settings/alerts` + `POST /api/alerts/test` + frontend toggle UI tab + recovery-alert bypass_cooldown wiring + alert_templates.py + alert_service_keys.py modules.
+- **Cleanup / refactor**: hedge_leg_external_close_warning → secondary_close_manual rename per design §2.A canonical (defer Phase 5 to avoid breaking 4.7b call sites mid-phase), Pydantic schemas extract to `app/api/schemas/`.
+- **Workflow / process**: bug-class fix audit sibling handlers (now codified in WORKFLOW.md §10 per D-4.8d lesson + D-SMOKE-10 incident).
 
 ## Quick reference
 - Repo: https://github.com/matran19900/ftmo_exness_hedge_v3
 - Workspace: `/workspaces/ftmo_exness_hedge_v3`
 - Redis: `redis://192.168.88.4:6379/2` (LAN)
-- Symbol count: 117 mapped (whitelist) → ~91 match cTrader broker.
+- Symbol count: 117 FTMO whitelist (mapping_ftmo_whitelist.json) → per-Exness-account raw-symbol files at `server/data/symbol_mapping_cache/{sig}.json`.
 - Test accounts:
   - cTrader **demo** (Phase 2 market data only, OAuth done).
-  - FTMO live free trial cTrader (Phase 3 trading, ctid_trader_account_id=47247733, OAuth done).
-  - Exness live (Phase 4+ — máy Windows cần thiết, MT5 lib Windows-only).
+  - FTMO live free trial cTrader (Phase 3+ trading, ctid_trader_account_id=47247733, OAuth done).
+  - Exness MT5 demo 433590363 + Standard demo Windows máy #2 (Phase 4 smoke).
 - Python: 3.12, Node: 24, npm: 11.12.1.
-- Stack versions: React 19.2, Vite 8.0, TypeScript 6.0, Tailwind 3.4, Zustand 5.0, Axios 1.16, react-hot-toast 2.6, Lightweight Charts 5.2, FastAPI, Pydantic v2, redis.asyncio, Twisted (FTMO client only), fakeredis (tests).
-- WS channels (6): ticks:{symbol}, candles:{symbol}:{tf}, positions, orders, accounts, agents (legacy).
-- REST surface Phase 3 (8 endpoints aggregate): /api/orders (POST + GET list + GET /id + POST /id/close + POST /id/modify), /api/positions (GET), /api/history (GET), /api/pairs (GET POST PATCH DELETE), /api/accounts (GET + PATCH /broker/id), /api/symbols (GET), /api/charts/:symbol/ohlc (GET), /api/symbols/:symbol/calculate-volume (POST), /api/auth/login (POST), /api/auth/ctrader/... (Phase 2).
+- Stack versions: React 19.2, Vite 8.0, TypeScript 6.0, Tailwind 3.4, Zustand 5.0, Axios 1.16, react-hot-toast 2.6, Lightweight Charts 5.2, FastAPI, Pydantic v2 (+ `model_validator` for cross-field check), redis.asyncio, Twisted (FTMO client only), `MetaTrader5` package (Exness client only, Windows), httpx (Phase 4 AlertService Telegram + FTMO OAuth), fakeredis (tests).
+- WS channels (9): `ticks:{symbol}`, `candles:{symbol}:{tf}`, `positions`, `orders`, `accounts`, `agents` (legacy), `mapping_status:{exness_account_id}` (Phase 4.A.4), `alerts` (Phase 4.11).
+- REST surface Phase 4 cumulative (~18 endpoints): /api/orders (POST + GET list + GET /id + POST /id/close + POST /id/modify), /api/positions (GET), /api/history (GET), /api/pairs (GET POST PATCH DELETE + GET /id/metadata + GET /id/check-symbol/{symbol}), /api/accounts (GET + PATCH /broker/id + DELETE /broker/id), /api/accounts/exness/{id}/raw-symbols, /api/accounts/exness/{id}/mapping-status, /api/accounts/exness/{id}/symbol-mapping/auto-match, /api/accounts/exness/{id}/symbol-mapping/save, /api/accounts/exness/{id}/symbol-mapping/edit, /api/accounts/exness/{id}/symbols/resync, /api/symbol-mapping-cache (GET), /api/symbols (GET), /api/symbols/{symbol}/calculate-volume (POST), /api/charts/:symbol/ohlc (GET), /api/auth/login (POST), /api/auth/ctrader/... (Phase 2).

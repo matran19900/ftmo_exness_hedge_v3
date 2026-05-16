@@ -5,10 +5,13 @@ Công cụ hedge thủ công giữa FTMO (cTrader) và Exness (MT5). Mỗi lện
 ## Documentation
 - Master plan: [docs/MASTER_PLAN_v2.md](docs/MASTER_PLAN_v2.md)
 - Trạng thái hiện tại: [docs/PROJECT_STATE.md](docs/PROJECT_STATE.md)
-- Sổ quyết định: [docs/DECISIONS.md](docs/DECISIONS.md)
+- Sổ quyết định: [docs/DECISIONS.md](docs/DECISIONS.md) (+ [docs/SYMBOL_MAPPING_DECISIONS.md](docs/SYMBOL_MAPPING_DECISIONS.md) cho D-SM-N namespace)
 - Báo cáo phase 1: [docs/PHASE_1_REPORT.md](docs/PHASE_1_REPORT.md)
 - Báo cáo phase 2: [docs/PHASE_2_REPORT.md](docs/PHASE_2_REPORT.md)
 - Báo cáo phase 3: [docs/PHASE_3_REPORT.md](docs/PHASE_3_REPORT.md)
+- Báo cáo phase 4: [docs/PHASE_4_REPORT.md](docs/PHASE_4_REPORT.md)
+- Phase 4 design (cascade + Telegram alerts): [docs/phase-4-design.md](docs/phase-4-design.md)
+- Symbol mapping design: [docs/phase-4-symbol-mapping-design.md](docs/phase-4-symbol-mapping-design.md)
 - Runbook (dev workflow + ops): [docs/RUNBOOK.md](docs/RUNBOOK.md)
 - Template handoff CTO: [docs/CTO_HANDOFF_TEMPLATE.md](docs/CTO_HANDOFF_TEMPLATE.md)
 
@@ -344,15 +347,14 @@ Phase 3 ship **single-leg FTMO trading** end-to-end. Exness hedging cascade defe
 
 ### Phase 3 limitations
 
-- Single FTMO account workflow (Phase 4 sẽ add Exness hedging cascade).
-- Full position close only — no partial close (Phase 4+ scope).
+- Single FTMO account workflow (Phase 4 đã add Exness hedging cascade — xem section dưới).
+- Full position close only — no partial close (Phase 4+ scope, vẫn defer trong Phase 4 cuối).
 - No drag-to-modify SL/TP trên chart (Phase 5 hardening backlog).
 - No row click → chart overlay entry/SL/TP highlight (Phase 5).
 - FTMO account create cần OAuth flow CLI Phase 3 (Settings UI defer Phase 5).
-- Exness account dropdown Phase 3 vẫn text-input free-form (Phase 4 widens to dropdown khi accounts:exness populated).
 - Single admin user (multi-user defer per non-goals).
 
-### Stack version (production-tested)
+### Stack version (production-tested, Phase 3 baseline)
 
 - **Backend**: Python 3.12 + FastAPI + Pydantic v2 + redis.asyncio + uvicorn.
 - **FTMO client**: Python 3.12 + Twisted (cTrader Open API protobuf bridge) + hedger-shared (OAuth + symbol mapping).
@@ -361,6 +363,51 @@ Phase 3 ship **single-leg FTMO trading** end-to-end. Exness hedging cascade defe
 - **Tests**: server 473 (pytest + fakeredis), ftmo-client 177, web tsc + eslint + vite build clean.
 
 Xem `docs/PHASE_3_REPORT.md` cho full acceptance table + step ledger + Phase 5 hardening backlog.
+
+## Phase 4 features (production-ready)
+
+Phase 4 ship **dual-leg hedge + cascade close** (FTMO primary + Exness secondary), **per-Exness-account symbol mapping wizard**, và **Telegram operator alerts**. Xem `docs/PHASE_4_REPORT.md` full coverage; tóm lược:
+
+### Operator flow (Phase 4 delta)
+
+1. **Exness MT5 client** chạy trên máy Windows song song server (Linux) + FTMO client (Linux). Heartbeat 30s + position monitor poll 2s.
+2. **Settings → Accounts**: per-Exness-account "Map Symbols" wizard. Resolve auto-match proposals (3-tier: whitelist / fuzzy / manual hints), confirm spec divergence (contract_size + digits), save → file=truth at `server/data/symbol_mapping_cache/{signature}.json`. Per-account `mapping_status` state machine: `pending_mapping` → `active` → (`spec_mismatch` / `disconnected`).
+3. **Order form** chỉ accept submit khi pair's Exness account có `mapping_status="active"` (HARD-BLOCK per D-156). Wizard-not-run → banner block + submit disabled.
+4. **Submit** → server pushes FTMO cmd → on fill server cascades Exness open cmd via `HedgeService.cascade_secondary_open` 3-retry exponential backoff. Both legs filled → composed status `"filled"`. Either leg cascade-exhausted → composed `"secondary_failed"` + CRITICAL `leg_orphaned` Telegram alert.
+5. **Cascade close** — 5 trigger paths funnel through `HedgeService.cascade_close_other_leg` with `cascade_lock` Lua SET-NX-EX serialization:
+   - **Path A**: UI close FTMO leg → server cascade Exness.
+   - **Path B**: UI close Exness leg → server cascade FTMO.
+   - **Path C**: completion of Path A or D (server-initiated Exness close landed via `position_closed_external`).
+   - **Path D**: SL/TP hit on FTMO → server cascade Exness.
+   - **Path E**: External MT5 close / margin call / stop-out → state-sync per Option C (composed stays `"filled"`, orphan visible + UI-closeable, cascade finalizes on subsequent operator close).
+6. **Telegram alerts** (Phase 4 ships 5 types):
+   - `hedge_closed` (INFO ✅) — both legs terminal.
+   - `leg_orphaned` (CRITICAL 🚨) — cascade open retry exhausted; FTMO primary orphan needs manual close.
+   - `secondary_liquidation` (CRITICAL 🚨) — Exness leg stop-out by broker.
+   - `hedge_leg_external_close_warning` (WARN ⚠️) — operator closed Exness leg externally (sl_hit / tp_hit / manual / external; not stop_out — that's `secondary_liquidation`).
+   - `hedge_leg_external_modify_warning` (WARN ⚠️) — operator modified Exness leg SL/TP on MT5.
+   - Production channel via `TELEGRAM_ALERT_*` env vars (separate chat from Claude Code self-check).
+7. **Real-time updates** — 9 WS channels now (added: `mapping_status:{exness_account_id}`, `alerts`). Frontend subscribes to mapping_status at app boot (step 4.8g) + Settings modal subscribes Account-specific channels while open.
+
+### Phase 4 limitations (Phase 5 backlog)
+
+- Alert types `server_error`, `client_offline` + `client_online`, `broker_disconnect` + `broker_reconnect` deferred (each needs upstream wire — FastAPI exception middleware, heartbeat state machine, cross-process client emit).
+- Settings → General tab for alert toggles deferred (Telegram channel mute is workaround Phase 4).
+- `POST /api/alerts/test` test-button endpoint deferred.
+- Account CRUD POST + DELETE that creates/destroys consumer group dynamically deferred (Phase 4 still requires server restart after `accounts:exness` SADD/SREM).
+- Dual-leg orphan badge UI in PositionList deferred.
+- Force-close FTMO orphan endpoint deferred (operator currently uses cTrader UI).
+- D-SMOKE-1 Exness Standard balance display, D-SMOKE-3 Open tab non-filled render gap, D-SMOKE-6 sequential ID schema, D-SMOKE-7 pair column fallback, D-SMOKE-8 cascade retry redesign — all Phase 5.
+
+### Phase 4 stack additions
+
+- **Exness client**: Python 3.12 + `MetaTrader5` lib (Windows-only) + redis.asyncio + standard library. ActionHandler filling-mode bitmask retry (FOK/IOC/BOC/RETURN). 197 tests.
+- **Server new deps**: httpx (Phase 4 AlertService Telegram + FTMO OAuth refactor at 4.4a/4.4b).
+- **Web new deps**: none (Phase 3 stack carries through).
+- **Tests Phase 4 final**: server 940 (+467 from Phase 3), ftmo 181 (+4), exness 197 (NEW), web 77 (+27). **1395 total** (+745 from Phase 3 cuối).
+- **Tags**: `step-4.X` per step + `phase-4-complete` (CEO tag thủ công sau khi merge 4.12).
+
+Xem `docs/PHASE_4_REPORT.md` cho full acceptance table + step ledger + Phase 5 hardening backlog (~30 items).
 
 ## Account Management (Phase 3+)
 

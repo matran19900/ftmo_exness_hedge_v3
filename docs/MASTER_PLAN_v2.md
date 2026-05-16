@@ -419,20 +419,45 @@ Add Exness leg + cascade close. Verify mục tiêu cốt lõi #1 (sync) và #2 (
 15. P&L 2 leg với USDJPY pair → đúng.
 16. P&L 2 leg với XAUUSD ↔ GOLD (symbol mapping khác name) → đúng.
 
-### Step breakdown
+### Step breakdown — **shipped** (per D-4.0-1 renumber)
+
+Plan gốc tier 4.1–4.11 absorbed nhiều scope shift trong execution. Bảng dưới là step ledger thực tế đã ship; rationale + sub-fix breakdown chi tiết trong `PHASE_4_REPORT.md` §3 + §4.
+
 | # | Branch | Scope |
 |---|---|---|
-| 4.1 | `step/4.1-exness-client-skeleton` | Connect Redis + heartbeat + MT5 connect + `XREADGROUP` loop. **Note**: code viết trên Linux devcontainer OK, nhưng test/run phải pull về máy Windows (MT5 lib Windows-only). |
-| 4.2 | `step/4.2-exness-client-actions-and-monitor` | Handlers `open` market + `close` + response + retcode mapping + position monitor poll 2s + account publish. |
-| 4.3 | `step/4.3-server-accounts-pairs-api` | CRUD accounts (FTMO + Exness) + CRUD pairs full với risk_ratio. |
-| 4.4 | `step/4.4-server-consumer-groups-runtime` | Tạo consumer group runtime khi add account (không cần restart). |
-| 4.5 | `step/4.5-server-create-hedge-order` | `create_hedge_order` full flow primary→secondary với retry 3 lần. |
-| 4.6 | `step/4.6-server-cascade-close` | Cascade logic + idempotent flag + integrate vào response/event handlers. |
-| 4.7 | `step/4.7-server-position-tracker-2legs` | Extend tracker tính P&L 2 leg + total. |
-| 4.8 | `step/4.8-web-settings-modal` | Settings modal 3 tab Accounts/Pairs/General. |
-| 4.9 | `step/4.9-web-account-status-bar` | AccountStatus bar + heartbeat WS subscribe. |
-| 4.10 | `step/4.10-web-hedge-display-and-toasts` | PositionList row hedge 2 leg + total + status indicator + form validate clients online + toast cascade events. |
-| 4.11 | `step/4.11-phase-4-docs-sync` | Update docs flows hedge + cascade + `PHASE_4_REPORT.md` + append `DECISIONS.md`. Tag `phase-4-complete`. |
+| 4.0 | `step/4.0-cascade-and-alerts-design-doc` | Design doc `phase-4-design.md` (cascade close + Telegram alerts + R10 sub-rule + D-4.0-N decisions). |
+| 4.A.0 | `step/4.A.0-symbol-mapping-design-doc` | `phase-4-symbol-mapping-design.md` + `SYMBOL_MAPPING_DECISIONS.md` (D-SM-01..12). |
+| 4.A.1 | `step/4.A.1-ftmo-whitelist-split` | FTMOWhitelistService + migration from monolithic JSON. |
+| 4.A.2 | `step/4.A.2-mapping-cache-repository` | MappingCacheRepository + atomic file write + signature lock. |
+| 4.A.3 | `step/4.A.3-auto-match-engine` | AutoMatchEngine 3-tier (whitelist / fuzzy / manual hints). |
+| 4.A.4 | `step/4.A.4-server-api-mapping-wizard` | 5 REST endpoints + `mapping_status:*` WS channel whitelist. |
+| 4.A.5 | `step/4.A.5-server-volume-lookup-refactor` | OrderService.volume_lookup → MappingService per-account. |
+| 4.A.6 | `step/4.A.6-web-mapping-wizard-ui` | Settings → Accounts wizard flow. |
+| 4.A.7 | `step/4.A.7-web-form-pair-aware-validation` | HedgeOrderForm `isWizardNotRun` + `checkPairSymbol` pre-flight. |
+| 4.1 | `step/4.1-exness-client-skeleton` | Exness MT5 client skeleton (Redis + heartbeat + MT5 connect + XREADGROUP loop). |
+| 4.2 | `step/4.2-exness-client-actions-and-sync` | ActionHandler open + close + symbol sync + retcode map. |
+| 4.2a | `step/4.2a-engine-bilateral-strip-and-normalized-hints` | AutoMatchEngine bilateral strip + normalized hints. |
+| 4.3 | `step/4.3-exness-position-monitor` | Position monitor poll loop 2s + `position_closed_external` / `position_modified` events. |
+| 4.3a | `step/4.3a-position-monitor-persistent-snapshot` | Persistent snapshot + cmd ledger for restart resilience. |
+| 4.4 | `step/4.4-exness-account-info-and-reconciliation` | account_info_loop + reconciliation skeleton. |
+| 4.4a | `step/4.4a-vendor-ctrader-oauth-and-pyproject-cleanup` | Vendor cTrader OAuth helper + pyproject CPR. |
+| 4.4b | `step/4.4b-delete-hedger-shared-directory` | Delete legacy hedger_shared/ (CPR consolidation). |
+| 4.5 | `step/4.5-server-accounts-pairs-crud-extension` | Accounts + pairs CRUD extension Option B (server-side risk_ratio + Exness account field). |
+| 4.5a | `step/4.5a-mapping-status-cleanup-on-remove` | mapping_status cleanup on remove_account + lifespan orphan-pointer detection (D-150..D-153). |
+| 4.7a | `step/4.7a-server-cascade-open-and-retry` | Server cascade open Path A v2 + secondary 3-retry (D-154..D-156). |
+| 4.7b | `step/4.7b-warning-alert-routing` | AlertService publish-only + 2 WARN types (D-157..D-159). |
+| 4.8 | `step/4.8-cascade-close-orchestrator` | Cascade close orchestrator + cascade_lock Lua + 5 trigger paths (D-160..D-163). |
+| 4.8a | `step/4.8a-exness-action-handler-filling-mode-bitmask` | Exness filling_mode bitmask + 4-attempt retry + symbol_select belt-suspenders (D-164..D-166). |
+| 4.8b | `step/4.8b-exness-action-handler-comment-and-last-error` | Exness `_handle_open` comment [:29] + `v3:` prefix + last_error (D-167..D-169). |
+| 4.8c | `step/4.8c-ftmo-publish-position-closed-on-solicited-close` | FTMO solicited close → publish `position_closed` (D-170; resolves D-SMOKE-9). |
+| 4.8d | `step/4.8d-exness-action-handler-close-comment-and-last-error` | Exness `_handle_close` mirror 4.8b + mt5-execution-events.md append (D-171..D-173). |
+| 4.8e | `step/4.8e-server-external-close-state-sync` | External-close state sync Option A initial (D-174..D-178). |
+| 4.8f | `step/4.8f-external-close-state-sync-option-c` | External-close state sync Option C correction (D-179..D-184; resolves D-SMOKE-11). |
+| 4.8g | `step/4.8g-frontend-mapping-status-boot-seed` | Frontend mapping_status REST seed hoisted to MainPage boot (D-185..D-186; resolves D-SMOKE-12). |
+| 4.11 | `step/4.11-server-telegram-alert-dispatch-and-types` | AlertService + httpx Telegram dispatch + bypass_cooldown + 3 new types (D-187..D-192). Per D-4.0-1 renumber: alert backend inserted between original 4.10 and 4.11; docs sync shifted to 4.12. |
+| 4.12 | `step/4.12-phase-end-docs-sync` | Phase 4 docs sync (PROJECT_STATE + DECISIONS + PHASE_4_REPORT + this step table + WORKFLOW §10 + README Phase 4 features). Tag `phase-4-complete`. |
+
+**Plan vs ship**: Plan gốc 4.1–4.11 (11 rows) → thực tế 30 step actions across 5 sub-trees. Plan rows 4.8 (Settings modal) + 4.9 (Account status bar) + 4.10 (Web hedge display) absorbed into 4.8 sub-fix series + 4.A.x symbol-mapping sub-phase per CEO direction mid-phase. Alert backend originally not planned at row-level; inserted at 4.11 per D-4.0-1.
 
 ---
 
@@ -777,13 +802,14 @@ CEO chỉ điền 2 dòng cuối → CTO mới có đủ context bắt đầu wo
 |---|---|---|---|---|
 | 1 — Foundation | ✅ done | 9/9 | `phase-1-complete` | `docs/PHASE_1_REPORT.md` |
 | 2 — Market Data + Chart + Form | ✅ done | 21/10 | `phase-2-complete` | `docs/PHASE_2_REPORT.md` |
-| 3 — Single-leg Trading | ✅ done | 30/14 | `phase-3-complete` (chờ merge 3.14b) | `docs/PHASE_3_REPORT.md` |
-| 4 — Hedge + Cascade | ⏳ pending | 0/11 | — | — |
+| 3 — Single-leg Trading | ✅ done | 30/14 | `phase-3-complete` | `docs/PHASE_3_REPORT.md` |
+| 4 — Hedge + Cascade | ✅ done | 30/11 | `phase-4-complete` (chờ merge 4.12) | `docs/PHASE_4_REPORT.md` |
 | 5 — Hardening + Deploy | ⏳ pending | 0/10 | — | — |
 
 > Phase 1 đếm 9 step khi tính cả 1.4a (sub-fix). Plan gốc có 8.
 > Phase 2 đếm 21 step khi tính 10 step chính + 11 sub-fix (2.1a, 2.1b, 2.2a, 2.6a, 2.7a, 2.7b, 2.7c, 2.7e, 2.8a, 2.9a, 2.9b). Plan gốc có 10. Step 2.7d (RAF throttle) làm xong nhưng REJECT — không merge. Chi tiết deviation xem `PHASE_2_REPORT.md`.
 > Phase 3 đếm 30 step actions khi tính 13 step chính (3.1–3.13) + 16 sub-fix (3.3a, 3.3b, 3.4a, 3.4b, 3.4c, 3.5a, 3.5b, 3.10a, 3.11a, 3.11b, 3.11c, 3.11d, 3.12a, 3.12b, 3.12c, 3.13a) + 1 docs sync split 2 commits (3.14a + 3.14b). Plan gốc có 14 step. Chi tiết deviation + cumulative deliverables (REST surface 6 endpoints + 6 WS channels + 650 tests + 104 decisions D-046→D-149) xem `PHASE_3_REPORT.md`.
+> Phase 4 đếm 30 step actions khi tính 5 step chính chuyển soang Phase 4 hedge (4.1, 4.2, 4.3, 4.4, 4.5) + 8 sub-fix cascade/alert (4.2a, 4.3a, 4.4a, 4.4b, 4.5a, 4.7a, 4.7b, 4.8) + 7 sub-fix 4.8 series (4.8a..g) + 1 alert backend (4.11) + 8 symbol-mapping sub-phase (4.A.0..7) + 1 docs sync (4.12). Plan gốc có 11 step (4.1..4.11) — plan rows 4.8/4.9/4.10 absorbed vào 4.8 sub-fix + 4.A. Per D-4.0-1, alert backend inserted ở slot 4.11; docs sync shifted to 4.12. Cumulative deliverables: REST surface ~18 endpoints + 9 WS channels (incl. `mapping_status:*` + `alerts`) + 1395 tests + 43 D-NNN (D-150→D-192) + 12 D-SMOKE + 12 D-SM (symbol mapping). Chi tiết xem `PHASE_4_REPORT.md`.
 
 CTO update tracker này sau mỗi phase PASS.
 
