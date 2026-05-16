@@ -325,6 +325,25 @@ class HedgeService:
                 )
                 return
 
+            # Step 4.8e — belt-and-suspenders short-circuit when the
+            # secondary leg is already closed but the composed status
+            # hasn't flipped yet (out-of-order event delivery during a
+            # concurrent operator-click-Close + external-close race).
+            # The 4.8e external-close stamp in event_handler writes
+            # ``s_status=closed`` + composed ``status=closed`` together
+            # via a single ``update_order`` patch, so under normal
+            # conditions the composed_status check above already
+            # short-circuits this case. This check guards the narrow
+            # window between the two writes if a third party (or a
+            # future code path) ever splits them.
+            if closed_leg == "p" and order.get("s_status") == "closed":
+                logger.info(
+                    "cascade_close.no_op_secondary_already_closed "
+                    "order_id=%s s_status=closed trigger=%s",
+                    order_id, trigger_path,
+                )
+                return
+
             if closed_leg == "p":
                 other_leg = "s"
                 other_broker = "exness"

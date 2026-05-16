@@ -744,6 +744,36 @@ async def _handle_exness_position_closed_external(
     pair_name = await _resolve_pair_name(redis_svc, pair_id)
     close_price = fields.get("close_price", "")
 
+    # Step 4.8e — stamp the order HASH so composed status reflects broker
+    # truth BEFORE emitting the WARNING. Pre-4.8e this branch only fired
+    # the alert; ``s_status`` stayed "filled" while the broker had already
+    # closed the position, producing two knock-on bugs:
+    #   1. Phantom open row in PositionList (frontend drops via
+    #      useWebSocket.ts:169 when status==="closed").
+    #   2. Double-close hazard: API endpoint _CLOSEABLE_STATUSES rejects
+    #      a second close attempt with order_not_closeable.
+    # NO cascade FTMO is triggered (R3 + design §1.B — secondary passive
+    # policy). The FTMO leg stays open as an orphan and the WARNING
+    # below tells the operator to clean it up manually.
+    #
+    # Idempotent: a duplicate event (e.g. reconcile_state replay) finds
+    # s_status == "closed" already and skips the stamp. The alert
+    # cooldown_key=order_id suppresses the duplicate WARNING separately.
+    if order.get("s_status") != "closed":
+        await redis_svc.update_order(
+            order_id,
+            patch={
+                "s_status": "closed",
+                "s_close_price": close_price,
+                "s_closed_at": fields.get("close_time_ms", ""),
+                "s_close_reason": close_reason,
+                "s_realized_pnl": fields.get("realized_profit", ""),
+                "s_commission": fields.get("commission", ""),
+                "status": "closed",
+                "updated_at": str(int(time.time() * 1000)),
+            },
+        )
+
     title_vi = "⚠️ Lệnh Exness đóng ngoài hệ thống"
     body_vi = (
         f"Order {order_id} ({pair_name}): Exness leg ticket {ticket} "
@@ -766,9 +796,11 @@ async def _handle_exness_position_closed_external(
             "close_time_ms": fields.get("close_time_ms", ""),
         },
     )
-    # NO cascade FTMO. Operator action required. Step 4.8 will wire the
-    # server_initiated cascade Path B/C/D/E; external bucket stays
-    # WARNING-only by design (R3 + design §1.B).
+    # NO cascade FTMO. R3 + design §1.B — secondary passive policy means
+    # the server does NOT auto-close the FTMO leg to mirror an external
+    # Exness close. Operator manually closes the FTMO orphan via the
+    # cTrader UI (Phase 5 backlog: server-side "force-close FTMO orphan"
+    # endpoint).
 
 
 async def _handle_exness_position_modified(

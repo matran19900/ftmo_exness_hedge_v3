@@ -696,3 +696,76 @@ async def test_close_initiated_broadcast_includes_trigger_path(
     assert len(msgs) == 1
     assert msgs[0]["trigger_path"] == "D"
     assert msgs[0]["closed_leg"] == "p"
+
+
+# ---------------------------------------------------------------------------
+# Step 4.8e — belt-and-suspenders s_status pre-check
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cascade_close_no_op_when_s_status_closed_composed_still_filled(
+    redis_client: fakeredis.aioredis.FakeRedis,
+    redis_svc: RedisService,
+    hedge_svc: HedgeService,
+    broadcast: _CapturingBroadcast,
+) -> None:
+    """Step 4.8e — belt-and-suspenders. If the secondary leg already
+    landed ``s_status="closed"`` (e.g. via the 4.8e external-close
+    stamp written by event_handler) but the composed ``status`` still
+    reads "filled" (out-of-order event delivery race), the cascade
+    orchestrator MUST short-circuit BEFORE pushing a duplicate close
+    cmd that the broker would reject with ``position_not_found``.
+
+    Pre-4.8e this check did not exist — the composed-status-only
+    guard at hedge_service.py:317-326 missed this race window.
+    """
+    await _seed_filled_hedge(redis_svc)
+    # Simulate the partial-write race: s_status flipped to closed, but
+    # the composed status update lost the race (extremely narrow window
+    # under Option A's single-patch write; documented edge case).
+    await redis_svc.update_order(
+        "ord_hedge_1", patch={"s_status": "closed"}
+    )
+
+    await hedge_svc.cascade_close_other_leg(
+        "ord_hedge_1",
+        closed_leg="p", close_reason="manual", trigger_path="B",
+    )
+
+    # No Exness cmd pushed — the belt-and-suspenders check fires.
+    entries = await redis_client.xrange(
+        "cmd_stream:exness:exness_001", "-", "+"
+    )
+    assert entries == []
+    # No close_initiated broadcast either (the cascade never advanced).
+    types = [m.get("type") for _ch, m in broadcast.published]
+    assert "close_initiated" not in types
+    # Lock released cleanly.
+    assert await redis_svc.read_cascade_lock("ord_hedge_1") is None
+
+
+@pytest.mark.asyncio
+async def test_cascade_close_proceeds_when_s_status_filled(
+    redis_client: fakeredis.aioredis.FakeRedis,
+    redis_svc: RedisService,
+    hedge_svc: HedgeService,
+    broadcast: _CapturingBroadcast,
+) -> None:
+    """Regression: the belt-and-suspenders short-circuit must NOT fire
+    on the happy path (s_status="filled"). Cascade proceeds normally."""
+    await _seed_filled_hedge(redis_svc)
+    fill_task = asyncio.create_task(
+        _race_leg_closed(redis_svc, "ord_hedge_1", "s")
+    )
+    await hedge_svc.cascade_close_other_leg(
+        "ord_hedge_1",
+        closed_leg="p", close_reason="manual", trigger_path="B",
+    )
+    await fill_task
+
+    # Cascade fired — exactly one cmd pushed.
+    entries = await redis_client.xrange(
+        "cmd_stream:exness:exness_001", "-", "+"
+    )
+    assert len(entries) == 1

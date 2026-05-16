@@ -53,6 +53,14 @@ Bất kỳ event nào đóng primary (TP, SL, manual cTrader, manual app, extern
 ### R10 — Cascade on secondary close (NEW v2)
 Nếu secondary bị đóng externally (margin call MT5, manual MT5 UI) → `position_monitor_loop` detect → server cascade close primary.
 
+#### Phase 4 implementation note (step 4.7b + 4.8e — secondary-passive lock)
+Phase 4 implements R10 as **WARNING-only**, NOT auto-cascade. Per CEO policy + design §1.B (secondary leg always passive), when `position_monitor` detects an external Exness close, the server:
+1. Stamps the order HASH: `s_status="closed"`, composed `status="closed"`, `s_close_price` / `s_closed_at` / `s_close_reason` / `s_realized_pnl` / `s_commission` from the event payload (step 4.8e — state sync only).
+2. Emits a `hedge_leg_external_close_warning` alert (step 4.7b — `⚠️ Lệnh Exness đóng ngoài hệ thống`, body explicitly tells the operator the FTMO leg is still open).
+3. Does **NOT** auto-close the FTMO leg. `p_status` stays `filled` (FTMO orphan); operator manually closes the FTMO leg via cTrader UI.
+
+Net behaviour: the state-sync in (1) prevents the pre-4.8e double-close hazard (operator clicks Close → API rejects with `order_not_closeable` because composed status is already `closed`) and the phantom-open row in the PositionList. The WARNING in (2) surfaces the orphan condition. Auto-cascade per R10's literal wording is deferred — Phase 5 backlog item could add a server-side "force-close FTMO orphan" endpoint if the manual workflow proves friction-heavy.
+
 ## 2. SL/TP rules (R11–R20)
 
 ### R11 — SL bắt buộc cho primary
