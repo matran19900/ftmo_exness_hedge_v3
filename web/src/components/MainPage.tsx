@@ -1,5 +1,6 @@
-import { useEffect } from 'react'
+import { useEffect, useMemo } from 'react'
 import { listPairs } from '../api/client'
+import { useMappingStatusSubscription } from '../hooks/useMappingStatusSubscription'
 import { useTickThrottle } from '../hooks/useTickThrottle'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useAppStore } from '../store'
@@ -41,6 +42,30 @@ export function MainPage() {
       cancelled = true
     }
   }, [setPairs])
+
+  // Step 4.8g: hoist the mapping_status seed + WS subscribe to app-boot
+  // level so the order form's wizard-not-run banner doesn't false-fire
+  // on browser refresh. Prior to this, the only caller of
+  // ``useMappingStatusSubscription`` was ``<AccountsTab>`` (inner tab of
+  // the Settings modal, default-closed) — meaning ``mappingStatusByAccount``
+  // stayed at its non-persisted ``{}`` initial value across reloads, and
+  // the ``?? 'pending_mapping'`` fallback in HedgeOrderForm tripped the
+  // banner regardless of the real per-account status. See
+  // ``verify-frontend-mapping-status-stale-bug.md`` §6 for the full trace.
+  //
+  // ``exnessIds`` is derived from ``accountStatuses`` rather than a
+  // dedicated REST call so the seed runs as soon as the first
+  // ``accounts`` WS broadcast (or REST list) lands; an empty array on
+  // the very first render is a no-op inside the hook.
+  const accountStatuses = useAppStore((s) => s.accountStatuses)
+  const exnessIds = useMemo(
+    () =>
+      accountStatuses
+        .filter((a) => a.broker === 'exness')
+        .map((a) => a.account_id),
+    [accountStatuses],
+  )
+  useMappingStatusSubscription(exnessIds)
 
   return (
     <div className="h-screen flex flex-col bg-gray-50 min-w-[1280px]">
