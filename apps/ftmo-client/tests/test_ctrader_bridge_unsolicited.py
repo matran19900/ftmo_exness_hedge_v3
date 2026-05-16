@@ -140,8 +140,16 @@ def patch_extract(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_on_message_resolves_pending_future_when_client_msg_id_matches(
     patch_extract: None,
 ) -> None:
-    """Regression for the 3.4b/3.4c path: a matching clientMsgId →
-    resolve the pending fill future, do NOT publish to event_stream."""
+    """Step 4.8c contract — ``_on_message`` itself must NEVER publish for
+    solicited fills (matching clientMsgId path). The publish for
+    SOLICITED CLOSES is handled by ``close_position`` after the future
+    resolves (single source of truth — see ``_publish_position_closed_from_fill``).
+    Open-side fills still don't publish anywhere (Phase 3 invariant).
+
+    The fixture below uses an open-side fill (no ``closePositionDetail``)
+    to exercise the bare future-resolution path. The post-4.8c new
+    test ``test_close_position_slow_path_publishes_position_closed``
+    covers the close-side variant end-to-end."""
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     bridge = _make_bridge(redis)
     bridge._loop = asyncio.get_running_loop()
@@ -163,7 +171,8 @@ async def test_on_message_resolves_pending_future_when_client_msg_id_matches(
 
     # Yield to allow any scheduled tasks (there shouldn't be any) to run.
     await asyncio.sleep(0)
-    # event_stream should be untouched on the solicited path.
+    # event_stream should be untouched — _on_message itself never publishes
+    # for solicited fills, whether open-side or close-side.
     entries = await redis.xrange("event_stream:ftmo:ftmo_001", "-", "+")
     assert entries == []
 
@@ -466,3 +475,196 @@ async def test_event_stream_key_includes_account_id() -> None:
     await bridge._publish_unsolicited_event(closed)
     entries = await redis.xrange("event_stream:ftmo:acc_xyz", "-", "+")
     assert len(entries) == 1
+
+
+# ---------- Step 4.8c: solicited-close event_stream publish ----------
+
+
+@pytest.mark.asyncio
+async def test_close_position_fast_path_publishes_position_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Step 4.8c — close_position fast path (broker fires ORDER_FILLED
+    synchronously, no intermediate ORDER_ACCEPTED). Bridge must publish
+    position_closed to event_stream:ftmo BEFORE returning to action_handlers
+    so the server's cascade_close_other_leg has its required event."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (  # noqa: PLC0415
+        ProtoOAOrderType,
+    )
+
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    bridge = _make_bridge(redis)
+
+    closed = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=5451198,
+        order_type=ProtoOAOrderType.MARKET,  # MARKET + closing → "manual"
+        closing_order=True,
+        deal_price=1.08400,
+        deal_ts=1735000050000,
+        close_gross_profit=240,
+    )
+
+    async def stub_send(*_args: Any, **_kwargs: Any) -> Any:
+        return closed
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+
+    result = await bridge.close_position(
+        position_id=5451198,
+        volume_lots=0.10,
+        lot_size=100_000,
+        client_msg_id="req_close_fast",
+    )
+
+    # Existing resp_stream path still works (close_position returns dict).
+    assert result["success"] is True
+    assert result["close_price"] == "1.084"
+
+    # NEW in 4.8c: event_stream entry published.
+    entries = await redis.xrange("event_stream:ftmo:ftmo_001", "-", "+")
+    assert len(entries) == 1
+    _entry_id, fields = entries[0]
+    assert fields["event_type"] == "position_closed"
+    assert fields["broker_order_id"] == "5451198"
+    assert fields["position_id"] == "5451198"
+    assert fields["close_reason"] == "manual"
+    assert fields["realized_pnl"] == "240"
+    assert fields["close_price"] == "1.084"
+
+
+@pytest.mark.asyncio
+async def test_close_position_slow_path_publishes_position_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Step 4.8c — close_position slow path: broker fires ORDER_ACCEPTED
+    first, then ORDER_FILLED arrives via _on_message Future resolution.
+    Bridge must publish position_closed after the Future resolves
+    (single-source publish per §2.3 — _on_message itself does NOT
+    publish, only sets the Future)."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (  # noqa: PLC0415
+        ProtoOAExecutionEvent as _PE,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (  # noqa: PLC0415
+        ProtoOAOrderType,
+    )
+
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    bridge = _make_bridge(redis)
+
+    accepted = _PE()
+    accepted.executionType = ProtoOAExecutionType.ORDER_ACCEPTED
+
+    closed = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=5451199,
+        order_type=ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+        closing_order=True,
+        deal_price=1.07500,
+        deal_ts=1735000060000,
+        close_gross_profit=-180,  # negative → "sl"
+    )
+
+    async def stub_send(*_args: Any, **kwargs: Any) -> Any:
+        # Resolve the pending future ourselves (simulating _on_message
+        # delivering the FILLED event after _send_and_wait returned
+        # ACCEPTED). The future was registered by close_position
+        # BEFORE _send_and_wait was called.
+        cmid = kwargs.get("client_msg_id", "")
+        future = bridge._pending_executions.get(cmid)
+        if future is not None and not future.done():
+            future.set_result(closed)
+        return accepted
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+
+    result = await bridge.close_position(
+        position_id=5451199,
+        volume_lots=0.10,
+        lot_size=100_000,
+        client_msg_id="req_close_slow",
+    )
+    assert result["success"] is True
+
+    entries = await redis.xrange("event_stream:ftmo:ftmo_001", "-", "+")
+    assert len(entries) == 1
+    _entry_id, fields = entries[0]
+    assert fields["event_type"] == "position_closed"
+    assert fields["close_reason"] == "sl"
+    assert fields["realized_pnl"] == "-180"
+
+
+@pytest.mark.asyncio
+async def test_close_position_no_publish_when_close_position_detail_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defensive guard: if a close cmd somehow returns an ORDER_FILLED
+    WITHOUT ``closePositionDetail`` (shouldn't happen in practice but
+    cTrader has surprised us before), the helper exits early and no
+    XADD lands. The order's resp_stream still gets the success."""
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    bridge = _make_bridge(redis)
+
+    # Build an ORDER_FILLED without close_gross_profit -> no closePositionDetail.
+    open_like = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=5451200,
+        deal_price=1.08000,
+        deal_ts=1735000070000,
+    )
+    assert not open_like.deal.HasField("closePositionDetail")
+
+    async def stub_send(*_args: Any, **_kwargs: Any) -> Any:
+        return open_like
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+
+    await bridge.close_position(
+        position_id=5451200,
+        volume_lots=0.10,
+        lot_size=100_000,
+        client_msg_id="req_no_detail",
+    )
+
+    entries = await redis.xrange("event_stream:ftmo:ftmo_001", "-", "+")
+    assert entries == []
+
+
+@pytest.mark.asyncio
+async def test_place_market_order_open_fill_does_not_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: Phase 3 invariant. Open-side solicited fills
+    (place_market_order returning ORDER_FILLED with no closePositionDetail)
+    MUST NOT publish to event_stream. Open-side state is driven by the
+    resp_stream ``open`` ACK; adding a publish here would create a
+    duplicate ``position_closed`` row that doesn't even apply."""
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    bridge = _make_bridge(redis)
+
+    open_filled = _exec_event(
+        ProtoOAExecutionType.ORDER_FILLED,
+        position_id=5451201,
+        deal_price=1.08500,
+        deal_ts=1735000080000,
+        # NO close_gross_profit → no closePositionDetail
+    )
+    assert not open_filled.deal.HasField("closePositionDetail")
+
+    async def stub_send(*_args: Any, **_kwargs: Any) -> Any:
+        return open_filled
+
+    monkeypatch.setattr(bridge, "_send_and_wait", stub_send)
+
+    await bridge.place_market_order(
+        symbol_id=1,
+        side="buy",
+        volume_lots=0.10,
+        lot_size=100_000,
+        sl_price=0.0,
+        tp_price=0.0,
+        client_msg_id="req_open",
+    )
+
+    entries = await redis.xrange("event_stream:ftmo:ftmo_001", "-", "+")
+    assert entries == []

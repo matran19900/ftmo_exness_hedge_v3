@@ -629,6 +629,11 @@ class CtraderBridge:
                 if exec_type == ProtoOAExecutionType.ORDER_FILLED:
                     # Fast path — broker filled immediately, no
                     # intermediate ACCEPTED on the wire.
+                    # Step 4.8c — publish position_closed for the cascade
+                    # close orchestrator BEFORE returning to action_handlers.
+                    # Pre-4.8c this event only fired for unsolicited closes,
+                    # leaving Phase 4 cascade Path A starved (D-SMOKE-9).
+                    await self._publish_position_closed_from_fill(response)
                     return self._parse_filled_close(response)
                 if exec_type == ProtoOAExecutionType.ORDER_ACCEPTED:
                     # Intermediate — wait for ORDER_FILLED via side channel.
@@ -648,6 +653,10 @@ class CtraderBridge:
                                 f"{_TRADING_TIMEOUT_SECONDS}s of ORDER_ACCEPTED"
                             ),
                         }
+                    # Step 4.8c — slow-path publish: the FILL arrived via
+                    # ``_on_message`` resolving the Future. Same cascade
+                    # contract as the fast path above.
+                    await self._publish_position_closed_from_fill(fill_event)
                     return self._parse_filled_close(fill_event)
                 # ORDER_REJECTED / other terminal type → fall through.
             return self._parse_close_position(response)
@@ -1459,6 +1468,13 @@ class CtraderBridge:
                 future = self._pending_executions.get(cmid)
                 if future is not None and not future.done() and self._loop is not None:
                     self._loop.call_soon_threadsafe(future.set_result, inner)
+                    # Step 4.8c — DO NOT publish ``position_closed`` here
+                    # for solicited closes. ``close_position`` itself
+                    # awaits the future then calls
+                    # ``_publish_position_closed_from_fill`` after parsing.
+                    # Single publish site per slow-path branch avoids
+                    # the double-publish risk an in-message XADD would
+                    # introduce. See verify-ftmo-close-event-gap.md §7.
                     return
             # Other executionType (REPLACED on a different correlation,
             # late REJECTED, etc.) while a fill-future is pending —
@@ -1473,6 +1489,73 @@ class CtraderBridge:
             return
         self._loop.call_soon_threadsafe(
             lambda: asyncio.create_task(self._publish_unsolicited_event(inner))
+        )
+
+    async def _publish_position_closed_from_fill(
+        self, fill_event: ProtoOAExecutionEvent
+    ) -> None:
+        """Step 4.8c — publish ``position_closed`` to ``event_stream:ftmo``
+        for solicited close fills.
+
+        Solicited fills (the ``close_position`` method's fast path AND
+        slow path) bypass ``_publish_unsolicited_event`` — the future
+        resolution path in ``_on_message`` returns before the publish
+        site. But Phase 4's cascade-close orchestrator
+        (``HedgeService.cascade_close_other_leg``, step 4.8) is gated
+        on ``event_type=position_closed`` from the FTMO leg. Without
+        this helper firing for solicited closes, cascade Path A
+        (server-initiated via ``POST /api/orders/{id}/close``) is
+        starved — discovered in the 2026-05-16 Phase 4 smoke
+        (D-SMOKE-9; full diagnostic in
+        ``verify-ftmo-close-event-gap.md``).
+
+        Idempotency: the server's
+        ``event_handler._handle_position_closed`` flow into
+        ``cascade_close_other_leg`` no-ops on terminal order status
+        (step 4.8 ``cascade_close.no_op_terminal``), so a duplicate
+        publish from ``reconcile_state`` replay is harmless.
+
+        Guards:
+          - Returns silently when the event has no
+            ``deal.closePositionDetail`` (defensive — the caller is
+            only supposed to invoke for close fills, but the check
+            keeps the helper safe to invoke unconditionally).
+          - Returns silently when ``self._redis is None`` (test
+            isolation or a shutdown race).
+          - Returns silently when ``build_event_payload`` returns
+            ``None`` (a future ``ProtoOAExecutionType`` value the
+            payload builder doesn't classify — logged at WARNING so
+            an operator notices).
+          - XADD failures are logged and swallowed, matching
+            ``_publish_unsolicited_event``.
+        """
+        if not fill_event.deal.HasField("closePositionDetail"):
+            return
+        if self._redis is None:
+            return
+        payload = build_event_payload(fill_event)
+        if payload is None:
+            logger.warning(
+                "solicited_close.build_event_payload_returned_none "
+                "executionType=%s",
+                int(fill_event.executionType),
+            )
+            return
+        stream = f"event_stream:ftmo:{self._account_id}"
+        try:
+            await self._redis.xadd(
+                stream, payload, maxlen=10000, approximate=True  # type: ignore[arg-type]
+            )
+        except RedisError:
+            logger.exception(
+                "solicited_close.event_stream_xadd_failed stream=%s",
+                stream,
+            )
+            return
+        logger.info(
+            "published solicited position_closed: position_id=%s close_reason=%s",
+            payload.get("position_id", ""),
+            payload.get("close_reason", ""),
         )
 
     async def _publish_unsolicited_event(self, event: ProtoOAExecutionEvent) -> None:

@@ -294,6 +294,80 @@ pins the D-080 silent-drop contract.
 Test: `test_order_cancelled_matching_pending_order_marks_cancelled`
 pins the legitimate-cancel path.
 
+## 3.8 Solicited close — event_stream publish on close-side FILL (step 4.8c)
+
+Up to step 4.8b, **solicited** closes (operator clicks the UI Close
+button → server `POST /api/orders/{id}/close` → close cmd via
+`cmd_stream:ftmo:{account_id}`) only published to
+`resp_stream:ftmo:{account_id}` (`action=close status=success`). The
+`position_closed` event_stream entry was emitted ONLY by:
+
+- **Unsolicited** closes (operator UI close, SL/TP hit, stop-out per
+  §3.2-3.6) via `_publish_unsolicited_event` in `_on_message`.
+- **Reconcile** reconstruction on offline-window closes
+  (§3.7 / §12 — `reconstructed=true` payload).
+
+This was the wrong design for Phase 4. The cascade-close orchestrator
+(`HedgeService.cascade_close_other_leg`, step 4.8) is gated on
+`event_type=position_closed` from the FTMO leg via
+`event_handler._handle_position_closed`. Without the event for
+solicited closes, **cascade Path A (server-initiated via API
+endpoint) was completely broken** — the secondary Exness leg stayed
+open as an orphan after the operator clicked Close. Discovered in
+the Phase 4 smoke 2026-05-16 (D-SMOKE-9); full diagnostic trail in
+`verify-ftmo-close-event-gap.md`.
+
+Step 4.8c extends the bridge: `ctrader_bridge.close_position`
+publishes `position_closed` to `event_stream:ftmo:{account_id}`
+AFTER parsing the `ORDER_FILLED` event with `closePositionDetail`.
+Applies to **both** fast path (cTrader returns `ORDER_FILLED`
+synchronously via `_send_and_wait`) and slow path
+(`ORDER_ACCEPTED` first, then `ORDER_FILLED` arrives via
+`_on_message` resolving the `_pending_executions` Future). The
+helper `_publish_position_closed_from_fill` is the single source of
+truth — `_on_message` itself does NOT publish for solicited fills
+to avoid double-publishing the slow-path branch.
+
+The `close_reason` value is computed by the existing
+`_infer_close_reason` (§3.6) — `sl|tp|manual|unknown` — and lands on
+the event payload exactly as it does for unsolicited closes. The
+server's cascade orchestrator does NOT depend on `close_reason`
+matching `server_initiated`; it derives the cascade `trigger_path`
+from the `close_trigger_initiated="A"` flag the API endpoint writes
+on the order row (`OrderService.close_order`, step 4.8) — a Path A
+marker independent of FTMO's `close_reason` vocabulary.
+
+**Idempotency**: the server's `_handle_position_closed` flows into
+`cascade_close_other_leg` which no-ops on terminal order status (step
+4.8 `cascade_close.no_op_terminal`). A duplicate publish from
+`reconcile_state` replay during the same close window is harmless.
+
+**Guards** on `_publish_position_closed_from_fill`:
+
+- Returns early when the event has no `deal.closePositionDetail`
+  (defensive — the caller is supposed to only invoke for close fills,
+  but the check keeps the helper safe to call unconditionally).
+- Returns early when `self._redis is None` (test isolation).
+- Returns early when `build_event_payload` returns `None` (an
+  executionType the payload builder doesn't classify — logged at
+  WARNING so operators notice).
+- XADD failures are logged and swallowed.
+
+Tests:
+
+- `test_close_position_fast_path_publishes_position_closed` — pins
+  the fast-path publish.
+- `test_close_position_slow_path_publishes_position_closed` — pins
+  the slow-path publish (Future-resolution branch).
+- `test_close_position_no_publish_when_close_position_detail_missing`
+  — defensive guard.
+- `test_place_market_order_open_fill_does_not_publish` — regression
+  on the Phase 3 invariant that open-side fills NEVER reach
+  `event_stream` (open state drives via the `resp_stream` `open` ACK).
+- `test_on_message_resolves_pending_future_when_client_msg_id_matches`
+  — pins the single-source-of-truth contract: `_on_message` itself
+  does NOT publish for solicited fills.
+
 ## 4. SL/TP modification flows
 
 ### 4.1 Modify qua API (server initiated) — successful flow (step 3.4 verified, step 3.4c documented)
@@ -710,3 +784,4 @@ first.
 | 2026-05-11 | 3.5a | Rewrite close_reason via structured order metadata (`order.orderType` + `order.closingOrder` + `closePositionDetail.grossProfit` sign); replace the 1-pip price-tolerance heuristic. Add extended `closePositionDetail` field publishing on `position_closed` payloads (`commission`, `swap`, `balance_after_close`, `money_digits`, `closed_volume`). §3.2-3.4 rewritten to show the structured signals. §3.6 replaced with the new mapping table + CEO sample. §8 ProtoOAOrder full field list (including `closingOrder`, `isStopOut`) + ProtoOAOrderType enum verified (STOP_LOSS_TAKE_PROFIT=4, NOT 6). |
 | 2026-05-11 | 3.5b | §11 added — reconciliation flow on client restart (`ProtoOAReconcileReq` → `reconcile_snapshot` event_stream entry; 3-attempt exponential backoff retry; failure-tolerant). §12 added — `fetch_close_history` command flow that pulls deal history via `ProtoOADealListByPositionIdReq` and publishes reconstructed `position_closed` events with `reconstructed=true`. DESCRIPTOR inspection: `ProtoOADealListByPositionIdReq.fromTimestamp`/`toTimestamp` are REQUIRED (label=2), not optional — bridge sets `fromTimestamp=0` / `toTimestamp=now_ms` for full history. |
 | 2026-05-11 | 3.7 | §3.7 added — D-080 ORDER_CANCELLED noise pattern: cTrader emits an internal-orderId `ORDER_CANCELLED` event whenever a position with SL/TP closes (cleanup of the synthetic STOP_LOSS_TAKE_PROFIT order). Server's event_handler silently drops these by comparing `broker_order_id` against the `p_broker_order_id_to_order:{id}` side-index — a legitimate operator-cancelled pending order has a hit; the D-080 noise events don't. Logged at DEBUG only. |
+| 2026-05-16 | 4.8c | §3.8 added — solicited closes (`close_position` via cmd_stream) now ALSO publish `position_closed` to `event_stream:ftmo:{account_id}` via the new `_publish_position_closed_from_fill` helper. Called from both close_position branches (fast path + slow-path Future resolution); `_on_message` itself stays publish-free for solicited fills (single source of truth, no double-publish). Fixes Phase 4 cascade close Path A starvation discovered in the 2026-05-16 smoke (D-SMOKE-9). Open-side solicited fills (place_market_order) remain publish-free — Phase 3 invariant. Full diagnostic in `verify-ftmo-close-event-gap.md`. |
