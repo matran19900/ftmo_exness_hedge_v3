@@ -405,7 +405,15 @@ class ActionHandler:
             "deviation": 20,
             "magic": position.magic,
             "type_filling": self._mt5.ORDER_FILLING_IOC,
-            "comment": f"close:{request_id}"[:31],
+            # Step 4.8d — mirror of 4.8b _handle_open fix. MT5 Python SDK
+            # silently rejects comments of 30+ chars with ``last_error
+            # == (-2, 'Invalid "comment" argument')``. Pre-4.8d the close
+            # path used ``f"close:{request_id}"[:31]`` which hit the same
+            # 30+ char silent-None bug under Phase 4 cascade close
+            # (D-SMOKE-10, smoke 2026-05-16). Prefix renamed ``close:``
+            # → ``v3:`` for symmetry with ``_handle_open`` and to keep a
+            # single grep target across handlers (D-4.8d-1).
+            "comment": f"v3:{request_id}"[:29],
         }
         try:
             result = await _to_thread(self._mt5.order_send, request)
@@ -421,11 +429,22 @@ class ActionHandler:
             )
             return
         if result is None:
+            # Step 4.8d — mirror of 4.8b. Capture ``mt5.last_error()`` so
+            # silent validation rejections surface in operator-visible
+            # logs + the published response. Pre-4.8d the opaque
+            # ``order_send_returned_none`` slug hid the actual reason
+            # (D-SMOKE-10 was the comment-length variant).
+            last_err = await _to_thread(self._mt5.last_error)
+            logger.warning(
+                "close.order_send_none request_id=%s last_error=%s",
+                request_id, last_err,
+            )
             await self._publish_response(
                 request_id=request_id,
                 action="close",
                 status="error",
                 reason="order_send_returned_none",
+                error_msg=f"order_send_returned_none last_error={last_err}",
                 cascade_trigger=cascade_trigger,
                 broker_position_id=str(position_ticket),
             )

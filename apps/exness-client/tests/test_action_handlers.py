@@ -1197,3 +1197,240 @@ async def test_open_last_error_not_queried_when_send_succeeds(
         )
     for rec in caplog.records:
         assert "order_send_none" not in rec.getMessage()
+
+
+# ---------------------------------------------------------------------------
+# Step 4.8d — _handle_close mirror of 4.8b (comment 29-char + last_error)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_close_comment_prefix_is_v3_not_hedge(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Step 4.8d — close path comment prefix must be ``v3:`` (mirrors
+    4.8b for the open path). Pre-4.8d the close path used
+    ``close:`` prefix which doesn't leak the hedging keyword but
+    inherits the 30+ char silent-None bug from the OPEN path's
+    ``hedge:`` prefix (close: was 6 chars + 25 of uuid = 31 chars,
+    same failure mode). Unified to ``v3:`` for a single grep target
+    across handlers (D-4.8d-1)."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        positions_get=(_open_position(),),
+    )
+    await handler.dispatch(
+        {
+            "request_id": "abc123",
+            "action": "close",
+            "broker_position_id": "67890",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"][0]
+    assert sent["comment"].startswith("v3:")
+    assert "hedge" not in sent["comment"].lower()
+    assert "close:" not in sent["comment"]
+
+
+@pytest.mark.asyncio
+async def test_close_comment_length_capped_at_29(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Step 4.8d — close path comment field truncated to ``[:29]`` so a
+    32-char uuid request_id doesn't trip the MT5 SDK's 30+ char silent
+    rejection (D-SMOKE-10, 2026-05-16 cascade close smoke)."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        positions_get=(_open_position(),),
+    )
+    long_request_id = "abc123def456abc123def456abc123ab"  # 32 chars
+    assert len(long_request_id) == 32
+    await handler.dispatch(
+        {
+            "request_id": long_request_id,
+            "action": "close",
+            "broker_position_id": "67890",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"][0]
+    comment = sent["comment"]
+    assert len(comment) <= 29
+    assert len(comment) == 29  # worst case fully populated
+
+
+@pytest.mark.asyncio
+async def test_close_comment_short_request_id_no_truncation(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Short request_id produces a comment shorter than 29 with no
+    truncation artefacts."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        positions_get=(_open_position(),),
+    )
+    await handler.dispatch(
+        {
+            "request_id": "shortid10",
+            "action": "close",
+            "broker_position_id": "67890",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"][0]
+    assert sent["comment"] == "v3:shortid10"
+    assert len(sent["comment"]) == 12
+
+
+@pytest.mark.asyncio
+async def test_close_full_comment_assembly_matches_expected_format(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Lock the close-path comment-assembly contract: ``v3:`` + first
+    26 chars of request_id == 29 chars total. Mirrors the 4.8b open
+    path lock-down."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        positions_get=(_open_position(),),
+    )
+    request_id = "abc123def456abc123def456abc123ab"  # 32-char hex
+    await handler.dispatch(
+        {
+            "request_id": request_id,
+            "action": "close",
+            "broker_position_id": "67890",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"][0]
+    expected = "v3:" + request_id[:26]
+    assert sent["comment"] == expected
+    assert len(sent["comment"]) == 29
+
+
+@pytest.mark.asyncio
+async def test_close_audit_no_hedge_keyword_in_request_dict(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Regression defence: ``hedge`` must not appear anywhere in the
+    close-path request dict shipped to ``mt5.order_send``. Same audit
+    pattern as the open-path test from 4.8b."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        positions_get=(_open_position(),),
+    )
+    await handler.dispatch(
+        {
+            "request_id": "r_audit_close",
+            "action": "close",
+            "broker_position_id": "67890",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"][0]
+    serialized = " ".join(str(v) for v in sent.values()).lower()
+    assert "hedge" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_close_last_error_captured_on_none_return(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Step 4.8d core fix verification: when close-path ``order_send``
+    returns ``None``, the handler captures ``mt5.last_error()`` and
+    surfaces the tuple in BOTH a WARNING log row AND the published
+    response's ``error_msg`` field. Pre-4.8d operators saw only the
+    opaque ``order_send_returned_none`` slug — D-SMOKE-10 took two
+    smoke iterations to root-cause because the slug hid the actual
+    'Invalid comment argument' reason."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        positions_get=(_open_position(),),
+        order_send_response=[None],
+        last_error=(-2, 'Invalid "comment" argument'),
+    )
+    with caplog.at_level(
+        logging.WARNING, logger="exness_client.action_handlers"
+    ):
+        await handler.dispatch(
+            {
+                "request_id": "r_close_last_err",
+                "action": "close",
+                "broker_position_id": "67890",
+            }
+        )
+    payload = await _read_one_response(fake_redis)
+    assert payload["status"] == "error"
+    assert payload["reason"] == "order_send_returned_none"
+    assert "Invalid" in payload["error_msg"]
+    assert "-2" in payload["error_msg"]
+    # broker_position_id field preserved on error path.
+    assert payload["broker_position_id"] == "67890"
+    warn_msgs = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and "close.order_send_none" in r.getMessage()
+    ]
+    assert len(warn_msgs) == 1
+    assert "Invalid" in warn_msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_close_no_filling_mode_loop(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Close path uses the position's original filling mode
+    (broker-internal); does NOT iterate the ``filling_modes`` bitmask
+    list that 4.8a added to the open path. Verify via single
+    ``order_send`` invocation per close cmd."""
+    sym = _stub_symbol(filling_mode=3)
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        positions_get=(_open_position(),),
+    )
+    await handler.dispatch(
+        {
+            "request_id": "r_single",
+            "action": "close",
+            "broker_position_id": "67890",
+        }
+    )
+    sent = mt5_stub._state["order_send_calls"]
+    assert len(sent) == 1
+    # Hardcoded IOC for close path (preserved from 3.7 / 4.3).
+    assert sent[0]["type_filling"] == mt5_stub.ORDER_FILLING_IOC
+
+
+@pytest.mark.asyncio
+async def test_close_response_publishes_broker_position_id_on_error(
+    handler: ActionHandler,
+    fake_redis: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """Regression: close error responses include ``broker_position_id``
+    so the server's response handler can correlate back to the order
+    row. Verified against resp_stream evidence from Phase 4 smoke."""
+    sym = _stub_symbol()
+    mt5_stub.set_state_for_tests(
+        symbol_info={"EURUSDm": sym},
+        positions_get=(_open_position(),),
+        order_send_response=[None],
+        last_error=(-2, "any reason"),
+    )
+    await handler.dispatch(
+        {
+            "request_id": "r_brk_id",
+            "action": "close",
+            "broker_position_id": "67890",
+        }
+    )
+    payload = await _read_one_response(fake_redis)
+    assert payload["broker_position_id"] == "67890"

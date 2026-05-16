@@ -227,8 +227,97 @@ Populate empirically mid-phase per D-069 pattern. Bullet list grows as smoke unc
 | Pip size derivation: `mt5.symbol_info` exposes `point` (smallest price increment), not `pip`. 5-digit forex + 3-digit JPY-quote → pip = `point * 10`; 2-digit metals/indices/crypto → pip = `point` as-is. | 4.2 | `exness_client/symbol_sync.py::_derive_pip_size`. CTO Phase 4 lock — see step 4.2 self-check. |
 | Symbol subscription required before tick/positions visible: must call `mt5.symbol_select(name, True)` to add the symbol to MarketWatch before `symbol_info(name)` returns valid bid/ask. | 4.2 | `SymbolSyncPublisher.publish_snapshot` calls `symbol_select` per enumerated symbol before reading `symbol_info`. |
 | Close action requires `position` ticket on the request dict alongside `type` (opposite of position direction); MT5 does NOT accept "close ticket X" as a single primitive. | 4.2 | `_handle_close` looks up `positions_get(ticket=...)` first to discover direction + volume, then issues opposite-direction `TRADE_ACTION_DEAL` with `position=ticket`. |
-| *(placeholder — populate as found)* | | |
-| *(placeholder — populate as found)* | | |
+| Filling mode is a BITMASK on the symbol side (`symbol_info.filling_mode`) but a flat ENUM on the request side (`ORDER_FILLING_*`). Bit 1 = FOK, Bit 2 = IOC, Bit 4 = BOC. Bitmask=1 (FOK-only, common on Cent demos) silently rejects IOC submissions with `None`. | 4.8a | `_handle_open` queries `info.filling_mode` and builds the request `type_filling` list (preferred + fallback) accordingly. `_handle_close` uses position's original filling mode broker-internally — hardcoded `ORDER_FILLING_IOC` without bitmask query. See §6.a below + step 4.8a self-check D-4.8a-1..5. |
+| Comment field actual broker limit is 29 chars (NOT 31 per official docs). 30+ chars triggers silent `None` + `last_error == (-2, 'Invalid "comment" argument')`. | 4.8b + 4.8d | All MT5 request dicts use `"comment": f"v3:{request_id}"[:29]`. `_handle_open` (4.8b) + `_handle_close` (4.8d) carry the fix; regression tests audit each handler. See §6.b below. |
+| `order_send` returns `None` (not a struct with retcode) for terminal-side validator rejections. The reason lives in `mt5.last_error()` — a separate call. | 4.8b + 4.8d | Defensive pattern: capture `last_error` after every `None`, log at WARNING + surface in response `error_msg`. See §6.c below. |
+| `mt5.order_check()` does NOT validate comment field length. 31-char comment passes `order_check` (retcode 0) but then fails `order_send` with `None`. | 4.8d (smoke 2026-05-16) | Phase 5 backlog: add `order_check` as defensive pre-flight; currently NOT called. See §6.d below. |
+
+### 6.a Filling mode bitmask vs ORDER_FILLING_* enum (step 4.8a)
+
+`mt5.symbol_info(symbol).filling_mode` returns an `int` **bitmask**:
+
+| Bit value | Symbol-side constant | Meaning |
+|---|---|---|
+| 1 | `SYMBOL_FILLING_FOK` | Fill-Or-Kill supported |
+| 2 | `SYMBOL_FILLING_IOC` | Immediate-Or-Cancel supported |
+| 4 | `SYMBOL_FILLING_BOC` | Book-Or-Cancel (passive — not used by market DEAL action) |
+
+**Request-side** values for `request["type_filling"]` use a DIFFERENT enum:
+
+- `ORDER_FILLING_FOK = 0`
+- `ORDER_FILLING_IOC = 1`
+- `ORDER_FILLING_RETURN = 2`
+
+The bitmask → request mapping that `_handle_open` applies (step 4.8a `action_handlers.py:158-194`):
+
+| Bitmask | First attempt | Fallback | Source |
+|---|---|---|---|
+| 3 (FOK + IOC) | `ORDER_FILLING_IOC` | `ORDER_FILLING_FOK` | Standard Exness — preserves historical IOC-first |
+| 1 (FOK only) | `ORDER_FILLING_FOK` | `ORDER_FILLING_IOC` (defensive) | **Exness Cent path** — D-SMOKE-2 initial hypothesis (turned out comment was the real bug, but bitmask query stays as defence-in-depth) |
+| 2 (IOC only) | `ORDER_FILLING_IOC` | `ORDER_FILLING_FOK` | Uncommon |
+| 5 (FOK + BOC) | `ORDER_FILLING_FOK` | `ORDER_FILLING_IOC` | BOC ignored for DEAL |
+| 7 (all) | `ORDER_FILLING_IOC` | `ORDER_FILLING_FOK` | Historical IOC-first |
+| 0 (none) | `ORDER_FILLING_RETURN` | — | Theoretical; fallback safety |
+
+**Scope**: open action only. CLOSE action uses position's original filling mode (broker-internal — `position.type_filling` field in the MT5 server's bookkeeping), so `_handle_close` hardcodes `ORDER_FILLING_IOC` without a bitmask loop. Verified in step 4.8d (`test_close_no_filling_mode_loop`). If the broker rejects with retcode `UNSUPPORTED_FILLING` (10030) on a close, the server's cascade orchestrator's retry budget (step 4.8 `cascade_close_other_leg` 3-retry) handles it; no client-side filling adaptation needed.
+
+### 6.b Comment field 29-char limit (step 4.8b + 4.8d)
+
+CEO REPL verification 2026-05-15 (Exness Standard demo, EURUSDm):
+
+| Comment length | `order_send` result | `mt5.last_error()` |
+|---|---|---|
+| ≤ 29 chars | `OrderSendResult(retcode=10009, ...)` | `(0, "no error")` |
+| 30 chars | `None` | `(-2, 'Invalid "comment" argument')` |
+| 31 chars | `None` | `(-2, 'Invalid "comment" argument')` |
+| 32+ chars | `None` | same |
+
+Official MT5 docs claim 31 chars max. Real Exness validator enforces 29. The gap likely originates server-side (broker validator stricter than terminal-side). Other brokers may have different limits — 29 is the verified safe lower bound for Exness Standard demo + Cent demo.
+
+**Operational discovery** (CEO 2026-05-15): the comment string lives in the broker's server-side trade audit. A prefix containing `hedge` (or any hedging-indicative keyword) may flag the account as running a detected hedging strategy → prop-firm ban risk. Neutral prefix required.
+
+**Locked format across all MT5 handlers** (steps 4.8b + 4.8d):
+
+```python
+"comment": f"v3:{request_id}"[:29],
+```
+
+`v3:` (3 chars) + 26-char `request_id` slice = 29 chars exact for 32-char uuid hex inputs. Regression tests (`test_open_audit_no_hedge_keyword_in_request_dict`, `test_close_audit_no_hedge_keyword_in_request_dict`) stringify each request dict and assert `"hedge"` is absent — defence against any future regression.
+
+### 6.c `mt5.last_error()` capture pattern (step 4.8b + 4.8d)
+
+When `order_send` returns `None`, the reason is in `mt5.last_error()` — a separate sync call. Without capturing it, operators see only the opaque `order_send_returned_none` slug and have no way to root-cause silent validation failures.
+
+Defensive pattern (applied in `_handle_open` 4.8b + `_handle_close` 4.8d):
+
+```python
+result = await _to_thread(self._mt5.order_send, request)
+if result is None:
+    last_err = await _to_thread(self._mt5.last_error)
+    logger.warning(
+        "{action}.order_send_none request_id=%s last_error=%s",
+        request_id, last_err,
+    )
+    await self._publish_response(
+        ...
+        reason="order_send_returned_none",
+        error_msg=f"order_send_returned_none last_error={last_err}",
+        ...
+    )
+    return
+```
+
+`error_msg` lands on the resp_stream payload (Exness `_publish_response` accepts `**extras: str`), which the server's `response_handler:exness` routes into `s_error_msg` / `s_close_error_msg` (per step 4.7a v2-6). Operators see the actual reason on the order row, not the slug.
+
+**Why D-SMOKE-2 took two smoke iterations**: 4.8b shipped the pattern for `_handle_open` but did NOT audit `_handle_close`. The 2026-05-16 cascade close smoke (post 4.8c FTMO fix) finally let close cmds reach the Exness client, surfacing the latent `_handle_close` instance of the same bug. Lesson — when fixing a bug class at one site, audit all sibling sites and apply the fix in a single step. This is what step 4.8d does (and this doc captures the lesson).
+
+### 6.d `mt5.order_check` does NOT validate comment length (smoke 2026-05-16)
+
+CEO REPL verification 2026-05-16: a 31-char comment passes `mt5.order_check(request)` with `retcode == 0` ("Done"), but then `mt5.order_send(request)` rejects with `None` + `last_error == (-2, 'Invalid "comment" argument')`.
+
+So `order_check` is an INCOMPLETE pre-flight — useful for margin / volume validation but NOT for terminal-side validator constraints like comment length. Currently NOT called by `_handle_open` / `_handle_close`.
+
+**Phase 5 backlog**: add `order_check` as a defensive pre-flight to surface margin / volume errors before the submit. Until then, the `last_error` capture in §6.c is the only safety net for silent validation rejections.
 
 Examples of expected entries (verify empirically):
 
@@ -312,5 +401,9 @@ Append-only mid-phase per D-069 exception (mirrors `docs/ctrader-execution-event
 | 2026-05-14 | 4.3 | Position monitor poll loop | §5.a populated: 3 event types (`position_new`, `position_closed_external`, `position_modified`) on `event_stream:exness:{account_id}`. Baseline pattern locked: first poll = silent snapshot (no replay events on client restart). `POLL_INTERVAL_S = 2.0` locked. SL/TP/volume diff detection runs entirely off the in-process snapshot — no `history_deals_get` reconciliation in this step (deferred to step 4.4). Event order is deterministic: news first (sorted by ticket), then closed, then modified. |
 | 2026-05-14 | 4.3a | Persistent snapshot + cmd ledger | Closes the Windows-smoke leg-open gap: persistent snapshot at `position_monitor:last_snapshot:{account_id}` (JSON STRING, 30-day TTL) saved after every poll and loaded on the first poll of the next process so offline closes/modifies/opens replay correctly. `position_closed_external` events now carry `close_reason` (`server_initiated` via `CmdLedger` lookup OR `external`) + `enrichment_source` (`history_deals` OR `snapshot_fallback`) + broker fill fields (`close_price` / `realized_profit` / `commission` / `swap` / `close_time_ms`) when `mt5.history_deals_get(position=ticket)` succeeds. CEO policy: secondary leg always passive — server step 4.7 will turn every `external` close on a hedge leg into a WARNING alert (no FTMO cascade). |
 | 2026-05-14 | 4.4 | Account info publish + terminal_info gate | §5.b populated: ``terminal_info().connected`` check now gates the position-monitor poll. Refines D-4.3-4 — a transient broker disconnect previously caused ``positions_get → empty → emit position_closed_external for every snapshot ticket`` (false WARN-alert spam); the gate now skips the poll entirely and preserves both the in-process and Redis snapshots. ``terminal_info() == None`` and exceptions are also treated as disconnect. §5.c populated: ``AccountInfoPublisher`` 30-second loop publishes ``account:exness:{account_id}`` HASH (12 fields incl. ``balance``/``equity``/``margin``/``free_margin`` for the AccountStatusBar + position-tracker P&L baselines). First publish runs immediately on entry. ``ShutdownCoordinator`` order: cmd_proc → position_monitor → account_info_publisher → heartbeat → bridge.disconnect → redis.aclose. |
+| 2026-05-15 | 4.8a | Filling-mode bitmask discovery | §6 quirks table appended: `symbol_info.filling_mode` is a bitmask (bit 1 = FOK, bit 2 = IOC, bit 4 = BOC) distinct from the request-side `ORDER_FILLING_*` enum (FOK=0, IOC=1, RETURN=2). `_handle_open` queries the bitmask + builds the request `type_filling` fallback list per §6.a mapping table. Exness Cent demo EURUSDm reports `filling_mode=1` (FOK-only) which silently rejected IOC submissions — initial hypothesis for D-SMOKE-2. Also added belt-and-suspenders `mt5.symbol_select(symbol, True)` per order so a silent symbol-sync miss can't strand an order. |
+| 2026-05-15 | 4.8b | Comment 29-char limit + `last_error` pattern | §6 quirks table appended + §6.b/§6.c populated. CEO REPL verified: 30+ char comments trigger silent `None` + `last_error == (-2, 'Invalid "comment" argument')` — official MT5 docs claim 31 chars max; real Exness validator enforces 29. Locked format: `"comment": f"v3:{request_id}"[:29]`. Operational discovery: comment prefix MUST NOT contain `hedge` keyword (prop-firm ban risk for detected hedging). `last_error` capture pattern: WARNING log + surface in response `error_msg` so silent validation rejections don't masquerade as opaque `order_send_returned_none`. Initial application: `_handle_open` only. |
+| 2026-05-16 | 4.8c | (Cross-broker context) | FTMO client `ctrader_bridge.close_position` started publishing `position_closed` to `event_stream:ftmo` for solicited closes (D-SMOKE-9 fix unblocks Phase 4 cascade close Path A). Documented separately in `docs/ctrader-execution-events.md` §3.8 — relevant here because the Phase 4 cascade-close smoke that this fix unblocked then surfaced D-SMOKE-10 (the Exness close-path equivalent of D-SMOKE-2) which step 4.8d addresses below. |
+| 2026-05-16 | 4.8d | `_handle_close` mirrors 4.8b + lesson | §6 quirks table appended + §6.d added. `_handle_close` had the same comment-31-char bug as pre-4.8b `_handle_open` — only with `"close:"` prefix instead of `"hedge:"`, same 31-char silent-None failure mode (D-SMOKE-10). 4.8b should have audited all handlers; this step ships the audit + fix + the lesson: when fixing a bug class at one site, audit sibling sites. Now BOTH `_handle_open` AND `_handle_close` use the locked `f"v3:{request_id}"[:29]` format. Single prefix across handlers gives one grep target. §6.d documents that `mt5.order_check` does NOT validate comment length — Phase 5 backlog. |
 
 *(Append entries below.)*
